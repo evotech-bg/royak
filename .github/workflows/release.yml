@@ -22,7 +22,10 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             name: royak-macos-arm64
-          - os: macos-13
+          # macOS Intel: cross-compiled on the arm64 runner (macos-13 Intel
+          # runners are scarce/deprecated). The macos-latest toolchain ships
+          # both slices, so `--target x86_64-apple-darwin` builds natively.
+          - os: macos-latest
             target: x86_64-apple-darwin
             name: royak-macos-x86_64
     runs-on: ${{ matrix.os }}
