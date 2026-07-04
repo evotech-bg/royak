@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Royak Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .pulse { animation: pulse-dot 2s ease-in-out infinite; }
+  body { background: #0a0e1a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+  .card { background: #111827; border: 1px solid #1e293b; border-radius: 12px; }
+  .glow { box-shadow: 0 0 20px rgba(99, 102, 241, 0.1); }
+</style>
+</head>
+<body class="min-h-screen p-6">
+<div class="max-w-7xl mx-auto">
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-8">
+    <div>
+      <h1 class="text-3xl font-bold bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
+        Royak
+      </h1>
+      <p class="text-slate-500 text-sm mt-1">v0.4-beta — Container Orchestrator</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="pulse inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+      <span class="text-slate-400 text-sm" id="status">Connected</span>
+      <span class="text-slate-600 text-xs" id="last-update"></span>
+    </div>
+  </div>
+
+  <!-- Stats Row -->
+  <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
+    <div class="card p-4 glow">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Pods</div>
+      <div class="text-2xl font-bold text-indigo-400 mt-1" id="stat-pods">-</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Deployments</div>
+      <div class="text-2xl font-bold text-cyan-400 mt-1" id="stat-deploys">-</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Services</div>
+      <div class="text-2xl font-bold text-purple-400 mt-1" id="stat-services">-</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Namespaces</div>
+      <div class="text-2xl font-bold text-amber-400 mt-1" id="stat-ns">-</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Brain Loss</div>
+      <div class="text-2xl font-bold text-emerald-400 mt-1" id="stat-loss">-</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Certs</div>
+      <div class="text-2xl font-bold text-rose-400 mt-1" id="stat-certs">-</div>
+    </div>
+  </div>
+
+  <!-- Main Grid -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- Pods -->
+    <div class="card p-5 lg:col-span-2">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Pods</h2>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-slate-500 text-xs uppercase border-b border-slate-800">
+            <th class="text-left py-2 px-2">Name</th>
+            <th class="text-left py-2">Image</th>
+            <th class="text-left py-2">Status</th>
+            <th class="text-right py-2 px-2">Namespace</th>
+          </tr></thead>
+          <tbody id="pods-table"></tbody>
+        </table>
+      </div>
+      <div id="pods-empty" class="text-slate-600 text-center py-8 hidden">No pods running</div>
+    </div>
+
+    <!-- Events -->
+    <div class="card p-5">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Events</h2>
+      <div class="space-y-2 max-h-80 overflow-y-auto" id="events-list"></div>
+      <div id="events-empty" class="text-slate-600 text-center py-8 hidden">No events</div>
+    </div>
+
+    <!-- Deployments -->
+    <div class="card p-5 lg:col-span-2">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Deployments</h2>
+      <div id="deploys-grid" class="grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+      <div id="deploys-empty" class="text-slate-600 text-center py-8 hidden">No deployments</div>
+    </div>
+
+    <!-- Brain -->
+    <div class="card p-5">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Neural Brain</h2>
+      <div class="space-y-3" id="brain-info">
+        <div class="flex justify-between"><span class="text-slate-500">Status</span><span class="text-emerald-400">Active</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Train Steps</span><span id="brain-steps">-</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Loss</span><span id="brain-loss">-</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Anomalies</span><span id="brain-anomalies">-</span></div>
+      </div>
+      <div class="mt-4 pt-4 border-t border-slate-800">
+        <h3 class="text-sm text-slate-500 mb-2">Security</h3>
+        <div class="flex justify-between text-sm"><span class="text-slate-500">Cluster CA</span><span id="ca-fp" class="text-cyan-400 font-mono text-xs">-</span></div>
+        <div class="flex justify-between text-sm mt-1"><span class="text-slate-500">Networks</span><span id="net-count">-</span></div>
+        <div class="flex justify-between text-sm mt-1"><span class="text-slate-500">Audit Events</span><span id="audit-count">-</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="mt-8 text-center text-slate-700 text-xs">
+    Royak v0.4-beta &mdash; 16K lines of Rust, 5.2 MB binary, zero etcd &mdash; by Ivo Gergov & Velko
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+async function fetchJSON(path) {
+  try {
+    const r = await fetch(API + path);
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+function statusBadge(phase) {
+  const colors = { Running: 'bg-emerald-500/20 text-emerald-400', Pending: 'bg-amber-500/20 text-amber-400',
+    Failed: 'bg-red-500/20 text-red-400', Succeeded: 'bg-blue-500/20 text-blue-400' };
+  const c = colors[phase] || 'bg-slate-500/20 text-slate-400';
+  return `<span class="px-2 py-0.5 rounded-full text-xs ${c}">${phase}</span>`;
+}
+
+async function refresh() {
+  // Pods
+  const pods = await fetchJSON('/api/v1/pods');
+  const tb = document.getElementById('pods-table');
+  const pe = document.getElementById('pods-empty');
+  if (pods && pods.items && pods.items.length > 0) {
+    tb.innerHTML = pods.items.map(p => `<tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+      <td class="py-2 px-2 font-mono text-xs">${p.metadata.name}</td>
+      <td class="py-2 text-slate-400 text-xs">${p.spec.containers[0]?.image || '?'}</td>
+      <td class="py-2">${statusBadge(p.status.phase)}</td>
+      <td class="py-2 px-2 text-right text-slate-500 text-xs">${p.metadata.namespace}</td>
+    </tr>`).join('');
+    pe.classList.add('hidden');
+    document.getElementById('stat-pods').textContent = pods.items.length;
+  } else {
+    tb.innerHTML = '';
+    pe.classList.remove('hidden');
+    document.getElementById('stat-pods').textContent = '0';
+  }
+
+  // Deployments
+  const deps = await fetchJSON('/apis/apps/v1/deployments');
+  const dg = document.getElementById('deploys-grid');
+  const de = document.getElementById('deploys-empty');
+  if (deps && deps.items && deps.items.length > 0) {
+    dg.innerHTML = deps.items.map(d => {
+      const ready = d.status.readyReplicas || 0;
+      const desired = d.spec.replicas || 0;
+      const pct = desired > 0 ? Math.round(ready/desired*100) : 0;
+      const barColor = pct === 100 ? 'bg-emerald-500' : pct > 50 ? 'bg-amber-500' : 'bg-red-500';
+      return `<div class="bg-slate-800/50 rounded-lg p-3">
+        <div class="flex justify-between items-center mb-2">
+          <span class="font-mono text-sm">${d.metadata.name}</span>
+          <span class="text-xs text-slate-500">${d.metadata.namespace}</span>
+        </div>
+        <div class="flex justify-between text-xs text-slate-400 mb-1">
+          <span>${ready}/${desired} ready</span>
+          <span>${d.spec.template.spec.containers[0]?.image || '?'}</span>
+        </div>
+        <div class="w-full bg-slate-700 rounded-full h-1.5">
+          <div class="${barColor} h-1.5 rounded-full transition-all" style="width:${pct}%"></div>
+        </div>
+      </div>`;
+    }).join('');
+    de.classList.add('hidden');
+    document.getElementById('stat-deploys').textContent = deps.items.length;
+  } else {
+    dg.innerHTML = '';
+    de.classList.remove('hidden');
+    document.getElementById('stat-deploys').textContent = '0';
+  }
+
+  // Events
+  const events = await fetchJSON('/api/v1/events');
+  const el = document.getElementById('events-list');
+  const ee = document.getElementById('events-empty');
+  if (events && events.items && events.items.length > 0) {
+    el.innerHTML = events.items.slice(0, 15).map(e => {
+      const icon = e.type === 'Warning' ? '&#9888;' : '&#10003;';
+      const color = e.type === 'Warning' ? 'text-amber-400' : 'text-emerald-400';
+      return `<div class="flex gap-2 text-xs py-1.5 border-b border-slate-800/50">
+        <span class="${color}">${icon}</span>
+        <div>
+          <span class="text-slate-300">${e.reason}</span>
+          <span class="text-slate-600 ml-1">${e.involvedObject?.name || ''}</span>
+          <div class="text-slate-500 mt-0.5">${e.message?.substring(0, 80) || ''}</div>
+        </div>
+      </div>`;
+    }).join('');
+    ee.classList.add('hidden');
+  } else {
+    el.innerHTML = '';
+    ee.classList.remove('hidden');
+  }
+
+  // Namespaces + Services
+  const ns = await fetchJSON('/api/v1/namespaces');
+  document.getElementById('stat-ns').textContent = ns?.items?.length || '-';
+  const svc = await fetchJSON('/api/v1/services');
+  document.getElementById('stat-services').textContent = svc?.items?.length || '0';
+
+  // Brain
+  const brain = await fetchJSON('/royak/v1/brain');
+  if (brain) {
+    document.getElementById('stat-loss').textContent = brain.training?.loss?.toFixed(4) || '-';
+    document.getElementById('brain-steps').textContent = brain.training?.steps || '0';
+    document.getElementById('brain-loss').textContent = brain.training?.loss?.toFixed(6) || '-';
+    document.getElementById('brain-anomalies').textContent = brain.cluster?.events || '0';
+    document.getElementById('stat-certs').textContent = brain.security?.certs_issued || '-';
+    document.getElementById('ca-fp').textContent = brain.security?.ca_fingerprint?.substring(0, 16) || '-';
+    document.getElementById('net-count').textContent = brain.security?.networks || '-';
+    document.getElementById('audit-count').textContent = brain.security?.audit_events || '-';
+  }
+
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,261 @@
+name: Royak CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Check binary size (<10MB)
+        run: |
+          ls -lh target/release/royak
+          SIZE=$(stat -f%z target/release/royak 2>/dev/null || stat -c%s target/release/royak)
+          echo "Binary size: $SIZE bytes"
+          if [ "$SIZE" -gt 10485760 ]; then
+            echo "FAIL: Binary too large (>10MB)"
+            exit 1
+          fi
+
+      - name: Check build has no errors
+        run: cargo build --release 2>&1 | grep -c "^error" | grep -q "^0$"
+
+      - name: Unit tests (cargo test)
+        run: cargo test --bin royak
+
+      - name: Smoke: brain + demo (no Docker required)
+        run: |
+          target/release/royak brain 2>&1 | grep -q "OrinBrain"
+          echo "Brain: OK"
+          target/release/royak demo 2>&1 | grep -q "SCHEDULE\|Noop\|SCALE"
+          echo "Demo: OK"
+
+  docker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Integration tests (62 checks)
+        run: bash test-demo.sh
+
+      - name: StorageClass auto-provisioning
+        run: |
+          cat <<'YAML' | target/release/royak apply -
+          ---
+          kind: StorageClass
+          metadata:
+            name: ci-test
+          spec:
+            provisioner: royak/host-path
+            hostPathPrefix: /tmp/ci-volumes
+          ---
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-pvc
+          spec:
+            storageClassName: ci-test
+            resources:
+              requests:
+                storage: 1Gi
+          YAML
+          test -d /tmp/ci-volumes/default/test-pvc
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f $(docker ps -a --filter "name=rk-" -q) 2>/dev/null || true
+          rm -f .royak-state.json .royak-state.json.nrns .royak-state.json.lock 2>/dev/null || true
+
+  multinode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-multinode-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: Multi-node sync test
+        run: bash test-multinode.sh
+
+  ha-lease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-ha-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: HA leader lease test
+        run: bash test-ha-lease.sh
+
+  mesh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-mesh-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: Mesh proxy test
+        run: bash test-mesh.sh
+      - name: Cleanup
+        if: always()
+        run: docker rm -f $(docker ps -a --filter "name=rk-" -q) 2>/dev/null || true
+
+  ingress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-ingress-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: Ingress live proxy test
+        run: bash test-ingress.sh
+      - name: Cleanup
+        if: always()
+        run: docker rm -f $(docker ps -a --filter "name=rk-" -q) 2>/dev/null || true
+
+  neuropod-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-neuropod-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: NeuroPod smoke (EXPERIMENTAL)
+        run: bash test-neuropod.sh
+
+  load-test:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-load-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Load + chaos test
+        env:
+          N_DEPLOYS: 10
+          REPLICAS: 2
+          TIMEOUT_SECS: 120
+        run: bash test-load.sh
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f $(docker ps -a --filter "name=rk-load-" -q) 2>/dev/null || true

@@ -1,0 +1,22 @@
+# Cluster configuration — everything configurable, nothing hardcoded
+apiVersion: royak/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  llm:
+    provider: ollama
+    host: http://10.77.0.1:11434
+    model: llama3.2:3b
+    temperature: 0.3
+  alerts:
+    webhook: /hooks/alert
+    onAnomaly: true
+    onRestart: true
+    onRollout: false
+  runtime: docker
+  pause:
+    enabled: true
+    defaultIdleSeconds: 300
+  api:
+    port: 6443

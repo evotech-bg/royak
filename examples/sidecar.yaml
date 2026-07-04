@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: web
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+        - name: logger
+          image: alpine:latest
+          command: ["sh", "-c", "while true; do echo '[logger] health check ok'; sleep 10; done"]

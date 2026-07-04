@@ -1,0 +1,54 @@
+# Nginx with resource limits, service, and configmap.
+# Shows: resource limits, service routing, configmap injection via envFrom.
+#
+# Deploy:  royak apply examples/nginx-with-limits.yaml
+# Verify:  docker inspect rk-web-1 --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}'
+# Export:  royak get deployment/web -o yaml
+#          royak get service/web-svc -o yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        envFrom:
+        - configMapRef:
+            name: web-config
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-svc
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP

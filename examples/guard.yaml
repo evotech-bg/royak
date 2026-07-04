@@ -1,0 +1,23 @@
+# Auto-remediation guard.
+# Watches for pod crashes and high memory, takes automatic action.
+#
+# Deploy: royak apply examples/guard.yaml
+
+apiVersion: v1
+kind: Guard
+metadata:
+  name: auto-healer
+spec:
+  rules:
+  - when: pod_crash
+    action: restart
+  - when: high_memory
+    action: scale_up
+    params:
+      threshold: "85"
+      max_replicas: "10"
+  - when: high_cpu
+    action: scale_up
+    params:
+      threshold: "90"
+      max_replicas: "8"

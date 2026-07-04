@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Royak — a swarm of containers, one tiny binary</title>
+<meta name="description" content="Royak is a container orchestrator in a single ~5 MB Rust binary. Deployments, rolling updates, services, RBAC, autoscaling and kubectl compatibility — without a control plane to babysit. Public beta." />
+<meta property="og:title" content="Royak — a swarm of containers, one tiny binary" />
+<meta property="og:description" content="Kubernetes-style orchestration in a single ~5 MB Rust binary. Public beta." />
+<link rel="icon" type="image/png" href="./assets/royak-mark.png" />
+<meta property="og:image" content="https://evotech-bg.github.io/royak/assets/royak-og.png" />
+<style>
+:root{
+  --bg:#fafbff; --bg2:#f3f5fc; --ink:#111327; --ink2:#4b5069; --ink3:#9aa0b5;
+  --line:#e5e7f0; --amber:#4f46e5; --amber2:#4338ca; --honey:#ef3d31;
+  --brand-blue:#315bff; --brand-purple:#7c3aed; --brand-red:#ef3d31;
+  --card:#ffffff; --term-bg:#131629; --term-ink:#e5e7f0; --ok:#16a34a;
+  --radius:14px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--bg);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--amber2);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wrap{max-width:1060px;margin:0 auto;padding:0 24px}
+
+/* ── nav ── */
+nav{position:sticky;top:0;z-index:50;background:rgba(250,251,255,.85);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;gap:26px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--ink)}
+.brand:hover{text-decoration:none}
+.brand svg{width:26px;height:26px}
+.nav-links{display:flex;gap:22px;margin-left:auto;font-size:15px}
+.nav-links a{color:var(--ink2)}
+.nav-links a:hover{color:var(--ink);text-decoration:none}
+.gh-btn{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);
+  border-radius:10px;padding:7px 14px;font-size:14px;font-weight:600;color:var(--ink);
+  background:var(--card);box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.gh-btn:hover{text-decoration:none;border-color:var(--ink3)}
+@media(max-width:720px){.nav-links a:not(.gh-btn){display:none}}
+
+/* ── hero ── */
+.hero{text-align:center;padding:72px 0 60px;position:relative;overflow:hidden}
+.swarm{position:relative;height:150px;margin:0 auto 20px;width:min(420px,90%)}
+.dot{position:absolute;border-radius:50%;background:var(--brand-purple);opacity:.9;
+  animation:drift var(--t,9s) ease-in-out infinite alternate}
+.dot:nth-child(3n){background:var(--brand-blue)}
+.dot:nth-child(4n){background:var(--brand-red)}
+.hero-mark{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);height:132px;z-index:2}
+@keyframes drift{
+  0%{transform:translate(0,0) scale(1)}
+  50%{transform:translate(var(--dx,20px),var(--dy,-14px)) scale(1.12)}
+  100%{transform:translate(calc(var(--dx,20px)*-.6),calc(var(--dy,-14px)*-.8)) scale(.95)}
+}
+@media(prefers-reduced-motion:reduce){.dot{animation:none}}
+.badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #c7d2fe;
+  background:#eef2ff;color:#3730a3;border-radius:999px;padding:6px 16px;font-size:14px;font-weight:600}
+.badge .pulse{width:8px;height:8px;border-radius:50%;background:var(--brand-purple);
+  box-shadow:0 0 0 0 rgba(124,58,237,.5);animation:pulse 2s infinite}
+@keyframes pulse{70%{box-shadow:0 0 0 8px rgba(124,58,237,0)}100%{box-shadow:0 0 0 0 rgba(124,58,237,0)}}
+h1{font-size:clamp(38px,6.5vw,64px);line-height:1.08;letter-spacing:-.03em;font-weight:800;margin:22px 0 18px}
+h1 .accent{background:linear-gradient(100deg,var(--brand-blue) 0%,var(--brand-purple) 48%,var(--brand-red) 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{max-width:640px;margin:0 auto 30px;font-size:19px;color:var(--ink2)}
+.sub b{color:var(--ink)}
+.ctas{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-bottom:26px}
+.btn{display:inline-flex;align-items:center;gap:9px;border-radius:12px;padding:13px 26px;
+  font-size:16px;font-weight:650;transition:transform .12s ease}
+.btn:hover{text-decoration:none;transform:translateY(-1px)}
+.btn-primary{background:var(--amber);color:#fff;box-shadow:0 6px 18px rgba(79,70,229,.28)}
+.btn-primary:hover{background:var(--amber2)}
+.btn-ghost{background:var(--card);color:var(--ink);border:1px solid var(--line)}
+.install-line{display:inline-flex;align-items:center;gap:12px;background:var(--card);
+  border:1px solid var(--line);border-radius:12px;padding:12px 16px;font-size:14.5px;
+  box-shadow:0 1px 3px rgba(0,0,0,.05);max-width:100%;overflow-x:auto}
+.install-line code{color:var(--amber2);white-space:nowrap}
+.copy-btn{border:1px solid var(--line);background:var(--bg2);border-radius:8px;
+  padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer;color:var(--ink2)}
+.copy-btn:hover{color:var(--ink)}
+.stats{display:flex;gap:10px 34px;justify-content:center;flex-wrap:wrap;margin-top:36px;
+  color:var(--ink2);font-size:15px}
+.stats b{color:var(--ink)}
+
+/* ── sections ── */
+section{padding:76px 0;border-top:1px solid var(--line)}
+.kicker{font-size:14px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
+h2{font-size:clamp(28px,4vw,40px);letter-spacing:-.02em;line-height:1.15;margin:10px 0 14px;font-weight:750}
+.lead{font-size:18px;color:var(--ink2);max-width:680px}
+.grid{display:grid;gap:18px;margin-top:40px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:860px){.g3{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.g3,.g2{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:22px 22px 20px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.card h3{font-size:17px;margin-bottom:6px;display:flex;align-items:center;gap:9px}
+.card p{font-size:15px;color:var(--ink2)}
+.card .ico{font-size:18px;line-height:1}
+.step-num{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;
+  border-radius:9px;background:#eef2ff;border:1px solid #c7d2fe;color:var(--amber2);
+  font-weight:700;font-size:15px;margin-bottom:12px}
+
+/* ── terminal ── */
+.term{background:var(--term-bg);border-radius:var(--radius);overflow:hidden;margin-top:36px;
+  box-shadow:0 18px 44px rgba(28,25,23,.18)}
+.term-bar{display:flex;align-items:center;gap:7px;padding:12px 16px;background:#292524}
+.term-bar i{width:11px;height:11px;border-radius:50%;display:block}
+.term-bar i:nth-child(1){background:#f87171}.term-bar i:nth-child(2){background:#fbbf24}.term-bar i:nth-child(3){background:#34d399}
+.term-bar span{margin-left:8px;color:#a8a29e;font-size:13px}
+.term pre{padding:20px 22px;overflow-x:auto;font-size:13.8px;line-height:1.75;color:var(--term-ink)}
+.t-cmd{color:#fbbf24;font-weight:600}
+.t-dim{color:#a8a29e}
+.t-ok{color:#34d399}
+
+/* ── honesty table ── */
+.truth{margin-top:36px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.truth-row{display:grid;grid-template-columns:200px 1fr;gap:16px;padding:16px 22px;
+  background:var(--card);border-top:1px solid var(--line);font-size:15px}
+.truth-row:first-child{border-top:none}
+.truth-row b{color:var(--ink)}
+.truth-row span{color:var(--ink2)}
+.tag{display:inline-block;border-radius:6px;padding:1px 9px;font-size:12.5px;font-weight:700;margin-right:8px}
+.tag-yes{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0}
+.tag-part{background:#fffbeb;color:#b45309;border:1px solid #fde68a}
+.tag-no{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
+@media(max-width:640px){.truth-row{grid-template-columns:1fr;gap:4px}}
+
+/* ── install ── */
+.install-block{background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
+  padding:26px;margin-top:36px}
+.install-block pre{background:var(--term-bg);color:var(--term-ink);border-radius:10px;
+  padding:18px 20px;font-size:13.8px;line-height:1.7;overflow-x:auto;margin-top:14px}
+.req{font-size:14px;color:var(--ink2);margin-top:14px}
+
+/* ── footer ── */
+footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);font-size:14.5px}
+.foot-in{display:flex;gap:24px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+.foot-links{display:flex;gap:20px;flex-wrap:wrap}
+</style>
+</head>
+<body id="top">
+
+<nav>
+  <div class="wrap nav-in">
+    <a class="brand" href="#top">
+      <img src="./assets/royak-mark.png" alt="" width="28" style="height:auto" />
+      Royak
+    </a>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#features">Features</a>
+      <a href="#beta">Beta status</a>
+      <a href="#install">Install</a>
+      <a class="gh-btn" href="https://github.com/evotech-bg/royak">★ Star on GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="swarm" id="swarm" aria-hidden="true"><img class="hero-mark" src="./assets/royak-mark.png" alt="" /></div>
+    <span class="badge"><span class="pulse"></span> Public beta · Free &amp; open source · Rust</span>
+    <h1>A swarm of containers.<br /><span class="accent">One tiny binary.</span></h1>
+    <p class="sub"><b>Royak</b> (<i>рояк</i> — Bulgarian for “swarm”) orchestrates Docker containers the way
+    Kubernetes does — deployments, rolling updates, services, RBAC, autoscaling — in a single
+    <b>~5&nbsp;MB</b> binary. No etcd, no control-plane zoo, nothing to babysit.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="https://github.com/evotech-bg/royak">View on GitHub</a>
+      <a class="btn btn-ghost" href="#install">Install from source</a>
+    </div>
+    <div class="install-line">
+      <code id="install-cmd">git clone https://github.com/evotech-bg/royak && cd royak && cargo build --release</code>
+      <button class="copy-btn" onclick="copyCmd()" id="copybtn">Copy</button>
+    </div>
+    <div class="stats">
+      <span><b>~5.2 MB</b> release binary</span>
+      <span><b>~16,000</b> lines of Rust</span>
+      <span><b>200+</b> tests</span>
+      <span><b>0</b> etcd</span>
+    </div>
+  </div>
+</header>
+
+<section id="how">
+  <div class="wrap">
+    <span class="kicker">How it works</span>
+    <h2>One loop. Desired state in, real containers out.</h2>
+    <p class="lead">Every few seconds Royak reads what you asked for, reads what Docker is actually
+    running, diffs the two, and acts. That’s the whole trick — the same reconcile model Kubernetes
+    implements with etcd, kubelet, kube-proxy and a control plane, collapsed into one process.</p>
+    <div class="grid g3">
+      <div class="card"><span class="step-num">1</span><h3>Read desired state</h3><p>Your YAML specs — Deployments, Services, ConfigMaps, 22+ resource kinds — parsed and held as the target world.</p></div>
+      <div class="card"><span class="step-num">2</span><h3>Read actual state</h3><p>Live queries against the Docker API. No cache to go stale: what Docker says is what counts.</p></div>
+      <div class="card"><span class="step-num">3</span><h3>Diff &amp; act</h3><p>Missing pod? Create it. Crashed? Restart it — with CrashLoopBackOff so it never spins forever. Too many? Remove.</p></div>
+    </div>
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>royak — 2 minutes from clone to cluster</span></div>
+      <pre><span class="t-cmd">$ royak apply examples/nginx.yaml</span>
+<span class="t-ok">  ✓ deployment/web applied</span>
+  [scale] web: 0 → 2 (+2)
+    [mtls] rk-web-1 cert issued (CA: 1e7788c2…, expires: 90d)
+    [create] rk-web-1 (main) → e30a2a93a6ce
+<span class="t-ok">    [start] rk-web-1 ✓</span>
+<span class="t-ok">    [start] rk-web-2 ✓</span>
+
+<span class="t-cmd">$ royak get pods</span>
+<span class="t-dim">  NAME       IMAGE          STATE     STATUS</span>
+  rk-web-2   nginx:alpine   running   Up Less than a second
+  rk-web-1   nginx:alpine   running   Up Less than a second
+<span class="t-dim">  2 pod(s) total</span>
+
+<span class="t-cmd">$ royak scale web 5</span>
+  Scaling web: 2 → 5
+<span class="t-ok">    [start] rk-web-3 ✓  [start] rk-web-4 ✓  [start] rk-web-5 ✓</span>
+
+<span class="t-cmd">$ royak api &amp;</span>
+<span class="t-cmd">$ kubectl --server=http://localhost:6443 get pods</span>
+<span class="t-dim">NAME       AGE</span>
+rk-web-5   0s
+rk-web-4   0s
+<span class="t-dim">…your existing kubectl, no --validate=false.</span></pre>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <span class="kicker">Features</span>
+    <h2>Small binary. Not a small feature set.</h2>
+    <p class="lead">Everything below is exercised by the test suite on every commit — 85 unit tests
+    plus 120+ integration checks across six suites, and a feature-by-feature
+    <a href="https://github.com/evotech-bg/royak/blob/main/COMPATIBILITY.md">compatibility ledger</a>
+    verified against a real kubectl.</p>
+    <div class="grid g3">
+      <div class="card"><h3><span class="ico">📦</span>Deployments &amp; StatefulSets</h3><p>Create, scale, delete with CPU/memory limits and HPA autoscaling. StatefulSets get ordered startup, stable identity and per-ordinal volumes.</p></div>
+      <div class="card"><h3><span class="ico">🔄</span>Rolling updates &amp; rollback</h3><p>Zero-downtime rollouts with readiness checks and auto-rollback on timeout. Rollback works even after the rollout completes.</p></div>
+      <div class="card"><h3><span class="ico">🌐</span>Services &amp; ingress</h3><p>ClusterIP discovery with pod-to-service DNS, NodePort via the built-in ServiceLB (userspace load balancer), and a live ingress reverse proxy — async, streaming, TLS.</p></div>
+      <div class="card"><h3><span class="ico">🔐</span>RBAC &amp; secrets</h3><p>Role-based access enforced on every API write. Secrets encrypted at rest with AES-256-GCM. mTLS cluster CA with per-pod certificates.</p></div>
+      <div class="card"><h3><span class="ico">🤝</span>kubectl compatible</h3><p><code>get</code>, <code>describe</code>, <code>delete</code>, <code>watch</code>, <code>logs</code>, <code>scale</code>, <code>exec -it</code>, <code>get events</code> and <code>apply</code> with client-side updates.</p></div>
+      <div class="card"><h3><span class="ico">🖧</span>Multi-node mesh</h3><p>UDP autodiscovery, pod distribution, heartbeat monitoring, and a cross-node service proxy so pods on node B reach services on node A.</p></div>
+      <div class="card"><h3><span class="ico">⚙️</span>Operators &amp; custom resources</h3><p>Define an Operator plus a CustomResource in YAML and Royak auto-provisions and manages the lifecycle.</p></div>
+      <div class="card"><h3><span class="ico">🛡️</span>Guards</h3><p>Declarative auto-remediation: pod crash → restart, high memory → scale up. Anomaly detection watches cluster telemetry.</p></div>
+      <div class="card"><h3><span class="ico">🚀</span>Pipelines &amp; jobs</h3><p>CI/CD pipelines with DAG dependencies, git triggers and matrix builds. Jobs, CronJobs, Functions — all as YAML kinds.</p></div>
+      <div class="card"><h3><span class="ico">📊</span>Dashboard &amp; metrics</h3><p>Built-in web dashboard and a Prometheus <code>/metrics</code> endpoint. Log aggregation with search.</p></div>
+      <div class="card"><h3><span class="ico">🧠</span>Neural brain (experimental)</h3><p>A small neural net trains on cluster telemetry for anomaly detection and load prediction. It monitors — the reconcile loop decides.</p></div>
+      <div class="card"><h3><span class="ico">🤖</span>MCP server</h3><p>13 tools for AI-assistant integration: deploy, scale, exec, logs, top — manage the swarm in natural language.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="beta">
+  <div class="wrap">
+    <span class="kicker">Beta status</span>
+    <h2>Beta means beta. Here’s the honest ledger.</h2>
+    <p class="lead">Royak is an MVP of a vision — great for learning, demos, homelabs and edge boxes.
+    It is <b>not</b> ready to carry your production. We test every feature in CI, but our testing is
+    not a substitute for yours: <b>evaluate it against your own workloads, and use it at your own
+    risk</b> (MIT, as-is, no warranty). Every gap below is designed and scheduled in the public
+    <a href="https://github.com/evotech-bg/royak/blob/main/ROADMAP.md">roadmap</a>, not swept under a rug.
+    The full feature-by-feature ledger — every row verified live against a real kubectl — lives in
+    <a href="https://github.com/evotech-bg/royak/blob/main/COMPATIBILITY.md">COMPATIBILITY.md</a>.</p>
+    <div class="truth">
+      <div class="truth-row"><b><span class="tag tag-yes">solid</span>Single node</b><span>Deploy, scale, rolling update, rollback, probes, CrashLoopBackOff — covered by the test suite end to end.</span></div>
+      <div class="truth-row"><b><span class="tag tag-yes">solid</span>kubectl workflow</b><span>get / describe / delete / watch / logs / scale / exec / events, apply with client-side updates — verified against kubectl v1.36.</span></div>
+      <div class="truth-row"><b><span class="tag tag-yes">solid</span>NodePort ServiceLB</b><span>Userspace load balancer binds every nodePort and round-robins across pods — works on macOS and Linux.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Multi-node</b><span>Control-plane sync, mesh proxy and HA leader-lease failover work and are tested — but not battle-tested at scale. Split-brain across independent disks is possible until Raft lands.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Raft consensus</b><span>openraft is integrated: leader election and log replication are proven in tests (in-process + HTTP transports). The live write path doesn’t go through Raft yet — that’s the next milestone.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Canary releases</b><span>Parsed and scheduled with weighted steps; service-layer traffic splitting still needs its proxy integration.</span></div>
+      <div class="truth-row"><b><span class="tag tag-no">not yet</span>Helm engine</b><span>No native chart rendering. <code>helm template ./chart | royak apply -</code> works today.</span></div>
+      <div class="truth-row"><b><span class="tag tag-yes">solid</span>exec &amp; port-forward</b><span>kubectl exec including -it (TTY, resize) works over WebSocket; royak port-forward tunnels local→pod. kubectl port-forward's SPDY tunnel is the one remaining caveat.</span></div>
+      <div class="truth-row"><b><span class="tag tag-no">experimental</span>NeuroPod runtime</b><span>Docker-free OCI runtime with its own isolation. Works on Linux with root; macOS path is not end-to-end. Clearly flagged, off by default.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <span class="kicker">Install</span>
+    <h2>Clone to cluster in about two minutes.</h2>
+    <p class="lead">Build from source, or grab a pre-built beta binary for Linux (x86_64/aarch64) and
+    macOS (Apple silicon/Intel) from
+    <a href="https://github.com/evotech-bg/royak/releases">GitHub Releases</a>.</p>
+    <div class="install-block">
+      <b>Build &amp; run</b>
+      <pre># prerequisites: Docker running, Rust toolchain
+git clone https://github.com/evotech-bg/royak
+cd royak
+cargo build --release
+
+# deploy nginx with 2 replicas
+./target/release/royak apply examples/nginx.yaml
+
+# see the swarm
+./target/release/royak get pods</pre>
+      <p class="req">Linux or macOS · Docker (or Colima/OrbStack — <code>DOCKER_HOST</code> is honoured) · Rust 1.75+</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-in">
+    <span>© 2026 Royak contributors · MIT · Built in Bulgaria 🇧🇬</span>
+    <div class="foot-links">
+      <a href="https://github.com/evotech-bg/royak">GitHub</a>
+      <a href="https://github.com/evotech-bg/royak/blob/main/ROADMAP.md">Roadmap</a>
+      <a href="https://github.com/evotech-bg/royak/blob/main/README.md">Docs</a>
+      <a href="https://github.com/evotech-bg/royak/blob/main/LICENSE">License</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+// hero swarm — a loose cluster of drifting dots
+(function(){
+  const s = document.getElementById('swarm');
+  const N = 16;
+  for (let i = 0; i < N; i++){
+    const d = document.createElement('span');
+    d.className = 'dot';
+    const size = 6 + Math.random()*16;
+    d.style.width = d.style.height = size + 'px';
+    d.style.left = (12 + Math.random()*76) + '%';
+    d.style.top  = (10 + Math.random()*70) + '%';
+    d.style.setProperty('--dx', (Math.random()*56 - 28) + 'px');
+    d.style.setProperty('--dy', (Math.random()*40 - 20) + 'px');
+    d.style.setProperty('--t', (6 + Math.random()*7) + 's');
+    d.style.animationDelay = (-Math.random()*8) + 's';
+    d.style.opacity = .45 + Math.random()*.5;
+    s.appendChild(d);
+  }
+})();
+function copyCmd(){
+  navigator.clipboard.writeText(document.getElementById('install-cmd').textContent).then(()=>{
+    const b = document.getElementById('copybtn');
+    b.textContent = 'Copied!';
+    setTimeout(()=>{ b.textContent = 'Copy'; }, 1600);
+  });
+}
+</script>
+</body>
+</html>

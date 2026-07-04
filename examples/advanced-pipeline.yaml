@@ -1,0 +1,62 @@
+# Advanced pipeline with init containers, conditional, and matrix
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: 2
+  template:
+    spec:
+      initContainers:
+        - name: db-migrate
+          image: alpine:latest
+          command: ["sh", "-c", "echo 'Running DB migration...' && sleep 2 && echo 'Done'"]
+        - name: config-check
+          image: alpine:latest
+          command: ["sh", "-c", "echo 'Checking config...' && echo 'OK'"]
+      containers:
+        - name: app
+          image: nginx:alpine
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+---
+apiVersion: royak/v1
+kind: Pipeline
+metadata:
+  name: full-ci
+spec:
+  trigger:
+    - type: manual
+  stages:
+    - name: lint
+      image: alpine:latest
+      command: ["echo", "lint passed"]
+
+    - name: test
+      dependsOn: lint
+      matrix:
+        image:
+          - "python:3.10-alpine"
+          - "python:3.11-alpine"
+          - "python:3.12-alpine"
+      command: ["python3", "--version"]
+
+    - name: deploy-staging
+      dependsOn: test
+      action: apply
+      file: examples/nginx.yaml
+
+    - name: deploy-prod
+      dependsOn: deploy-staging
+      if: "branch == main"
+      action: apply
+      file: examples/nginx.yaml
+
+    - name: notify-failure
+      dependsOn: test
+      if: failure
+      image: alpine:latest
+      command: ["echo", "Tests failed! Sending notification..."]

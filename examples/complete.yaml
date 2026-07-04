@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: myapp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: myapp
+spec:
+  APP_ENV: production
+  LOG_LEVEL: info
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-creds
+  namespace: myapp
+spec:
+  DB_PASSWORD: secret123
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: app-storage
+spec:
+  capacity:
+    storage: 10Gi
+  storageClassName: local
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /tmp/royak-myapp
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: myapp
+spec:
+  storageClassName: local
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: myapp
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: myapp
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: api
+          image: python:3.12-alpine
+          command: ["python3", "-m", "http.server", "8000"]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-monitor
+  namespace: myapp
+spec:
+  template:
+    spec:
+      containers:
+        - name: monitor
+          image: alpine:latest
+          command: ["sh", "-c", "while true; do echo $(date) ok; sleep 30; done"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: myapp
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: init
+          image: alpine:latest
+          command: ["sh", "-c", "echo 'DB initialized at' $(date)"]
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+spec:
+  scaleTargetRef:
+    name: frontend
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: main-ingress
+  namespace: myapp
+spec:
+  rules:
+    - host: myapp.local
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+          - path: /api
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-policy
+  namespace: myapp
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: database
