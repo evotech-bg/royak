@@ -824,6 +824,12 @@ pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str) -> Result<Str
             Ok(n) => response.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            // The daemon often RESETs the connection at the end of the build
+            // stream instead of a clean EOF (seen on GitHub-hosted Docker). Treat
+            // reset/broken-pipe as end-of-stream and judge success from the body
+            // + the image store below, not from how the socket closed.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset
+                   || e.kind() == std::io::ErrorKind::BrokenPipe => break,
             Err(e) => return Err(format!("Read build stream: {e}")),
         }
     }
@@ -846,10 +852,16 @@ pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str) -> Result<Str
         }
     }
     // A malformed HTTP status (e.g. 400/500) with no JSON error line.
-    if err.is_none() && text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 5") {
-        if err.is_none() {
-            err = Some(text.lines().next().unwrap_or("build failed").to_string());
-        }
+    if err.is_none() && (text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 5")) {
+        err = Some(text.lines().next().unwrap_or("build failed").to_string());
+    }
+
+    // Ground truth: if the tagged image now exists in the store, the build
+    // succeeded — regardless of how the stream ended. This overrides a spurious
+    // error from an abruptly-closed connection while still honouring a real
+    // build error (which would have left no image).
+    if image_exists_locally(tag) {
+        return Ok(logbuf);
     }
 
     match err {

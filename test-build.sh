@@ -79,6 +79,9 @@ docker ps -a --filter "name=rk-btweb" -q | xargs -r docker rm -f 2>/dev/null || 
 docker rmi -f royak-bt:v1 >/dev/null 2>&1 || true
 rm -f .royak-state.json .royak-state.json.nrns .royak-state.json.lock 2>/dev/null || true
 lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+# Warm the base image so the build's `FROM nginx:alpine` doesn't pay a cold
+# registry pull inside the builder (that alone is ~2 min on a fresh CI runner).
+docker pull nginx:alpine >/dev/null 2>&1 || true
 
 echo ""
 echo "1. Register repo + build pipeline"
@@ -106,9 +109,9 @@ check "webhook accepts trigger" "echo \"\$WH\" | grep -q '\"status\":\"ok\"'"
 
 # Poll for the true end state — the deployed container is up and serving — so the
 # assertions never race the build/deploy (build time + local-image create vary by
-# host; a fresh runner also pays a cold nginx:alpine pull). Up to ~150s.
+# host; a fresh runner also pays a cold nginx:alpine pull). Up to ~4 min.
 CID=""
-for _ in $(seq 1 75); do
+for _ in $(seq 1 120); do
     CID=$(docker ps --filter "name=rk-btweb" --filter "status=running" -q | head -1)
     [ -n "$CID" ] && docker exec "$CID" wget -qO- localhost 2>/dev/null | grep -q "$MARK" && break
     sleep 2
@@ -125,6 +128,17 @@ echo "────────────────────────�
 CID=$(docker ps --filter "name=rk-btweb" -q | head -1)
 check "deployed app serves the build-time marker ($MARK)" \
     "[ -n '$CID' ] && docker exec $CID wget -qO- localhost 2>/dev/null | grep -q '$MARK'"
+
+if [ "$FAIL" -ne 0 ]; then
+    echo ""
+    echo "─── diagnostics (failure) ─────────────────────────"
+    echo "reconcile log (pipeline + create lines):"
+    grep -iE "pipeline|build|btweb|create|start|pull|warn|error|✗" /tmp/rk-buildtest.log | tail -30 | sed 's/^/    /'
+    echo "docker images royak-bt:"
+    docker images royak-bt --format '    {{.Repository}}:{{.Tag}} {{.ID}}' 2>&1
+    echo "docker ps -a (rk-btweb):"
+    docker ps -a --filter "name=rk-btweb" --format '    {{.Names}} {{.Image}} {{.Status}}' 2>&1
+fi
 
 echo ""
 echo "════════════════════════════════════════"
