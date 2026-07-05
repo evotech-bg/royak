@@ -5056,12 +5056,21 @@ pub fn invoke_function(desired: &mut DesiredWorld, name: &str) -> Result<String,
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
 
-                    // Get output
-                    let output = docker::get_logs(&id[..12.min(id.len())], 100)
-                        .unwrap_or_default();
-                    let clean: String = output.chars()
-                        .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-                        .collect();
+                    // Get output. A very fast function (e.g. `echo`) can exit
+                    // before Docker flushes its stdout to the logs endpoint, so
+                    // an immediate read may come back empty. Retry a few times
+                    // on empty output before giving up — deterministic instead
+                    // of racy on loaded hosts (e.g. CI runners).
+                    let short = &id[..12.min(id.len())];
+                    let mut clean = String::new();
+                    for attempt in 0..10 {
+                        let output = docker::get_logs(short, 100).unwrap_or_default();
+                        clean = output.chars()
+                            .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+                            .collect();
+                        if !clean.trim().is_empty() || attempt == 9 { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
 
                     let elapsed = start.elapsed();
 

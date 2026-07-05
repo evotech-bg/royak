@@ -995,7 +995,11 @@ pub fn setup_pod_dns(rootfs: &Path, pod_name: &str, pod_ip: &str, peers: &[(Stri
 /// Get runtime by name
 pub fn get_runtime(name: &str) -> Box<dyn ContainerRuntime> {
     match name {
-        "light" => Box::new(LightRuntime::new()),
+        // "neuropod" and "light" share the Docker-free OCI puller (registry v2
+        // over curl). `watch --runtime neuropod` drives the full NeuroPod
+        // reconcile path separately; for one-shot `pull`, the OCI puller is the
+        // no-Docker code path, and it seeds ~/.royak/{images,containers,logs}.
+        "light" | "neuropod" => Box::new(LightRuntime::new()),
         "cri" | "cri-o" | "containerd" => Box::new(CriRuntime::new("/var/run/crio/crio.sock")),
         _ => Box::new(DockerRuntime),
     }

@@ -10,8 +10,10 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+SKIP=0
 pass() { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  ✗ $1"; }
+skip() { SKIP=$((SKIP+1)); echo "  ⊘ $1"; }
 check() {
     if eval "$2" >/dev/null 2>&1; then pass "$1"; else fail "$1"; fi
 }
@@ -385,8 +387,17 @@ YAML
 check "Function applied" "echo '$OUT' | grep -qi 'function/hello-ci'"
 OUT=$($BIN functions 2>&1)
 check "Function listed" "echo '$OUT' | grep -q 'hello-ci'"
-OUT=$($BIN invoke hello-ci 2>&1)
+# Invoke can be transiently slow under heavy parallel load (image pull /
+# daemon contention on CI). Retry a few times before judging, and on final
+# failure print what invoke actually returned so the log shows ground truth.
+OUT=""
+for _ in 1 2 3; do
+    OUT=$($BIN invoke hello-ci 2>&1)
+    echo "$OUT" | grep -q 'hello-from-function' && break
+    sleep 2
+done
 check "Function invocation output" "echo '$OUT' | grep -q 'hello-from-function'"
+echo "$OUT" | grep -q 'hello-from-function' || { echo "    ─ invoke output was:"; echo "$OUT" | sed 's/^/      /'; }
 
 # ═══════════════════════════════════════════
 echo ""
@@ -738,7 +749,30 @@ echo ""
 echo "28f. NetworkPolicy egress L4 enforcement (real iptables)"
 echo "────────────────────────────────────────────────────────"
 docker ps -a --filter "name=rk-egt" -q | xargs -r docker rm -f 2>/dev/null || true
-$BIN apply - <<'YAML' > /dev/null 2>&1
+
+# ── Capability probe ──────────────────────────────────────────────
+# L4 enforcement writes iptables rules INSIDE a pod's netns via a helper
+# container that joins it with NET_ADMIN. That needs the host kernel to let
+# iptables initialize the `filter` table from within a nested container netns.
+# Native Linux and Colima can; GitHub's hosted runners cannot (the nf_tables
+# filter table won't init there). Probe the real capability so we run the hard
+# assertions where they're meaningful and skip — honestly, with a reason —
+# where the host kernel can't, instead of reporting a false failure.
+docker rm -f rk-npprobe >/dev/null 2>&1 || true
+docker run -d --name rk-npprobe alpine:3.21 sleep 60 >/dev/null 2>&1
+NP_CAP=$(docker run --rm --network container:rk-npprobe --cap-add NET_ADMIN alpine:3.21 \
+    sh -c 'apk add -q --no-cache iptables >/dev/null 2>&1; \
+           iptables -A OUTPUT -p tcp --dport 9 -j DROP 2>/dev/null && \
+           iptables -S OUTPUT 2>/dev/null | grep -q -- "--dport 9 -j DROP" && echo CAP_OK' \
+    2>/dev/null)
+docker rm -f rk-npprobe >/dev/null 2>&1 || true
+
+if [ "$NP_CAP" != "CAP_OK" ]; then
+    skip "L4 iptables applied in pod netns (host kernel can't init iptables in a nested netns — native Linux/Colima can; GitHub hosted runners can't)"
+    skip "egress to allowed port 443 works (L4 enforcement unavailable on this host)"
+    skip "egress to denied port 80 is DROPPED (L4 enforcement unavailable on this host)"
+else
+    $BIN apply - <<'YAML' > /dev/null 2>&1
 kind: Deployment
 metadata: {name: egt}
 spec:
@@ -752,21 +786,22 @@ spec:
   egress:
     - ports: [{port: 443}]
 YAML
-lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-$BIN watch --interval 2 --ingress-port 0 > /tmp/rk-netpol.log 2>&1 &
-NP_WPID=$!
-# Enforcement runs an iptables helper (pulls alpine + apk add iptables on cold
-# cache) — poll up to 60s for it to apply rather than a fixed sleep.
-NP_ENFORCED=""
-for _ in $(seq 1 60); do
-    if grep -q "L4 iptables enforced" /tmp/rk-netpol.log 2>/dev/null; then NP_ENFORCED=yes; break; fi
-    sleep 1
-done
-check "L4 iptables applied in pod netns" "[ \"$NP_ENFORCED\" = \"yes\" ]"
-check "egress to allowed port 443 works" "docker exec rk-egt-1 sh -c 'nc -w 3 -z 1.1.1.1 443'"
-check "egress to denied port 80 is DROPPED" "! docker exec rk-egt-1 sh -c 'nc -w 3 -z 1.1.1.1 80'"
-kill -TERM "$NP_WPID" 2>/dev/null || true
-wait "$NP_WPID" 2>/dev/null || true
+    lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    $BIN watch --interval 2 --ingress-port 0 > /tmp/rk-netpol.log 2>&1 &
+    NP_WPID=$!
+    # Enforcement runs an iptables helper (pulls alpine + apk add iptables on cold
+    # cache) — poll up to 60s for it to apply rather than a fixed sleep.
+    NP_ENFORCED=""
+    for _ in $(seq 1 60); do
+        if grep -q "L4 iptables enforced" /tmp/rk-netpol.log 2>/dev/null; then NP_ENFORCED=yes; break; fi
+        sleep 1
+    done
+    check "L4 iptables applied in pod netns" "[ \"$NP_ENFORCED\" = \"yes\" ]"
+    check "egress to allowed port 443 works" "docker exec rk-egt-1 sh -c 'nc -w 3 -z 1.1.1.1 443'"
+    check "egress to denied port 80 is DROPPED" "! docker exec rk-egt-1 sh -c 'nc -w 3 -z 1.1.1.1 80'"
+    kill -TERM "$NP_WPID" 2>/dev/null || true
+    wait "$NP_WPID" 2>/dev/null || true
+fi
 docker ps -a --filter "name=rk-egt" -q | xargs -r docker rm -f 2>/dev/null || true
 
 # ═══════════════════════════════════════════
@@ -933,7 +968,7 @@ $BIN delete deployment/sickapp >/dev/null 2>&1 || true
 # ═══════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════"
-echo "  Results: $PASS passed, $FAIL failed (out of $TOTAL)"
+echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped (out of $TOTAL run)"
 echo "════════════════════════════════════════"
 
 # Cleanup
