@@ -250,7 +250,21 @@ pub fn remove_container(id: &str, force: bool) -> Result<(), String> {
 }
 
 /// Pull an image (waits for completion)
+/// True if an image already exists in the local Docker image store.
+pub fn image_exists_locally(image: &str) -> bool {
+    match docker_request("GET", &format!("/images/{image}/json"), None) {
+        Ok(body) => body.contains("\"Id\"") || body.contains("\"Config\""),
+        Err(_) => false,
+    }
+}
+
 pub fn pull_image(image: &str) -> Result<(), String> {
+    // IfNotPresent: never hit a registry for an image we already have — notably
+    // images built locally by a `build` pipeline stage (royak-<app>:<tag>),
+    // which have no registry to pull from and would otherwise 404 slowly.
+    if image_exists_locally(image) {
+        return Ok(());
+    }
     let (repo, tag) = if let Some(pos) = image.rfind(':') {
         (&image[..pos], &image[pos+1..])
     } else {
@@ -737,4 +751,192 @@ pub fn apply_netns_iptables(pod_id: &str, rules: &[Vec<String>]) -> Result<(), S
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     Ok(())
+}
+
+// ─── Image build from source (git context → OCI image) ───
+//
+// The keystone that turns Royak from "deploy existing images" (GitOps) into
+// "build from source, then deploy" (PaaS). Builds happen via the Docker Engine
+// `/build` endpoint: we tar the build context and POST it, streaming back the
+// build log. Builds are slow (seconds to minutes), so a build MUST NOT run
+// inline in the reconcile loop — `start_build` spawns it on a background thread
+// and `poll_build` lets the loop check progress each tick without blocking.
+
+use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+
+/// Build an image from a local context directory containing a Dockerfile.
+/// Blocking — call from a background thread (see `start_build`). Returns the
+/// build log on success, or an error message (Docker's own error text) on
+/// failure. `tag` is the resulting image name:tag (may be a local-only tag).
+pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str) -> Result<String, String> {
+    if !std::path::Path::new(context_dir).exists() {
+        return Err(format!("build context '{context_dir}' does not exist"));
+    }
+    if !std::path::Path::new(context_dir).join(dockerfile).exists() {
+        return Err(format!("{dockerfile} not found in build context '{context_dir}'"));
+    }
+
+    // Tar the context (excluding .git to keep it small). `tar` is ubiquitous;
+    // we stream its stdout into memory as the request body. `--no-xattrs` is
+    // REQUIRED: macOS stamps files with a `com.apple.provenance` xattr that the
+    // Linux-side builder rejects on unpack (`lsetxattr ... not supported`); the
+    // flag is understood by both bsdtar (macOS) and GNU tar (Linux).
+    let out = std::process::Command::new("tar")
+        .args(["--no-xattrs", "--exclude=./.git", "-cf", "-", "-C", context_dir, "."])
+        .output()
+        .map_err(|e| format!("tar context failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("tar context failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let tar_body = out.stdout;
+
+    // POST the tar to /build. `rm=1&forcerm=1` cleans up intermediate build
+    // containers; `dockerfile` names the Dockerfile within the context.
+    let df = urlencode(dockerfile);
+    let t = urlencode(tag);
+    let path = format!("/build?t={t}&dockerfile={df}&rm=1&forcerm=1");
+
+    let mut stream = UnixStream::connect(docker_sock())
+        .map_err(|e| format!("Cannot connect to Docker: {e}"))?;
+    // Builds can take minutes — generous read timeout, and we read until the
+    // daemon closes the connection (end of the streamed build log).
+    stream.set_read_timeout(Some(Duration::from_secs(900))).ok();
+
+    let header = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/x-tar\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        tar_body.len()
+    );
+    stream.write_all(header.as_bytes()).map_err(|e| format!("Write header: {e}"))?;
+    stream.write_all(&tar_body).map_err(|e| format!("Write context: {e}"))?;
+    stream.flush().ok();
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => return Err(format!("Read build stream: {e}")),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&response).to_string();
+    // Body starts after the HTTP headers; it's a stream of JSON objects, one
+    // per progress line: {"stream":"..."} on progress, {"error":"...",
+    // "errorDetail":{...}} on failure. Success has no "error" key.
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or(&text);
+    // Collect human-readable "stream" lines for the log, and detect errors.
+    let mut logbuf = String::new();
+    let mut err: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') { continue; }
+        if let Some(msg) = json_str_field(line, "error") {
+            err = Some(msg);
+        } else if let Some(s) = json_str_field(line, "stream") {
+            logbuf.push_str(&s);
+        }
+    }
+    // A malformed HTTP status (e.g. 400/500) with no JSON error line.
+    if err.is_none() && text.starts_with("HTTP/1.1 4") || text.starts_with("HTTP/1.1 5") {
+        if err.is_none() {
+            err = Some(text.lines().next().unwrap_or("build failed").to_string());
+        }
+    }
+
+    match err {
+        Some(e) => Err(e.trim().to_string()),
+        None => Ok(logbuf),
+    }
+}
+
+/// Minimal application/x-www-form-urlencode for query values (image tags,
+/// filenames). Enough for the characters that appear in tags and paths.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Extract a top-level JSON string field's value from one compact JSON line,
+/// unescaping the common `\n`, `\t`, `\"`, `\\` sequences. Deliberately tiny —
+/// the Docker build stream lines are flat objects, so this avoids a JSON dep.
+fn json_str_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// Poll state for a background build job.
+pub enum BuildPoll {
+    NotStarted,
+    Running,
+    Done(Result<String, String>),
+}
+
+fn build_jobs() -> &'static Mutex<HashMap<String, Arc<Mutex<Option<Result<String, String>>>>>> {
+    static JOBS: OnceLock<Mutex<HashMap<String, Arc<Mutex<Option<Result<String, String>>>>>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Kick off a build on a background thread, keyed by `job`. Idempotent: if a
+/// job with this key already exists, does nothing (the loop keeps polling it).
+pub fn start_build(job: &str, context_dir: String, dockerfile: String, tag: String) {
+    let mut map = build_jobs().lock().unwrap();
+    if map.contains_key(job) { return; }
+    let slot: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
+    map.insert(job.to_string(), slot.clone());
+    drop(map);
+    std::thread::spawn(move || {
+        let result = build_image(&context_dir, &dockerfile, &tag);
+        *slot.lock().unwrap() = Some(result);
+    });
+}
+
+/// Check a build job's progress without blocking.
+pub fn poll_build(job: &str) -> BuildPoll {
+    let map = build_jobs().lock().unwrap();
+    match map.get(job) {
+        None => BuildPoll::NotStarted,
+        Some(slot) => match &*slot.lock().unwrap() {
+            None => BuildPoll::Running,
+            Some(r) => BuildPoll::Done(r.clone()),
+        },
+    }
+}
+
+/// Forget a finished build job (call once its result has been consumed).
+pub fn clear_build(job: &str) {
+    build_jobs().lock().unwrap().remove(job);
 }

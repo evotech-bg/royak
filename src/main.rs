@@ -1910,6 +1910,7 @@ pub fn save_state(path: &str, world: &DesiredWorld) {
             "stages": p.stages.iter().map(|s| serde_json::json!({
                 "name": s.name, "image": s.image, "command": s.command,
                 "action": s.action, "file": s.file, "artifacts": s.artifacts,
+                "context": s.context, "dockerfile": s.dockerfile, "tag": s.tag,
                 "dependsOn": s.depends_on, "env": s.env,
                 "if": s.if_condition, "matrixImages": s.matrix_images,
             })).collect::<Vec<_>>(),
@@ -2445,6 +2446,9 @@ fn load_state(path: &str) -> DesiredWorld {
                             command: s["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
                             action: s["action"].as_str().map(|s| s.to_string()),
                             file: s["file"].as_str().map(|s| s.to_string()),
+                            context: s["context"].as_str().map(|s| s.to_string()),
+                            dockerfile: s["dockerfile"].as_str().map(|s| s.to_string()),
+                            tag: s["tag"].as_str().map(|s| s.to_string()),
                             artifacts: s["artifacts"].as_array()
                                 .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                                 .unwrap_or_default(),

@@ -100,6 +100,13 @@ Tested with kubectl **v1.36** against `royak api`:
 Pipelines (CI/CD DAGs), Functions (invoke), Guards (declarative auto-remediation), neural anomaly
 detection, MCP server for AI assistants, NeuroPod experimental Docker-free runtime.
 
+**Build from source (PaaS).** A pipeline stage with `action: build` turns a git context (a
+registered repository or a path) into an image via the Docker Engine `/build` API, which a later
+`action: apply` stage deploys — so `git push → webhook → build → deploy → live app` works end to
+end, no external CI or registry required. Dockerfile-based today (Nixpacks-style auto-detection is
+not yet implemented). Verified live by `test-build.sh`: the deployed container serves a marker baked
+in at build time, proving the running image was built from the source.
+
 ---
 
 Found a row that doesn't match reality? That's a bug in this document — please open an issue.

@@ -226,6 +226,35 @@ jobs:
       - name: NeuroPod smoke (EXPERIMENTAL)
         run: bash test-neuropod.sh
 
+  build-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-buildpipe-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: "PaaS build pipeline: git context → image → deploy → serve"
+        run: bash test-build.sh
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f $(docker ps -a --filter "name=rk-" -q) 2>/dev/null || true
+
   load-test:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'

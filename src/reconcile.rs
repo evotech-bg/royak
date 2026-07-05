@@ -42,6 +42,9 @@ pub struct StoredStage {
     pub command: Option<Vec<String>>,
     pub action: Option<String>,
     pub file: Option<String>,
+    pub context: Option<String>,      // action: build — repo name or path
+    pub dockerfile: Option<String>,   // action: build — Dockerfile name
+    pub tag: Option<String>,          // action: build — output image tag
     pub artifacts: Vec<String>,
     pub depends_on: Option<String>,
     pub env: Vec<String>,
@@ -1767,6 +1770,9 @@ impl DesiredWorld {
                         command: s.command.clone(),
                         action: s.action.clone(),
                         file: s.file.clone(),
+                        context: s.context.clone(),
+                        dockerfile: s.dockerfile.clone(),
+                        tag: s.tag.clone(),
                         artifacts: s.artifacts.clone().unwrap_or_default(),
                         depends_on: s.depends_on.clone(),
                         env,
@@ -3337,6 +3343,49 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     }
 
     // 8. Pipeline runs — execute stages as Jobs in DAG order
+
+    // Pre-pass: advance in-flight background BUILD stages. Builds run off-thread
+    // (not as containers), so the container-based completion detection never
+    // fires for them — poll the build registry directly and update their status.
+    {
+        let mut updates: Vec<(usize, String, StageStatus, String)> = Vec::new();
+        for (ri, run) in desired.pipeline_runs.iter().enumerate() {
+            let pipeline = match desired.pipelines.get(&run.pipeline) { Some(p) => p, None => continue };
+            for s in pipeline.stages.iter().filter(|s| s.action.as_deref() == Some("build")) {
+                let running = run.stage_status.iter().any(|(n, st)| n == &s.name && *st == StageStatus::Running);
+                if !running { continue; }
+                let tag = s.tag.clone().unwrap_or_else(|| format!("royak-{}:{}", run.pipeline, run.run_id));
+                let job = format!("rk-build-{}-{}-{}", run.pipeline, run.run_id, s.name);
+                match docker::poll_build(&job) {
+                    docker::BuildPoll::Done(Ok(_)) => {
+                        docker::clear_build(&job);
+                        updates.push((ri, s.name.clone(), StageStatus::Succeeded,
+                            format!("  [pipeline] {}#{}: stage '{}' built {tag} ✓", run.pipeline, run.run_id, s.name)));
+                    }
+                    docker::BuildPoll::Done(Err(e)) => {
+                        docker::clear_build(&job);
+                        let short: String = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(&e).chars().take(200).collect();
+                        updates.push((ri, s.name.clone(), StageStatus::Failed,
+                            format!("  [pipeline] {}#{}: stage '{}' ✗ build failed: {short}", run.pipeline, run.run_id, s.name)));
+                    }
+                    docker::BuildPoll::NotStarted => {
+                        // Process restarted mid-build; the in-memory job is gone.
+                        // Reset to Pending so the stage rebuilds (crash-safety).
+                        updates.push((ri, s.name.clone(), StageStatus::Pending,
+                            format!("  [pipeline] {}#{}: stage '{}' build lost (restart) → retrying", run.pipeline, run.run_id, s.name)));
+                    }
+                    docker::BuildPoll::Running => {}
+                }
+            }
+        }
+        for (ri, sname, st, msg) in updates {
+            if let Some(run_mut) = desired.pipeline_runs.get_mut(ri) {
+                for (n, s) in run_mut.stage_status.iter_mut() { if n == &sname { *s = st.clone(); } }
+            }
+            log.push(msg);
+        }
+    }
+
     let mut run_idx = 0;
     while run_idx < desired.pipeline_runs.len() {
         let run = &desired.pipeline_runs[run_idx];
@@ -3477,6 +3526,74 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                                         for (n, s) in run_mut.stage_status.iter_mut() {
                                             if n == &stage_name { *s = StageStatus::Failed; }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    } else if action == "build" {
+                        // Build an image from a git context (PaaS: source → image).
+                        // The build runs on a background thread so it never blocks
+                        // the reconcile loop; we poll it across ticks like a Job.
+                        let job = format!("rk-build-{pipeline_name}-{run_id}-{stage_name}");
+                        let ctx_name = sd.context.clone();
+                        let dockerfile = sd.dockerfile.clone().unwrap_or_else(|| "Dockerfile".to_string());
+                        let tag = sd.tag.clone().unwrap_or_else(|| format!("royak-{pipeline_name}:{run_id}"));
+                        // `sd` / `pipeline` are not used past this point in this arm.
+                        match docker::poll_build(&job) {
+                            docker::BuildPoll::NotStarted => {
+                                let branch = desired.repositories.values().next()
+                                    .map(|r| r.branch.clone()).unwrap_or_else(|| "main".to_string());
+                                // Default context = the pipeline's first linked repo.
+                                let ctx = ctx_name.or_else(|| desired.repositories.keys().next().cloned());
+                                match ctx {
+                                    None => {
+                                        log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build: no context (set stage.context or register a repo)"));
+                                        if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
+                                            for (n, s) in run_mut.stage_status.iter_mut() {
+                                                if n == &stage_name { *s = StageStatus::Failed; }
+                                            }
+                                        }
+                                    }
+                                    Some(cn) => match resolve_build_context(desired, &cn, &branch) {
+                                        Ok(dir) => {
+                                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' → build {tag} from {dir} ({dockerfile})"));
+                                            docker::start_build(&job, dir, dockerfile, tag);
+                                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
+                                                for (n, s) in run_mut.stage_status.iter_mut() {
+                                                    if n == &stage_name { *s = StageStatus::Running; }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build context: {e}"));
+                                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
+                                                for (n, s) in run_mut.stage_status.iter_mut() {
+                                                    if n == &stage_name { *s = StageStatus::Failed; }
+                                                }
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                            docker::BuildPoll::Running => {
+                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: building '{stage_name}'..."));
+                            }
+                            docker::BuildPoll::Done(Ok(_)) => {
+                                docker::clear_build(&job);
+                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' built {tag} ✓"));
+                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
+                                    for (n, s) in run_mut.stage_status.iter_mut() {
+                                        if n == &stage_name { *s = StageStatus::Succeeded; }
+                                    }
+                                }
+                            }
+                            docker::BuildPoll::Done(Err(e)) => {
+                                docker::clear_build(&job);
+                                let short: String = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(&e).chars().take(200).collect();
+                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build failed: {short}"));
+                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
+                                    for (n, s) in run_mut.stage_status.iter_mut() {
+                                        if n == &stage_name { *s = StageStatus::Failed; }
                                     }
                                 }
                             }
@@ -3944,6 +4061,49 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
 
 fn dirs_or_home() -> std::path::PathBuf {
     std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+}
+
+/// Resolve a `build` stage's context into a local directory holding the source.
+/// `ctx` is either a registered repository name or a filesystem path. A registered
+/// remote repo (url, no local path) is cloned/updated under ~/.royak/repos/<name>,
+/// so `git push` → build works end-to-end.
+fn resolve_build_context(desired: &DesiredWorld, ctx: &str, branch: &str) -> Result<String, String> {
+    if let Some(repo) = desired.repositories.get(ctx) {
+        if let Some(p) = &repo.path {
+            if std::path::Path::new(p).exists() { return Ok(p.clone()); }
+            return Err(format!("repo '{ctx}' path '{p}' does not exist"));
+        }
+        if let Some(url) = &repo.url {
+            let br = if repo.branch.is_empty() { branch } else { repo.branch.as_str() };
+            let base = dirs_or_home().join(".royak").join("repos");
+            let dest = base.join(ctx);
+            let dest_str = dest.to_string_lossy().to_string();
+            if dest.join(".git").exists() {
+                // Existing checkout — fast-forward to the tip of the branch.
+                std::process::Command::new("git")
+                    .args(["-C", &dest_str, "fetch", "--depth", "1", "origin", br]).output().ok();
+                let reset = std::process::Command::new("git")
+                    .args(["-C", &dest_str, "reset", "--hard", &format!("origin/{br}")]).output()
+                    .map_err(|e| format!("git reset failed: {e}"))?;
+                if !reset.status.success() {
+                    return Err(format!("git reset failed: {}", String::from_utf8_lossy(&reset.stderr)));
+                }
+            } else {
+                std::fs::create_dir_all(&base).ok();
+                let out = std::process::Command::new("git")
+                    .args(["clone", "--depth", "1", "-b", br, url, &dest_str]).output()
+                    .map_err(|e| format!("git clone failed: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("git clone failed: {}", String::from_utf8_lossy(&out.stderr)));
+                }
+            }
+            return Ok(dest_str);
+        }
+        return Err(format!("repo '{ctx}' has neither path nor url"));
+    }
+    // Not a registered repo — treat as a direct filesystem path.
+    if std::path::Path::new(ctx).exists() { return Ok(ctx.to_string()); }
+    Err(format!("build context '{ctx}' not found (no such repository or path)"))
 }
 
 /// Start a pipeline run

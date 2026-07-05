@@ -114,7 +114,7 @@ kubectl --server=http://localhost:6443 get pods
 | **kubectl API** | `get`/`describe`/`delete`/`watch`/`logs`/`scale`/`exec` (incl. `-it` TTY)/`get events` + `apply` incl. client-side updates |
 | **Stdin Pipe** | `cat file.yaml \| royak apply -` or `helm template \| royak apply -` |
 | **HPA** | Auto-scaling based on real Docker CPU stats |
-| **Pipelines** | CI/CD with DAG dependencies, git triggers, matrix builds |
+| **Pipelines** | CI/CD with DAG dependencies, git triggers, matrix builds, and `action: build` (git source → image → deploy, PaaS-style — no external CI/registry) |
 | **Ingress** | Live reverse proxy — async, streaming, binary-safe, TLS, path-based routing |
 | **Multi-node** | UDP autodiscovery, pod distribution, heartbeat monitoring, cross-node mesh proxy |
 | **HA leader lease** | File-based election, automatic failover (15s TTL) |

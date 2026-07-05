@@ -251,8 +251,15 @@ pub struct PipelineStage {
     pub name: String,
     pub image: Option<String>,
     pub command: Option<Vec<String>>,
-    pub action: Option<String>,     // "apply" for deploy stages
+    pub action: Option<String>,     // "apply" for deploy stages, "build" for image builds
     pub file: Option<String>,       // for action: apply
+    /// action: build — build context (a registered repository name, or a
+    /// filesystem path). Defaults to the pipeline's first linked repo.
+    pub context: Option<String>,
+    /// action: build — Dockerfile name within the context (default "Dockerfile")
+    pub dockerfile: Option<String>,
+    /// action: build — resulting image tag (default royak-<pipeline>:<runId>)
+    pub tag: Option<String>,
     pub artifacts: Option<Vec<String>>,
     #[serde(rename = "dependsOn")]
     pub depends_on: Option<String>, // stage name this depends on
