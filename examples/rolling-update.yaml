@@ -1,0 +1,33 @@
+# Rolling update demo.
+#
+# Step 1: Deploy v1
+#   royak apply examples/rolling-update.yaml
+#
+# Step 2: Change image to nginx:latest below, then re-apply:
+#   royak apply examples/rolling-update.yaml
+#   → [rollout] web: nginx:alpine → nginx:latest (1/3 done)
+#   → [rollout] web: COMPLETE
+#
+# Step 3: Rollback
+#   royak rollback web
+#   → Rolling back web to nginx:alpine...
+#   → [rollout] web: COMPLETE
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "128Mi"

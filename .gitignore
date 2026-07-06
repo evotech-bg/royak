@@ -1,0 +1,15 @@
+/target
+.royak-state*
+.royak-brain.bin
+*.swp
+*.swo
+.DS_Store
+
+# Local IDE + runtime
+.claude/
+*.bundle
+
+# Local Linux cross-build for mesh verification on macOS
+target-linux/
+.cargo-docker/
+_linuxtest/

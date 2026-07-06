@@ -1,0 +1,36 @@
+# Redis cluster via Operator pattern.
+# The operator defines HOW to provision a RedisCluster.
+# The CustomResource says "I want one."
+#
+# Deploy: royak apply examples/redis-operator.yaml
+# Check:  royak get deployments
+#         (should see my-redis-primary and my-redis-replica)
+# Note:   Uses redis:alpine — lightweight, pulls fast.
+
+apiVersion: v1
+kind: Operator
+metadata:
+  name: redis-operator
+spec:
+  customKind: RedisCluster
+  provision:
+  - role: primary
+    image: redis:alpine
+    replicas: 1
+    env:
+    - "REDIS_ROLE=master"
+  - role: replica
+    image: redis:alpine
+    replicas: 2
+    env:
+    - "REDIS_ROLE=slave"
+  hooks:
+    on_create: "echo Redis cluster provisioned"
+---
+apiVersion: v1
+kind: CustomResource
+metadata:
+  name: my-redis
+spec:
+  resourceKind: RedisCluster
+  replicas: 3

@@ -1,0 +1,41 @@
+# Serverless Functions — K8s doesn't have this!
+# Deploy with: royak apply examples/function.yaml
+# Invoke with: royak invoke hello
+# Or via HTTP: curl http://localhost:6443/api/hello
+# Or webhook:  curl http://localhost:6443/hooks/greet
+
+apiVersion: royak/v1
+kind: Function
+metadata:
+  name: hello
+spec:
+  runtime: python3.12
+  command: ["python3", "-c", "print('Hello from Orinetes Lambda!')"]
+  trigger:
+    - http: /api/hello
+    - webhook: /hooks/greet
+  timeout: 10s
+  memory: 64Mi
+---
+apiVersion: royak/v1
+kind: Function
+metadata:
+  name: date-service
+spec:
+  image: alpine:latest
+  command: ["date", "+%Y-%m-%d %H:%M:%S"]
+  trigger:
+    - http: /api/date
+  timeout: 5s
+---
+apiVersion: royak/v1
+kind: Function
+metadata:
+  name: system-info
+spec:
+  image: alpine:latest
+  command: ["sh", "-c", "echo hostname=$(hostname) cpu=$(nproc) mem=$(free -m 2>/dev/null | awk '/Mem/{print $2}' || echo N/A)MB"]
+  trigger:
+    - http: /api/system
+    - webhook: /hooks/health
+  timeout: 10s

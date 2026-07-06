@@ -1,0 +1,39 @@
+apiVersion: royak/v1
+kind: Pipeline
+metadata:
+  name: deploy-app
+spec:
+  trigger:
+    - type: webhook
+      path: /hooks/deploy
+    - type: manual
+  stages:
+    - name: build
+      image: rust:latest
+      command: ["cargo", "build", "--release"]
+      artifacts: ["target/release/myapp"]
+    - name: test
+      image: rust:latest
+      command: ["cargo", "test"]
+      dependsOn: build
+    - name: deploy
+      action: apply
+      file: examples/nginx.yaml
+      dependsOn: test
+---
+# Quick pipeline: lint + deploy
+apiVersion: royak/v1
+kind: Pipeline
+metadata:
+  name: quick-deploy
+spec:
+  trigger:
+    - type: manual
+  stages:
+    - name: lint
+      image: alpine:latest
+      command: ["echo", "lint passed"]
+    - name: deploy
+      action: apply
+      file: examples/nginx.yaml
+      dependsOn: lint

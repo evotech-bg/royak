@@ -1,0 +1,38 @@
+# RBAC roles — control who can do what.
+# When no roles are defined, all operations are allowed (open by default).
+# Once at least one role exists, the API enforces permissions.
+#
+# Deploy: royak apply examples/rbac-roles.yaml
+# Test:   curl -X POST http://localhost:6443/apis/apps/v1/deployments \
+#              -H "X-Royak-Role: viewer" \
+#              -d '...'   # → 403 Forbidden
+
+apiVersion: v1
+kind: RbacRole
+metadata:
+  name: admin
+spec:
+  rules:
+  - resources: ["*"]
+    verbs: ["*"]
+    namespaces: ["*"]
+---
+apiVersion: v1
+kind: RbacRole
+metadata:
+  name: viewer
+spec:
+  rules:
+  - resources: ["pods", "deployments", "services", "configmaps"]
+    verbs: ["get", "list"]
+    namespaces: ["*"]
+---
+apiVersion: v1
+kind: RbacRole
+metadata:
+  name: deployer
+spec:
+  rules:
+  - resources: ["deployments", "configmaps"]
+    verbs: ["get", "list", "create", "update"]
+    namespaces: ["default"]

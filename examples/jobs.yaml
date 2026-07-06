@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: monitor
+spec:
+  template:
+    spec:
+      containers:
+        - name: monitor
+          image: alpine:latest
+          command: ["sh", "-c", "while true; do echo \"[monitor] $(date) - system ok\"; sleep 30; done"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-db
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: migrator
+          image: alpine:latest
+          command: ["sh", "-c", "echo 'Running DB migration...' && sleep 2 && echo 'Migration complete!'"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup
+spec:
+  schedule: "*/5 * * * *"
+  template:
+    spec:
+      containers:
+        - name: cleaner
+          image: alpine:latest
+          command: ["sh", "-c", "echo 'Cleanup at' $(date) && echo 'Done'"]

@@ -1,0 +1,21 @@
+[Unit]
+Description=Royak Container Orchestrator
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/royak watch
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/royak.log
+StandardError=append:/var/log/royak.log
+WorkingDirectory=/etc/royak
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/royak /var/log /var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target
