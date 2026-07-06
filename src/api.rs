@@ -188,6 +188,10 @@ fn json_response(status: u16, body: &str) -> hyper::Response<BoxedBody> {
     hyper::Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        // Allow read-only cross-origin dashboards (e.g. demo.royak.io) to fetch
+        // stats. This only exposes GET responses; mutations still require the
+        // X-Royak-Token header, which CORS does not bypass.
+        .header("Access-Control-Allow-Origin", "*")
         .body(Full::new(Bytes::from(body.to_string())).boxed())
         .unwrap()
 }
@@ -196,6 +200,7 @@ fn typed_response(status: u16, body: &str, content_type: &str) -> hyper::Respons
     hyper::Response::builder()
         .status(status)
         .header("Content-Type", content_type)
+        .header("Access-Control-Allow-Origin", "*")
         .body(Full::new(Bytes::from(body.to_string())).boxed())
         .unwrap()
 }
@@ -221,6 +226,27 @@ fn parse_query(query: Option<&str>) -> HashMap<String, String> {
             Some((key, val))
         })
         .collect()
+}
+
+// ─── Public demo controls (opt-in, sandboxed) ───
+// Enabled ONLY with ROYAK_DEMO=1. Exposes a tiny, whitelisted set of safe
+// actions (scale within 1..5, kill one pod) on a single demo deployment, so a
+// public demo page can let visitors break things and watch Royak self-heal —
+// WITHOUT exposing the control plane. Fail-safe: absent flag → routes 404.
+fn demo_enabled() -> bool {
+    std::env::var("ROYAK_DEMO").map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+fn demo_app() -> String {
+    std::env::var("ROYAK_DEMO_APP").unwrap_or_else(|_| "demo".to_string())
+}
+/// Coarse global rate limit for demo mutations (min gap between actions).
+fn demo_rate_ok() -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let m = LAST.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(10)));
+    let mut g = m.lock().unwrap();
+    if g.elapsed() >= Duration::from_millis(600) { *g = Instant::now(); true } else { false }
 }
 
 // ─── Route handler (all business logic, synchronous) ───
@@ -292,6 +318,59 @@ fn route_request(
                     }
                 }
                 None => (400, r#"{"kind":"Status","status":"Failure","message":"no spec.replicas in patch","code":400}"#.to_string()),
+            }
+        }
+
+        // ─── Sandboxed public demo controls (ROYAK_DEMO=1 only) ───
+        ("GET", "/demo/info") => {
+            if !demo_enabled() { (404, not_found_status(path)) }
+            else {
+                let app = demo_app();
+                let w = world.read().unwrap();
+                let reps = w.deployments.get(&app).map(|d| d.replicas).unwrap_or(0);
+                (200, serde_json::json!({"demo": true, "app": app, "replicas": reps, "min": 1, "max": 5}).to_string())
+            }
+        }
+        ("POST", _) if path == "/demo/scale" => {
+            if !demo_enabled() { (404, not_found_status(path)) }
+            else if !demo_rate_ok() { (429, r#"{"status":"error","message":"slow down"}"#.to_string()) }
+            else {
+                let q = full_url.split_once('?').map(|(_, s)| parse_query(Some(s))).unwrap_or_default();
+                let n = q.get("n").and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 5);
+                let app = demo_app();
+                let mut w = world.write().unwrap();
+                if let Some(d) = w.deployments.get_mut(&app) {
+                    d.replicas = n;
+                    crate::save_state(crate::state_path(), &w);
+                    next_rv();
+                    (200, serde_json::json!({"status": "ok", "app": app, "replicas": n}).to_string())
+                } else {
+                    (404, serde_json::json!({"status": "error", "message": format!("demo app '{app}' not found")}).to_string())
+                }
+            }
+        }
+        ("POST", _) if path == "/demo/kill" => {
+            if !demo_enabled() { (404, not_found_status(path)) }
+            else if !demo_rate_ok() { (429, r#"{"status":"error","message":"slow down"}"#.to_string()) }
+            else {
+                let app = demo_app();
+                let prefix = format!("rk-{app}-");
+                // Kill exactly one RUNNING pod of the demo app — nothing else.
+                let killed = match crate::docker::list_containers(false) {
+                    Ok(cs) => cs.into_iter()
+                        .find(|c| c.state == "running"
+                            && c.names.iter().any(|n| n.trim_start_matches('/').starts_with(&prefix)))
+                        .map(|c| {
+                            let name = c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+                            let _ = crate::docker::remove_container(&c.id, true);
+                            name
+                        }),
+                    Err(_) => None,
+                };
+                match killed {
+                    Some(name) => (200, serde_json::json!({"status": "ok", "killed": name}).to_string()),
+                    None => (200, serde_json::json!({"status": "ok", "killed": serde_json::Value::Null, "message": "no running demo pod"}).to_string()),
+                }
             }
         }
 

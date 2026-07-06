@@ -1,0 +1,46 @@
+# Deployed by the `demosite` pipeline's `apply` stage — runs the freshly built
+# image (royak-demosite:v1) and routes demo.royak.io to it through Royak ingress.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demosite
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: web
+          image: royak-demosite:v1
+          ports:
+            - containerPort: 80
+          # If the page and the Royak API are not same-origin, point it at the API:
+          # env:
+          #   - {name: ROYAK_API, value: https://demo.royak.io}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demosite
+spec:
+  selector:
+    app: demosite
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demosite
+spec:
+  rules:
+    - host: demo.royak.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demosite
+                port:
+                  number: 80

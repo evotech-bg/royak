@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Royak — live demo cluster</title>
+<style>
+  :root{
+    --bg:#fafbff; --bg2:#f3f5fc; --ink:#111327; --ink2:#4b5069; --ink3:#9aa0b5;
+    --line:#e5e7f0; --card:#ffffff; --panel:#131629; --panel2:#1b2036; --panel-ink:#e5e7f0;
+    --brand-blue:#315bff; --brand-purple:#7c3aed; --brand-red:#ef3d31; --ok:#16a34a;
+    --radius:14px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg);color:var(--ink);line-height:1.55;-webkit-font-smoothing:antialiased}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 22px}
+  a{color:var(--brand-blue);text-decoration:none}
+
+  header{padding:40px 0 20px}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:20px;letter-spacing:-.02em}
+  .brand .mk{width:26px;height:26px;border-radius:8px;
+    background:linear-gradient(135deg,var(--brand-blue),var(--brand-purple) 55%,var(--brand-red))}
+  .live{display:inline-flex;align-items:center;gap:8px;margin-left:auto;background:#eef2ff;color:#3730a3;
+    border-radius:999px;padding:6px 14px;font-size:13px;font-weight:700}
+  .live .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(22,163,74,.5);
+    animation:pulse 1.6s infinite}
+  .live.off .pulse{background:var(--brand-red);animation:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,163,74,.5)}70%{box-shadow:0 0 0 8px rgba(22,163,74,0)}100%{box-shadow:0 0 0 0 rgba(22,163,74,0)}}
+  h1{font-size:clamp(30px,5vw,50px);letter-spacing:-.03em;line-height:1.05;margin:26px 0 10px}
+  h1 .accent{background:linear-gradient(100deg,var(--brand-blue),var(--brand-purple) 48%,var(--brand-red));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{color:var(--ink2);font-size:18px;max-width:720px}
+  .lead code{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:.9em}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:30px 0}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;
+    box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .stat .n{font-size:34px;font-weight:800;letter-spacing:-.02em;line-height:1;
+    font-variant-numeric:tabular-nums}
+  .stat .l{color:var(--ink3);font-size:13px;font-weight:600;margin-top:8px;text-transform:uppercase;letter-spacing:.04em}
+  .stat .n.g{background:linear-gradient(100deg,var(--brand-blue),var(--brand-purple) 60%,var(--brand-red));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+
+  .grid{display:grid;gap:16px;grid-template-columns:1fr 1fr}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border-radius:var(--radius);padding:18px 18px 8px;overflow:hidden}
+  .panel h3{color:#aeb4d0;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+    display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .panel h3 .v{margin-left:auto;color:var(--panel-ink);font-weight:800;font-size:15px;font-variant-numeric:tabular-nums}
+  canvas{width:100%;display:block}
+  .rows{margin:6px 0 12px}
+  .row{display:flex;align-items:center;gap:10px;padding:5px 0}
+  .row .nm{color:var(--panel-ink);font-size:13px;min-width:96px;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .bar{flex:1;height:9px;border-radius:6px;background:#2a3150;overflow:hidden}
+  .row .bar i{display:block;height:100%;border-radius:6px;
+    background:linear-gradient(90deg,var(--brand-blue),var(--brand-purple));transition:width .5s}
+  .row .bar i.mem{background:linear-gradient(90deg,var(--brand-purple),var(--brand-red))}
+  .row .vv{color:#aeb4d0;font-size:12px;min-width:62px;text-align:right;font-variant-numeric:tabular-nums}
+
+  .controls{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;margin-bottom:16px;
+    box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .controls.off{opacity:.55;pointer-events:none}
+  .ctitle{font-weight:800;font-size:16px;letter-spacing:-.01em;margin-bottom:12px}
+  .btns{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .btn{border:1px solid var(--line);background:var(--bg2);color:var(--ink);border-radius:10px;padding:9px 16px;
+    font-size:14px;font-weight:700;cursor:pointer;transition:.15s}
+  .btn:hover{border-color:var(--brand-blue);color:var(--brand-blue)}
+  .btn:active{transform:translateY(1px)}
+  .btn.kill{background:linear-gradient(100deg,var(--brand-purple),var(--brand-red));color:#fff;border:none;
+    box-shadow:0 6px 16px rgba(239,61,49,.28)}
+  .btn.kill:hover{color:#fff;filter:brightness(1.06)}
+  .reps{font-weight:800;font-size:20px;min-width:34px;text-align:center;font-variant-numeric:tabular-nums}
+  .chaos{display:inline-flex;align-items:center;gap:6px;color:var(--ink2);font-size:13px;font-weight:600;margin-left:6px;cursor:pointer}
+  .chint{color:var(--ink3);font-size:13px;margin-top:10px}
+
+  .resil{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:10px;margin:8px 0 4px}
+  .rz{background:var(--panel2);border-radius:10px;padding:12px 12px 10px;text-align:center}
+  .rn{font-size:24px;font-weight:800;color:var(--panel-ink);font-variant-numeric:tabular-nums;line-height:1}
+  .rn.g{background:linear-gradient(100deg,var(--brand-blue),var(--brand-purple) 60%,var(--brand-red));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .rl{color:#7b829e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:7px}
+  .evlog{margin-top:10px;max-height:132px;overflow:auto;font-family:ui-monospace,monospace;font-size:12.5px}
+  .evlog .e{color:#aeb4d0;padding:3px 0;border-top:1px solid rgba(255,255,255,.05)}
+  .evlog .e .ok{color:#4ade80}.evlog .e .bad{color:#fb7185}.evlog .e .t{color:#6b7392;margin-right:8px}
+  .panel h3 .v.healing{color:#fbbf24}
+
+  .foot{color:var(--ink3);font-size:14px;text-align:center;padding:34px 0 46px;border-top:1px solid var(--line);margin-top:34px}
+  .empty{color:#7b829e;font-size:13px;padding:18px 0 22px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><span class="mk"></span>Royak
+      <span class="live off" id="live"><span class="pulse"></span><span id="live-t">connecting…</span></span>
+    </div>
+    <h1>This page runs on <span class="accent">Royak</span>.</h1>
+    <p class="lead">Deployed by a <code>git push</code>, built and served by Royak's own ingress. Every number
+      below is this cluster's <b>real, live</b> state — polled from Royak's API every 2&nbsp;seconds.</p>
+  </header>
+
+  <div class="stats" id="stats">
+    <div class="stat"><div class="n g" id="s-pods">–</div><div class="l">Pods running</div></div>
+    <div class="stat"><div class="n" id="s-deploys">–</div><div class="l">Deployments</div></div>
+    <div class="stat"><div class="n" id="s-nodes">–</div><div class="l">Nodes</div></div>
+    <div class="stat"><div class="n" id="s-svc">–</div><div class="l">Services</div></div>
+    <div class="stat"><div class="n" id="s-ns">–</div><div class="l">Namespaces</div></div>
+    <div class="stat"><div class="n" id="s-certs">–</div><div class="l">mTLS certs</div></div>
+    <div class="stat"><div class="n" id="s-ticks">–</div><div class="l">Reconcile ticks</div></div>
+    <div class="stat"><div class="n" id="s-up">–</div><div class="l">Demo uptime</div></div>
+  </div>
+
+  <div class="controls" id="controls">
+    <div class="ctitle">Break it — watch Royak heal it</div>
+    <div class="btns">
+      <button class="btn" id="b-down">Scale ▼</button>
+      <span class="reps" id="b-reps">–</span>
+      <button class="btn" id="b-up">Scale ▲</button>
+      <button class="btn kill" id="b-kill">💥 Kill a pod</button>
+      <label class="chaos"><input type="checkbox" id="b-chaos" /> Auto-chaos</label>
+    </div>
+    <div class="chint" id="ctrl-hint">Kill a pod or scale the demo app — the numbers above are real, and Royak reconciles them back.</div>
+  </div>
+
+  <div class="grid">
+    <div class="panel" style="grid-column:1/-1">
+      <h3>Resilience — self-healing across restarts <span class="v" id="v-stable">–</span></h3>
+      <div class="resil">
+        <div class="rz"><div class="rn" id="r-disr">0</div><div class="rl">Disruptions</div></div>
+        <div class="rz"><div class="rn" id="r-rec">0</div><div class="rl">Recovered</div></div>
+        <div class="rz"><div class="rn" id="r-avg">–</div><div class="rl">Avg recovery</div></div>
+        <div class="rz"><div class="rn" id="r-last">–</div><div class="rl">Last recovery</div></div>
+        <div class="rz"><div class="rn g" id="r-stable">–</div><div class="rl">Stable for</div></div>
+      </div>
+      <div class="evlog" id="evlog"></div>
+    </div>
+    <div class="panel">
+      <h3>Pods over time <span class="v" id="v-pods">–</span></h3>
+      <canvas id="c-pods" height="150"></canvas>
+    </div>
+    <div class="panel">
+      <h3>Neural brain — training loss <span class="v" id="v-loss">–</span></h3>
+      <canvas id="c-loss" height="150"></canvas>
+    </div>
+    <div class="panel">
+      <h3>Per-pod CPU <span class="v" id="v-cpu">–</span></h3>
+      <div class="rows" id="cpu-rows"></div>
+    </div>
+    <div class="panel">
+      <h3>Per-pod memory <span class="v" id="v-mem">–</span></h3>
+      <div class="rows" id="mem-rows"></div>
+    </div>
+    <div class="panel" style="grid-column:1/-1">
+      <h3>Ingress traffic — top talkers <span class="v" id="v-flows">idle</span></h3>
+      <div class="rows" id="flow-rows"></div>
+      <div class="empty" id="flow-empty">No live traffic yet — hit the ingress to see flows appear.</div>
+    </div>
+  </div>
+
+  <div class="foot">Powered by <b>Royak</b> — a swarm of containers in one ~5&nbsp;MB binary ·
+    <a href="https://github.com/evotech-bg/royak" target="_blank" rel="noopener">github.com/evotech-bg/royak</a></div>
+</div>
+
+<script>
+// API base: same-origin by default; override with window.ROYAK_API for local dev
+// (e.g. <script>window.ROYAK_API='http://127.0.0.1:6443'<\/script> before this).
+const API = (window.ROYAK_API || '').replace(/\/$/,'');
+const $ = id => document.getElementById(id);
+const started = Date.now();
+
+const podHist = [];   // {t, v}
+const lossHist = [];
+const MAXPTS = 90;
+
+async function getJSON(path){
+  const r = await fetch(API + path, {cache:'no-store'});
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+function fmtDur(ms){
+  const s=Math.floor(ms/1000), h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
+  return (h?h+'h ':'') + (m||h?m+'m ':'') + ss + 's';
+}
+
+// ── minimal self-contained area/line chart on a canvas ──
+function drawLine(cv, data, color){
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.height;
+  cv.width = w*dpr; cv.style.height = h+'px'; cv.height = h*dpr;
+  const g = cv.getContext('2d'); g.scale(dpr,dpr);
+  g.clearRect(0,0,w,h);
+  // grid
+  g.strokeStyle='rgba(255,255,255,.06)'; g.lineWidth=1;
+  for(let i=1;i<4;i++){const y=h*i/4; g.beginPath(); g.moveTo(0,y); g.lineTo(w,y); g.stroke();}
+  if(data.length<2){return;}
+  const vals=data.map(d=>d.v);
+  let mn=Math.min(...vals), mx=Math.max(...vals);
+  if(mx===mn){mx=mn+1;}
+  const pad=6, iw=w, ih=h-pad*2;
+  const x=i=>i/(data.length-1)*iw;
+  const y=v=>pad+ih-((v-mn)/(mx-mn))*ih;
+  // area
+  const grad=g.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,color+'55'); grad.addColorStop(1,color+'00');
+  g.beginPath(); g.moveTo(0,h);
+  data.forEach((d,i)=>g.lineTo(x(i),y(d.v)));
+  g.lineTo(iw,h); g.closePath(); g.fillStyle=grad; g.fill();
+  // line
+  g.beginPath();
+  data.forEach((d,i)=>{i?g.lineTo(x(i),y(d.v)):g.moveTo(x(i),y(d.v));});
+  g.strokeStyle=color; g.lineWidth=2; g.lineJoin='round'; g.stroke();
+  // last dot
+  const last=data[data.length-1];
+  g.beginPath(); g.arc(x(data.length-1),y(last.v),3,0,7); g.fillStyle=color; g.fill();
+}
+
+function rows(container, items, cls){
+  container.innerHTML = items.map(it=>`
+    <div class="row"><span class="nm">${it.name}</span>
+      <span class="bar"><i class="${cls}" style="width:${Math.max(2,Math.min(100,it.pct))}%"></i></span>
+      <span class="vv">${it.label}</span></div>`).join('');
+}
+
+function setLive(on, txt){
+  const el=$('live'); el.classList.toggle('off',!on); $('live-t').textContent=txt;
+}
+
+// ── resilience / stability tracking ──
+let disruptions=0, recovered=0, recTimes=[], lastRec=null;
+let degraded=false, degradedSince=0, stableSince=null, lastDesired=null, prevRunning=null;
+function logEvent(kind, msg){
+  const el=$('evlog'); const t=new Date().toLocaleTimeString();
+  const cls = kind==='ok'?'ok':'bad', ic = kind==='ok'?'✓':'💥';
+  el.insertAdjacentHTML('afterbegin', `<div class="e"><span class="t">${t}</span><span class="${cls}">${ic} ${msg}</span></div>`);
+  while(el.children.length>40) el.removeChild(el.lastChild);
+}
+function updateResil(desired, running, now){
+  if(prevRunning===null){ prevRunning=running; lastDesired=desired; if(running>=desired) stableSince=now; return; }
+  // A disruption = we were healthy, a pod was actually LOST (running fell), and
+  // it wasn't just pods still spinning up toward a freshly-raised replica count.
+  const wasHealthy = prevRunning >= lastDesired;
+  const dropped    = running < prevRunning;
+  const raised     = desired > lastDesired;
+  if(running < desired){
+    if(!degraded && wasHealthy && dropped && !raised){
+      degraded=true; degradedSince=now; disruptions++; stableSince=null;
+      logEvent('bad', `pod lost — ${running}/${desired} healthy, Royak reconciling…`);
+    }
+  } else {
+    if(degraded){
+      const rt=(now-degradedSince)/1000; recovered++; recTimes.push(rt); lastRec=rt;
+      degraded=false; stableSince=now;
+      logEvent('ok', `recovered in ${rt.toFixed(1)}s — back to ${running}/${desired}`);
+    }
+    if(stableSince===null) stableSince=now;
+  }
+  prevRunning=running; lastDesired=desired;
+  $('r-disr').textContent=disruptions;
+  $('r-rec').textContent=recovered;
+  $('r-avg').textContent=recTimes.length? (recTimes.reduce((a,b)=>a+b,0)/recTimes.length).toFixed(1)+'s' : '–';
+  $('r-last').textContent=lastRec!==null? lastRec.toFixed(1)+'s' : '–';
+  const vb=$('v-stable');
+  if(degraded){ vb.textContent='healing…'; vb.classList.add('healing'); $('r-stable').textContent='—'; }
+  else { vb.textContent='stable'; vb.classList.remove('healing');
+    $('r-stable').textContent = stableSince? fmtDur(now-stableSince) : '–'; }
+}
+
+// ── demo controls (only if the sandbox endpoint is available) ──
+let demoReplicas=null, demoOn=false, chaos=false;
+async function refreshDemo(){
+  try{ const d=await getJSON('/demo/info'); demoOn=!!d.demo; demoReplicas=d.replicas;
+    $('b-reps').textContent=d.replicas; return true;
+  }catch(e){ demoOn=false; $('controls').classList.add('off'); $('ctrl-hint').textContent='Interactive controls are off for this instance.'; return false; }
+}
+async function scaleBy(delta){
+  if(!demoOn||demoReplicas===null) return;
+  const n=Math.max(1,Math.min(5,demoReplicas+delta));
+  try{ const r=await (await fetch(API+'/demo/scale?n='+n,{method:'POST'})).json();
+    demoReplicas=r.replicas; $('b-reps').textContent=r.replicas; }catch(e){}
+}
+async function killOne(){
+  if(!demoOn) return;
+  try{ await fetch(API+'/demo/kill',{method:'POST'}); }catch(e){}
+}
+$('b-up').onclick=()=>scaleBy(1);
+$('b-down').onclick=()=>scaleBy(-1);
+$('b-kill').onclick=killOne;
+$('b-chaos').onchange=e=>{ chaos=e.target.checked; };
+setInterval(()=>{ if(chaos && demoOn && !degraded) killOne(); }, 18000);
+
+let ticks=0;
+async function tick(){
+  try{
+    const [brain, pods, nodes, flows] = await Promise.all([
+      getJSON('/royak/v1/brain'),
+      getJSON('/royak/v1/top/pods'),
+      getJSON('/royak/v1/top/nodes').catch(()=>({items:[]})),
+      getJSON('/royak/v1/flows').catch(()=>({flows:[],topTalkers:[]})),
+    ]);
+    setLive(true,'live');
+    ticks++;
+
+    const c = brain.cluster||{};
+    $('s-pods').textContent   = c.pods ?? '–';
+    $('s-deploys').textContent= c.deployments ?? '–';
+    $('s-nodes').textContent  = c.nodes ?? '–';
+    $('s-svc').textContent    = c.services ?? '–';
+    $('s-ns').textContent     = c.namespaces ?? '–';
+    $('s-certs').textContent  = (brain.security&&brain.security.certs_issued) ?? 0;
+    $('s-ticks').textContent  = ticks;
+    $('s-up').textContent     = fmtDur(Date.now()-started);
+
+    // pods timeline
+    podHist.push({t:Date.now(), v:c.pods||0}); if(podHist.length>MAXPTS) podHist.shift();
+    $('v-pods').textContent = c.pods ?? '–';
+    drawLine($('c-pods'), podHist, '#315bff');
+
+    // loss timeline
+    const loss = (brain.training && typeof brain.training.loss==='number') ? brain.training.loss : null;
+    if(loss!==null){ lossHist.push({t:Date.now(), v:loss}); if(lossHist.length>MAXPTS) lossHist.shift(); }
+    $('v-loss').textContent = loss!==null ? loss.toFixed(4) : '–';
+    drawLine($('c-loss'), lossHist, '#7c3aed');
+
+    // per-pod cpu / mem
+    const items = pods.items||[];
+    // resilience: desired (demo replicas, else desired pod sum) vs actually running
+    const desired = (demoOn && demoReplicas!==null) ? demoReplicas : (c.pods||0);
+    updateResil(desired, items.length, Date.now());
+    const maxMem = Math.max(1, ...items.map(p=>p.memory_raw_mb||0));
+    $('v-cpu').textContent = items.length + ' pods';
+    $('v-mem').textContent = items.reduce((a,p)=>a+(p.memory_raw_mb||0),0).toFixed(0)+' Mi';
+    rows($('cpu-rows'), items.map(p=>({name:p.name, pct:(p.cpu_raw||0), label:(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
+    rows($('mem-rows'), items.map(p=>({name:p.name, pct:(p.memory_raw_mb||0)/maxMem*100, label:(p.memory||'0Mi')})), 'mem');
+
+    // flows
+    const talkers = flows.topTalkers||[];
+    if(talkers.length){
+      $('flow-empty').style.display='none';
+      const mx=Math.max(1,...talkers.map(t=>t.count||t.bytes||0));
+      $('v-flows').textContent = talkers.length+' active';
+      rows($('flow-rows'), talkers.slice(0,8).map(t=>({name:t.name||t.dst||t.src||'?', pct:((t.count||t.bytes||0)/mx*100), label:String(t.count||t.bytes||0)})), 'cpu');
+    }else{
+      $('flow-rows').innerHTML=''; $('flow-empty').style.display='block'; $('v-flows').textContent='idle';
+    }
+  }catch(e){
+    setLive(false,'reconnecting…');
+  }
+}
+refreshDemo(); setInterval(refreshDemo, 6000);
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>
