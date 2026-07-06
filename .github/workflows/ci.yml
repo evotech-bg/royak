@@ -51,7 +51,7 @@ jobs:
       - name: Unit tests (cargo test)
         run: cargo test --bin royak
 
-      - name: Smoke: brain + demo (no Docker required)
+      - name: "Smoke: brain + demo (no Docker required)"
         run: |
           target/release/royak brain 2>&1 | grep -q "OrinBrain"
           echo "Brain: OK"
