@@ -260,6 +260,8 @@ pub struct PipelineStage {
     pub dockerfile: Option<String>,
     /// action: build — resulting image tag (default royak-<pipeline>:<runId>)
     pub tag: Option<String>,
+    /// action: build — Dockerfile ARGs passed at build time (name/value)
+    pub args: Option<Vec<EnvVar>>,
     pub artifacts: Option<Vec<String>>,
     #[serde(rename = "dependsOn")]
     pub depends_on: Option<String>, // stage name this depends on

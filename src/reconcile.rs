@@ -45,6 +45,7 @@ pub struct StoredStage {
     pub context: Option<String>,      // action: build — repo name or path
     pub dockerfile: Option<String>,   // action: build — Dockerfile name
     pub tag: Option<String>,          // action: build — output image tag
+    pub build_args: Vec<(String, String)>, // action: build — Dockerfile ARGs
     pub artifacts: Vec<String>,
     pub depends_on: Option<String>,
     pub env: Vec<String>,
@@ -1773,6 +1774,9 @@ impl DesiredWorld {
                         context: s.context.clone(),
                         dockerfile: s.dockerfile.clone(),
                         tag: s.tag.clone(),
+                        build_args: s.args.as_ref().map(|v| v.iter()
+                            .filter_map(|e| e.value.as_ref().map(|val| (e.name.clone(), val.clone())))
+                            .collect()).unwrap_or_default(),
                         artifacts: s.artifacts.clone().unwrap_or_default(),
                         depends_on: s.depends_on.clone(),
                         env,
@@ -3538,6 +3542,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                         let ctx_name = sd.context.clone();
                         let dockerfile = sd.dockerfile.clone().unwrap_or_else(|| "Dockerfile".to_string());
                         let tag = sd.tag.clone().unwrap_or_else(|| format!("royak-{pipeline_name}:{run_id}"));
+                        let build_args = sd.build_args.clone();
                         // `sd` / `pipeline` are not used past this point in this arm.
                         match docker::poll_build(&job) {
                             docker::BuildPoll::NotStarted => {
@@ -3557,7 +3562,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                                     Some(cn) => match resolve_build_context(desired, &cn, &branch) {
                                         Ok(dir) => {
                                             log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' → build {tag} from {dir} ({dockerfile})"));
-                                            docker::start_build(&job, dir, dockerfile, tag);
+                                            docker::start_build(&job, dir, dockerfile, tag, build_args);
                                             if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
                                                 for (n, s) in run_mut.stage_status.iter_mut() {
                                                     if n == &stage_name { *s = StageStatus::Running; }

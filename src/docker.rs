@@ -769,7 +769,7 @@ use std::collections::HashMap;
 /// Blocking — call from a background thread (see `start_build`). Returns the
 /// build log on success, or an error message (Docker's own error text) on
 /// failure. `tag` is the resulting image name:tag (may be a local-only tag).
-pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str) -> Result<String, String> {
+pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str, build_args: &[(String, String)]) -> Result<String, String> {
     if !std::path::Path::new(context_dir).exists() {
         return Err(format!("build context '{context_dir}' does not exist"));
     }
@@ -795,7 +795,16 @@ pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str) -> Result<Str
     // containers; `dockerfile` names the Dockerfile within the context.
     let df = urlencode(dockerfile);
     let t = urlencode(tag);
-    let path = format!("/build?t={t}&dockerfile={df}&rm=1&forcerm=1");
+    let mut path = format!("/build?t={t}&dockerfile={df}&rm=1&forcerm=1");
+    // Build-time ARGs → the `buildargs` query param as a URL-encoded JSON map,
+    // so a Dockerfile `ARG KEY` receives its value at build time.
+    if !build_args.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = build_args.iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        let json = serde_json::Value::Object(map).to_string();
+        path.push_str(&format!("&buildargs={}", urlencode(&json)));
+    }
 
     let mut stream = UnixStream::connect(docker_sock())
         .map_err(|e| format!("Cannot connect to Docker: {e}"))?;
@@ -924,14 +933,14 @@ fn build_jobs() -> &'static Mutex<HashMap<String, Arc<Mutex<Option<Result<String
 
 /// Kick off a build on a background thread, keyed by `job`. Idempotent: if a
 /// job with this key already exists, does nothing (the loop keeps polling it).
-pub fn start_build(job: &str, context_dir: String, dockerfile: String, tag: String) {
+pub fn start_build(job: &str, context_dir: String, dockerfile: String, tag: String, build_args: Vec<(String, String)>) {
     let mut map = build_jobs().lock().unwrap();
     if map.contains_key(job) { return; }
     let slot: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     map.insert(job.to_string(), slot.clone());
     drop(map);
     std::thread::spawn(move || {
-        let result = build_image(&context_dir, &dockerfile, &tag);
+        let result = build_image(&context_dir, &dockerfile, &tag, &build_args);
         *slot.lock().unwrap() = Some(result);
     });
 }

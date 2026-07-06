@@ -122,6 +122,90 @@ kubectl --server=http://localhost:6443 get pods
 | **Encryption** | AES-256-GCM for secrets at rest and inter-node communication |
 | **MCP Server** | 13 tools for AI assistant integration (deploy, scale, exec, top...) |
 
+## Deploy from source (PaaS)
+
+Royak doesn't just deploy existing images — a pipeline `build` stage turns a git
+repo with a Dockerfile into an image and deploys it, so `git push` becomes a live
+app. No external CI, no registry. It's a Heroku/Coolify-style flow inside the one
+binary.
+
+```yaml
+# ship.yaml — apply once
+apiVersion: royak/v1
+kind: Repository
+metadata: { name: myapp }
+spec:
+  url: https://github.com/you/myapp    # or path: ./myapp for a local checkout
+  branch: main
+  pipeline: ship                        # auto-triggered on new commits
+---
+apiVersion: royak/v1
+kind: Pipeline
+metadata: { name: ship }
+spec:
+  stages:
+    - name: build
+      action: build
+      context: myapp                    # the repo above (or a path)
+      dockerfile: Dockerfile            # optional (default: Dockerfile)
+      tag: royak-myapp:v1
+      args:                             # optional build-time ARGs
+        - { name: NODE_ENV, value: production }
+    - name: deploy
+      action: apply
+      file: app.yaml                    # the manifests below
+      dependsOn: build
+```
+
+**How the deploy is triggered — three ways:**
+
+| Trigger | How | When |
+| --- | --- | --- |
+| Webhook | `POST /hooks/repo/myapp` | wire your GitHub/GitLab push webhook here → instant build + deploy |
+| Git-watch | the reconcile loop polls the repo each `--interval` tick (`git ls-remote` / `git rev-parse`) | a new commit auto-triggers the linked pipeline |
+| Manual | `royak pipeline run ship` | force a run |
+
+**Runtime env, config and secrets** for the deployed app are ordinary Kubernetes
+manifests that the `deploy` stage applies — `env`, `envFrom` from a ConfigMap or
+Secret (secrets are AES-256-GCM encrypted at rest):
+
+```yaml
+# app.yaml
+apiVersion: v1
+kind: Secret
+metadata: { name: app-secrets }
+stringData:
+  DATABASE_URL: postgres://user:pass@db:5432/app
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: app-config }
+data:
+  LOG_LEVEL: info
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: web
+          image: royak-myapp:v1        # ← the tag the build stage produced
+          env:
+            - { name: PORT, value: "8080" }
+          envFrom:
+            - secretRef: { name: app-secrets }
+            - configMapRef: { name: app-config }
+```
+
+`git push` → webhook → **build** (clone + `docker build`, with your build-args) →
+**deploy** (apply the manifests, env and secrets injected) → live app.
+
+> Build inputs today are Dockerfile + build-args. Nixpacks-style auto-detection
+> (no Dockerfile) and a one-click service catalog are not yet implemented.
+
 ## Architecture
 
 ```

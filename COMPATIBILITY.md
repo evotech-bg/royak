@@ -103,9 +103,11 @@ detection, MCP server for AI assistants, NeuroPod experimental Docker-free runti
 **Build from source (PaaS).** A pipeline stage with `action: build` turns a git context (a
 registered repository or a path) into an image via the Docker Engine `/build` API, which a later
 `action: apply` stage deploys — so `git push → webhook → build → deploy → live app` works end to
-end, no external CI or registry required. Dockerfile-based today (Nixpacks-style auto-detection is
-not yet implemented). Verified live by `test-build.sh`: the deployed container serves a marker baked
-in at build time, proving the running image was built from the source.
+end, no external CI or registry required. Dockerfile + build-args (`args:` on the stage → Docker
+`buildargs`) today; Nixpacks-style auto-detection (no Dockerfile) is not yet implemented. Runtime
+env/config/secrets for the deployed app use ordinary `env`/`envFrom` (ConfigMap/Secret). Verified
+live by `test-build.sh`: the deployed container serves a marker written **from a build-arg**,
+proving the build ran, the arg flowed through, and the built image is the one deployed.
 
 ---
 

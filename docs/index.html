@@ -152,6 +152,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);fo
     <div class="nav-links">
       <a href="#how">How it works</a>
       <a href="#features">Features</a>
+      <a href="#deploy">Deploy from source</a>
       <a href="#beta">Beta status</a>
       <a href="#install">Install</a>
       <a class="gh-btn" href="https://github.com/evotech-bg/royak">★ Star on GitHub</a>
@@ -235,6 +236,7 @@ rk-web-4   0s
     <a href="https://github.com/evotech-bg/royak/blob/main/COMPATIBILITY.md">compatibility ledger</a>
     verified against a real kubectl.</p>
     <div class="grid g3">
+      <div class="card"><h3><span class="ico">🏗️</span>Build from source → deploy</h3><p>Point a pipeline at a git repo with a Dockerfile: <code>git push</code> → Royak builds the image and deploys it, routed and live. A Heroku/Coolify-style PaaS flow with no external CI or registry — in the same one binary.</p></div>
       <div class="card"><h3><span class="ico">📦</span>Deployments &amp; StatefulSets</h3><p>Create, scale, delete with CPU/memory limits and HPA autoscaling. StatefulSets get ordered startup, stable identity and per-ordinal volumes.</p></div>
       <div class="card"><h3><span class="ico">🔄</span>Rolling updates &amp; rollback</h3><p>Zero-downtime rollouts with readiness checks and auto-rollback on timeout. Rollback works even after the rollout completes.</p></div>
       <div class="card"><h3><span class="ico">🌐</span>Services &amp; ingress</h3><p>ClusterIP discovery with pod-to-service DNS, NodePort via the built-in ServiceLB (userspace load balancer), and a live ingress reverse proxy — async, streaming, TLS.</p></div>
@@ -243,11 +245,44 @@ rk-web-4   0s
       <div class="card"><h3><span class="ico">🖧</span>Multi-node mesh</h3><p>UDP autodiscovery, pod distribution, heartbeat monitoring, and a cross-node service proxy so pods on node B reach services on node A.</p></div>
       <div class="card"><h3><span class="ico">⚙️</span>Operators &amp; custom resources</h3><p>Define an Operator plus a CustomResource in YAML and Royak auto-provisions and manages the lifecycle.</p></div>
       <div class="card"><h3><span class="ico">🛡️</span>Guards</h3><p>Declarative auto-remediation: pod crash → restart, high memory → scale up. Anomaly detection watches cluster telemetry.</p></div>
-      <div class="card"><h3><span class="ico">🚀</span>Pipelines &amp; jobs</h3><p>CI/CD pipelines with DAG dependencies, git triggers and matrix builds. Jobs, CronJobs, Functions — all as YAML kinds.</p></div>
+      <div class="card"><h3><span class="ico">🚀</span>Pipelines &amp; jobs</h3><p>CI/CD pipelines with DAG dependencies, git triggers, matrix builds and a <code>build</code> stage that turns source into an image. Jobs, CronJobs, Functions — all as YAML kinds.</p></div>
       <div class="card"><h3><span class="ico">📊</span>Dashboard &amp; metrics</h3><p>Built-in web dashboard and a Prometheus <code>/metrics</code> endpoint. Log aggregation with search.</p></div>
       <div class="card"><h3><span class="ico">🧠</span>Neural brain (experimental)</h3><p>A small neural net trains on cluster telemetry for anomaly detection and load prediction. It monitors — the reconcile loop decides.</p></div>
       <div class="card"><h3><span class="ico">🤖</span>MCP server</h3><p>13 tools for AI-assistant integration: deploy, scale, exec, logs, top — manage the swarm in natural language.</p></div>
     </div>
+  </div>
+</section>
+
+<section id="deploy">
+  <div class="wrap">
+    <span class="kicker">Deploy from source</span>
+    <h2>From <code>git push</code> to a live app.</h2>
+    <p class="lead">Point a pipeline at a git repo with a Dockerfile. Royak builds the image and
+    deploys it — routed, with your env and secrets injected. A Heroku/Coolify-style PaaS flow with
+    no external CI and no registry, in the same one binary.</p>
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i><span>ship.yaml — apply once, then git push</span></div>
+      <pre><span class="t-dim">kind: Repository</span>
+metadata: {name: myapp}
+spec: {url: github.com/you/myapp, branch: main, pipeline: ship}
+<span class="t-dim">---
+kind: Pipeline</span>
+metadata: {name: ship}
+spec:
+  stages:
+    - {name: build,  <span class="t-ok">action: build</span>, context: myapp, tag: royak-myapp:v1,
+       args: [{name: NODE_ENV, value: production}]}   <span class="t-dim"># build-time ARGs</span>
+    - {name: deploy, <span class="t-ok">action: apply</span>, file: app.yaml, dependsOn: build}
+
+<span class="t-cmd">$ git push</span>            <span class="t-dim"># or: POST /hooks/repo/myapp  ·  or: royak pipeline run ship</span>
+<span class="t-ok">  [pipeline] ship: build royak-myapp:v1 from myapp (Dockerfile)</span>
+<span class="t-ok">  [pipeline] ship: built royak-myapp:v1 ✓</span>
+<span class="t-ok">  [pipeline] ship: deploy → apply app.yaml</span>
+<span class="t-dim">  env + secrets (AES-256-GCM at rest) injected · app live</span></pre>
+    </div>
+    <p class="req">Triggered by a git webhook, by commit polling, or manually · env/config via
+    <code>env</code> &amp; <code>envFrom</code> (ConfigMap/Secret) · Dockerfile + build-args today
+    (Nixpacks auto-detection not yet).</p>
   </div>
 </section>
 

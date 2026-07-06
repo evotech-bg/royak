@@ -30,10 +30,12 @@ WORK="$(mktemp -d)"
 APP="$WORK/app"
 MARK="royak-build-$$-$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
 mkdir -p "$APP"
-printf '<h1>%s</h1>\n' "$MARK" > "$APP/index.html"
+# The served marker is written from a build ARG, so a passing "serves marker"
+# check proves BOTH that the build ran AND that the build-arg flowed through.
 cat > "$APP/Dockerfile" <<'DOCKER'
 FROM nginx:alpine
-COPY index.html /usr/share/nginx/html/index.html
+ARG MARK=missing
+RUN printf '<h1>%s</h1>\n' "$MARK" > /usr/share/nginx/html/index.html
 DOCKER
 ( cd "$APP" && git init -q && git add -A && git -c user.email=a@b.c -c user.name=x commit -qm init )
 
@@ -62,7 +64,12 @@ kind: Pipeline
 metadata: {name: btpipe}
 spec:
   stages:
-    - {name: build, action: build, context: bt, tag: royak-bt:v1}
+    - name: build
+      action: build
+      context: bt
+      tag: royak-bt:v1
+      args:
+        - {name: MARK, value: $MARK}
     - {name: deploy, action: apply, file: $WORK/deploy.yaml, dependsOn: build}
 YAML
 
@@ -126,7 +133,9 @@ echo ""
 echo "3. Proof: the running app serves OUR built content"
 echo "──────────────────────────────────────────────────"
 CID=$(docker ps --filter "name=rk-btweb" -q | head -1)
-check "deployed app serves the build-time marker ($MARK)" \
+# The marker is written from a build ARG, so this proves the build ran, the
+# build-arg flowed into the Dockerfile, and the built image is the one deployed.
+check "app serves marker written from a build-arg ($MARK)" \
     "[ -n '$CID' ] && docker exec $CID wget -qO- localhost 2>/dev/null | grep -q '$MARK'"
 
 if [ "$FAIL" -ne 0 ]; then
