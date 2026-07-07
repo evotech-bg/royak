@@ -2989,17 +2989,23 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     }
 
     // 2e. ANOMALY — neural container monitoring (learn patterns, detect deviations)
-    for container in &managed {
-        if container.state != "running" { continue; }
-        let name = container.names.first()
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_default();
-        let short_id = &container.id[..12.min(container.id.len())];
-
-        // Real metrics from Docker stats API (skip on failure — don't poison baselines)
-        match docker::container_stats(short_id) {
-            Ok((cpu, mem)) => brain.observe(&name, cpu, mem, 0),
-            Err(_) => {} // stats unavailable, skip — don't record 0.0 as real data
+    // Docker's /stats samples ~1-2s per call; fetching serially over N containers
+    // stalled the whole reconcile (which holds the world lock, blocking the API).
+    // Fetch all containers' stats in PARALLEL, then feed the brain serially.
+    let stat_targets: Vec<(String, String)> = managed.iter()
+        .filter(|c| c.state == "running")
+        .map(|c| {
+            let name = c.names.first().map(|s| s.trim_start_matches('/').to_string()).unwrap_or_default();
+            (name, c.id[..12.min(c.id.len())].to_string())
+        })
+        .collect();
+    let stat_handles: Vec<_> = stat_targets.into_iter()
+        .map(|(name, short)| std::thread::spawn(move || (name, docker::container_stats(&short))))
+        .collect();
+    for h in stat_handles {
+        // Skip on failure — don't poison baselines with 0.0.
+        if let Ok((name, Ok((cpu, mem)))) = h.join() {
+            brain.observe(&name, cpu, mem, 0);
         }
     }
 

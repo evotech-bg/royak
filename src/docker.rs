@@ -610,6 +610,29 @@ pub fn get_stderr_logs(id: &str, tail: u32) -> Result<String, String> {
 
 /// Get real CPU and memory stats from a running container
 pub fn container_stats(id: &str) -> Result<(f32, f32), String> {
+    // Docker's /stats endpoint samples CPU for ~1-2s per call, and the reconcile
+    // loop asks for the same container's stats from several places each tick.
+    // Cache results briefly so one tick does at most one real fetch per
+    // container instead of 3-4 serial ones (which otherwise stall the API that
+    // shares the world lock). Freshness within a few seconds is plenty for
+    // display / HPA / the neural brain.
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static CACHE: OnceLock<Mutex<HashMap<String, ((f32, f32), Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((val, at)) = cache.lock().unwrap().get(id) {
+        if at.elapsed() < Duration::from_secs(8) {
+            return Ok(*val);
+        }
+    }
+    let out = container_stats_uncached(id);
+    if let Ok(v) = out {
+        cache.lock().unwrap().insert(id.to_string(), (v, Instant::now()));
+    }
+    out
+}
+
+fn container_stats_uncached(id: &str) -> Result<(f32, f32), String> {
     // Docker stats API (one-shot, no stream)
     let resp = docker_request("GET", &format!("/containers/{id}/stats?stream=false"), None)?;
 
@@ -873,9 +896,17 @@ pub fn build_image(context_dir: &str, dockerfile: &str, tag: &str, build_args: &
         return Ok(logbuf);
     }
 
+    // No image in the store → the build did NOT succeed, even if the stream
+    // ended without an explicit error line (e.g. a connection reset truncated
+    // it, or a COPY failed against the wrong context). Never report success
+    // without a resulting image.
     match err {
         Some(e) => Err(e.trim().to_string()),
-        None => Ok(logbuf),
+        None => {
+            let tail: String = logbuf.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
+            Err(format!("build produced no image '{tag}' (stream ended without success){}",
+                if tail.is_empty() { String::new() } else { format!(": …{tail}") }))
+        }
     }
 }
 
