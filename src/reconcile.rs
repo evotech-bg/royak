@@ -4253,6 +4253,10 @@ pub fn run_loop_shared_with_runtime(
             reconcile_with_runtime(&mut w, brain, use_neuropod)
         };
 
+        // Publish the lock-free ingress routing snapshot AFTER releasing the
+        // write lock, so ingress requests never block on the reconcile lock.
+        crate::api::publish_ingress_snapshot(&world.read().unwrap());
+
         brain.ticks += 1;
         let elapsed = start.elapsed();
         brain.set("cluster.last_tick".to_string(), brain.ticks.to_string());

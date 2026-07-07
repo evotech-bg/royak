@@ -2499,6 +2499,28 @@ async fn handle_ingress(
         }
     }
 
+    // Fast path: serve from the lock-free pre-resolved snapshot — no world lock,
+    // no per-request Docker call. This is what keeps the ingress concurrent even
+    // while the reconcile loop holds the write lock during a tick. Falls through
+    // to the live path if the route isn't in the snapshot yet.
+    if let Some((ip, port)) = snapshot_backend(&host, &path) {
+        let method = req.method().clone();
+        let req_headers = req.headers().clone();
+        let body_bytes = match req.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        return Ok(match proxy_request_async(&ip, port, method.as_str(), &path, &req_headers, &body_bytes).await {
+            Ok((status, body, resp_headers)) => {
+                let mut builder = hyper::Response::builder().status(status);
+                for (k, v) in resp_headers { builder = builder.header(k, v); }
+                let body: BoxedBody = Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed();
+                builder.body(body).unwrap_or_else(|_| typed_response(500, "response build failed", "text/plain"))
+            }
+            Err(e) => typed_response(502, &format!("Bad Gateway: {e}"), "text/plain"),
+        });
+    }
+
     let backend = {
         let w = world.read().unwrap();
         find_backend(&w, &host, &path)
@@ -2626,6 +2648,59 @@ fn resolve_service_to_pod_ip(world: &DesiredWorld, service: &str) -> Option<Stri
         }
     }
     None
+}
+
+// ─── Lock-free ingress route snapshot ───
+// The reconcile loop holds the world WRITE lock for a whole tick (docker I/O),
+// which makes every ingress request block on `world.read()` and stalls the async
+// runtime under concurrency (~10 req/s). Instead, the reconcile publishes a
+// compact, pre-resolved routing table after each tick; ingress requests read it
+// lock-free and skip the per-request docker container_ip call entirely.
+#[derive(Clone)]
+pub struct ResolvedRoute {
+    pub host: String,
+    pub path: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+fn ingress_snapshot() -> &'static std::sync::Mutex<Arc<Vec<ResolvedRoute>>> {
+    static SNAP: std::sync::OnceLock<std::sync::Mutex<Arc<Vec<ResolvedRoute>>>> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| std::sync::Mutex::new(Arc::new(Vec::new())))
+}
+
+/// Rebuild the pre-resolved ingress routing table. Called by the reconcile loop
+/// AFTER each tick (off the write-lock), so request handling never touches the
+/// world lock or Docker. Resolving pod IPs (a Docker call) happens once per tick
+/// here instead of once per request.
+pub fn publish_ingress_snapshot(world: &DesiredWorld) {
+    let mut routes = Vec::new();
+    for ingress in world.ingresses.values() {
+        for rule in &ingress.rules {
+            for ip_path in &rule.paths {
+                if let Some(pod_ip) = resolve_service_to_pod_ip(world, &ip_path.service) {
+                    routes.push(ResolvedRoute {
+                        host: rule.host.clone(),
+                        path: ip_path.path.clone(),
+                        ip: pod_ip,
+                        port: ip_path.port,
+                    });
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = ingress_snapshot().lock() {
+        *g = Arc::new(routes);
+    }
+}
+
+/// Longest-prefix lookup in the published snapshot. Lock-free path (Arc clone).
+fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16)> {
+    let snap = ingress_snapshot().lock().ok()?.clone();
+    snap.iter()
+        .filter(|r| (r.host.is_empty() || r.host == host) && path.starts_with(&r.path))
+        .max_by_key(|r| r.path.len())
+        .map(|r| (r.ip.clone(), r.port))
 }
 
 fn find_backend(world: &DesiredWorld, host: &str, path: &str) -> Option<(String, u16)> {
