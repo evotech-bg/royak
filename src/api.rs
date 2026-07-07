@@ -322,6 +322,13 @@ fn route_request(
         }
 
         // ─── Sandboxed public demo controls (ROYAK_DEMO=1 only) ───
+        // Consolidated dashboard read model — lock-free, no world.read(), no
+        // docker call. Served from the snapshot published after each reconcile
+        // tick, so it never blocks even while the reconcile holds the write lock.
+        ("GET", "/demo/state") => {
+            let snap = demo_state_snapshot().lock().unwrap().clone();
+            (200, (*snap).clone())
+        }
         ("GET", "/demo/info") => {
             if !demo_enabled() { (404, not_found_status(path)) }
             else {
@@ -1301,7 +1308,16 @@ async fn handle_request(
         }
     }
 
-    let (status, body) = route_request(method.as_str(), &path, &full_url, &headers, &body_bytes, &world);
+    // route_request is synchronous and does blocking work (RwLock waits, docker
+    // calls, disk writes, stderr→journald logging). Running it inline would pin
+    // a tokio worker thread for its whole duration — on a small box (1–2 cores =
+    // 1–2 async workers) that serialises all concurrent requests. Offload it to
+    // the blocking pool so the async workers stay free to accept/dispatch.
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        route_request(method.as_str(), &path, &full_url, &headers, &body_bytes, &world)
+    })
+    .await
+    .unwrap_or_else(|_| (500, r#"{"kind":"Status","status":"Failure","message":"handler panicked","code":500}"#.to_string()));
     Ok(json_response(status, &body))
 }
 
@@ -2701,6 +2717,62 @@ fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16)> {
         .filter(|r| (r.host.is_empty() || r.host == host) && path.starts_with(&r.path))
         .max_by_key(|r| r.path.len())
         .map(|r| (r.ip.clone(), r.port))
+}
+
+// ─── Consolidated demo dashboard snapshot (lock-free read model) ───
+// The demo page used to poll /royak/v1/brain (world.read → blocks on the
+// reconcile write-lock) + /royak/v1/top/pods (a docker call per request) +
+// two endpoints that 404'd — every 2s. Under chaos the reconcile tick holds
+// the world lock long enough to freeze all of it. Instead we publish ONE
+// pre-rendered JSON blob after each tick and the page polls just /demo/state,
+// served lock-free (Arc<String> clone) with zero world.read() and zero docker.
+fn demo_state_snapshot() -> &'static std::sync::Mutex<Arc<String>> {
+    static SNAP: std::sync::OnceLock<std::sync::Mutex<Arc<String>>> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| std::sync::Mutex::new(Arc::new(String::from("{}"))))
+}
+
+pub fn publish_demo_state(world: &DesiredWorld) {
+    let certs_issued = world.cluster_ca.as_ref().map(|ca| ca.issued_count).unwrap_or(0);
+    let cluster = serde_json::json!({
+        "pods": world.deployments.values().map(|d| d.replicas).sum::<u32>(),
+        "deployments": world.deployments.len(),
+        "nodes": world.nodes.len(),
+        "services": world.services.len(),
+        "namespaces": world.namespaces.len(),
+    });
+    // Per-pod cpu/mem from the 8s-cached docker stats (cheap; runs on the
+    // reconcile thread between ticks, never on a request path).
+    let mut pods = Vec::new();
+    if let Ok(containers) = docker::list_containers(true) {
+        for c in containers.iter()
+            .filter(|c| c.state == "running" && c.names.iter().any(|n| n.contains("rk-")))
+        {
+            let short = &c.id[..12.min(c.id.len())];
+            let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
+            let (cpu, mem) = docker::container_stats(short).unwrap_or((0.0, 0.0));
+            pods.push(serde_json::json!({
+                "name": name, "cpu_raw": cpu, "memory_raw_mb": mem,
+                "cpu": format!("{:.1}%", cpu), "memory": format!("{:.0}Mi", mem),
+            }));
+        }
+    }
+    let demo = if demo_enabled() {
+        let app = demo_app();
+        let reps = world.deployments.get(&app).map(|d| d.replicas).unwrap_or(0);
+        serde_json::json!({"enabled": true, "app": app, "replicas": reps, "min": 1, "max": 5})
+    } else {
+        serde_json::json!({"enabled": false})
+    };
+    let body = serde_json::json!({
+        "cluster": cluster,
+        "certs_issued": certs_issued,
+        "running": pods.len(),
+        "pods": pods,
+        "demo": demo,
+    }).to_string();
+    if let Ok(mut g) = demo_state_snapshot().lock() {
+        *g = Arc::new(body);
+    }
 }
 
 fn find_backend(world: &DesiredWorld, host: &str, path: &str) -> Option<(String, u16)> {

@@ -7,7 +7,7 @@
 <style>
   :root{
     --bg:#fafbff; --bg2:#f3f5fc; --ink:#111327; --ink2:#4b5069; --ink3:#9aa0b5;
-    --line:#e5e7f0; --card:#ffffff; --panel:#131629; --panel2:#1b2036; --panel-ink:#e5e7f0;
+    --line:#e5e7f0; --card:#ffffff; --panel:#ffffff; --panel2:#f3f5fc; --panel-ink:#111327;
     --brand-blue:#315bff; --brand-purple:#7c3aed; --brand-red:#ef3d31; --ok:#16a34a;
     --radius:14px;
   }
@@ -44,23 +44,28 @@
 
   .grid{display:grid;gap:16px;grid-template-columns:1fr 1fr}
   @media(max-width:820px){.grid{grid-template-columns:1fr}}
-  .panel{background:var(--panel);border-radius:var(--radius);padding:18px 18px 8px;overflow:hidden}
-  .panel h3{color:#aeb4d0;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  .panel{background:var(--panel);border:1px solid var(--line);box-shadow:0 1px 2px rgba(0,0,0,.04);
+    border-radius:var(--radius);padding:18px 18px 8px;overflow:hidden}
+  .panel h3{color:var(--ink3);font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
     display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .panel h3 .v{margin-left:auto;color:var(--panel-ink);font-weight:800;font-size:15px;font-variant-numeric:tabular-nums}
   canvas{width:100%;height:150px;display:block}
   .rows{margin:6px 0 12px}
   .row{display:flex;align-items:center;gap:10px;padding:5px 0}
   .row .nm{color:var(--panel-ink);font-size:13px;min-width:96px;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .row .bar{flex:1;height:9px;border-radius:6px;background:#2a3150;overflow:hidden}
+  .row .bar{flex:1;height:9px;border-radius:6px;background:#e9ecf5;overflow:hidden}
   .row .bar i{display:block;height:100%;border-radius:6px;
     background:linear-gradient(90deg,var(--brand-blue),var(--brand-purple));transition:width .5s}
   .row .bar i.mem{background:linear-gradient(90deg,var(--brand-purple),var(--brand-red))}
-  .row .vv{color:#aeb4d0;font-size:12px;min-width:62px;text-align:right;font-variant-numeric:tabular-nums}
+  .row .vv{color:var(--ink2);font-size:12px;min-width:62px;text-align:right;font-variant-numeric:tabular-nums}
 
-  .chaos-banner{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--line);
+  .chaos-banner{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:var(--card);border:1px solid var(--line);
     border-left:4px solid var(--brand-red);border-radius:var(--radius);padding:14px 20px;margin:24px 0 16px;
     box-shadow:0 1px 2px rgba(0,0,0,.04);position:relative;overflow:hidden}
+  .chaos-anim{flex:none;width:200px;height:200px;border-radius:12px;background:#EAECF6;
+    box-shadow:0 1px 3px rgba(0,0,0,.06);display:block;object-fit:cover}
+  .chaos-text{flex:1;min-width:260px}
+  @media(max-width:640px){.chaos-anim{width:100%;height:200px}}
   .monkey{font-size:38px;line-height:1;display:inline-block;flex:none;transform-origin:60% 85%;
     animation:sway 2.6s ease-in-out infinite}
   @keyframes sway{0%,100%{transform:rotate(-8deg)}50%{transform:rotate(8deg)}}
@@ -95,8 +100,8 @@
     -webkit-background-clip:text;background-clip:text;color:transparent}
   .rl{color:#7b829e;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-top:7px}
   .evlog{margin-top:10px;max-height:132px;overflow:auto;font-family:ui-monospace,monospace;font-size:12.5px}
-  .evlog .e{color:#aeb4d0;padding:3px 0;border-top:1px solid rgba(255,255,255,.05)}
-  .evlog .e .ok{color:#4ade80}.evlog .e .bad{color:#fb7185}.evlog .e .t{color:#6b7392;margin-right:8px}
+  .evlog .e{color:var(--ink2);padding:3px 0;border-top:1px solid rgba(0,0,0,.06)}
+  .evlog .e .ok{color:var(--ok)}.evlog .e .bad{color:var(--brand-red)}.evlog .e .t{color:var(--ink3);margin-right:8px}
   .panel h3 .v.healing{color:#fbbf24}
 
   .foot{color:var(--ink3);font-size:14px;text-align:center;padding:34px 0 46px;border-top:1px solid var(--line);margin-top:34px}
@@ -115,8 +120,8 @@
   </header>
 
   <div class="chaos-banner">
-    <span class="monkey" id="monkey">🐵</span>
-    <span class="boom" id="boom">💥</span>
+    <video class="chaos-anim" src="chaos-monkey.mp4" autoplay loop muted playsinline
+      aria-label="A chaos monkey smashing pods while Royak heals them"></video>
     <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> It kills a random pod every ~20 seconds so you can watch Royak notice and heal it — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Want to help the monkey? Kill or scale pods yourself below.</div>
   </div>
 
@@ -171,11 +176,6 @@
       <h3>Per-pod memory <span class="v" id="v-mem">–</span></h3>
       <div class="rows" id="mem-rows"></div>
     </div>
-    <div class="panel" style="grid-column:1/-1">
-      <h3>Ingress traffic — top talkers <span class="v" id="v-flows">idle</span></h3>
-      <div class="rows" id="flow-rows"></div>
-      <div class="empty" id="flow-empty">No live traffic yet — hit the ingress to see flows appear.</div>
-    </div>
   </div>
 
   <div class="foot">Powered by <b>Royak</b> — a swarm of containers in one ~5&nbsp;MB binary ·
@@ -214,7 +214,7 @@ function drawLine(cv, data, color){
   const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
   g.clearRect(0,0,w,h);
   // grid
-  g.strokeStyle='rgba(255,255,255,.06)'; g.lineWidth=1;
+  g.strokeStyle='rgba(0,0,0,.07)'; g.lineWidth=1;
   for(let i=1;i<4;i++){const y=h*i/4; g.beginPath(); g.moveTo(0,y); g.lineTo(w,y); g.stroke();}
   if(data.length<2){return;}
   const vals=data.map(d=>d.v);
@@ -295,18 +295,33 @@ function updateResil(desired, running, now){
     $('r-stable').textContent = stableSince? fmtDur(now-stableSince) : '–'; }
 }
 
-// ── demo controls (only if the sandbox endpoint is available) ──
+// ── demo controls — enabled from the same consolidated /demo/state poll ──
 let demoReplicas=null, demoOn=false, chaos=false;
-async function refreshDemo(){
-  try{ const d=await getJSON('/demo/info'); demoOn=!!d.demo; demoReplicas=d.replicas;
-    $('b-reps').textContent=d.replicas; return true;
-  }catch(e){ demoOn=false; $('controls').classList.add('off'); $('ctrl-hint').textContent='Interactive controls are off for this instance.'; return false; }
+// Optimistic scale target: the snapshot lags the write by ~1 reconcile tick, so
+// after a scale we hold our intended value until the snapshot catches up —
+// otherwise the next poll briefly reverts the number to the stale count.
+let pendingReplicas=null, pendingUntil=0;
+const CTRL_ON_HINT='A chaos monkey is already killing a pod every ~20s — watch the charts sawtooth and heal. Or break it yourself: kill a pod, scale the app. Every number here is this live cluster, and Royak reconciles it back.';
+function applyDemo(d){
+  demoOn = !!(d && d.enabled);
+  if(demoOn){
+    if(pendingReplicas!==null && (d.replicas===pendingReplicas || Date.now()>pendingUntil)) pendingReplicas=null;
+    demoReplicas = pendingReplicas!==null ? pendingReplicas : d.replicas;
+    $('b-reps').textContent = demoReplicas;
+    $('controls').classList.remove('off');
+    $('ctrl-hint').textContent = CTRL_ON_HINT;
+  } else {
+    $('controls').classList.add('off');
+    $('ctrl-hint').textContent = 'Interactive controls are off for this instance.';
+  }
 }
 async function scaleBy(delta){
   if(!demoOn||demoReplicas===null) return;
   const n=Math.max(1,Math.min(5,demoReplicas+delta));
+  pendingReplicas=n; pendingUntil=Date.now()+12000;  // hold our target until the snapshot confirms (ceiling 12s; a scale tick is docker-bound)
+  demoReplicas=n; $('b-reps').textContent=n;
   try{ const r=await (await fetch(API+'/demo/scale?n='+n,{method:'POST'})).json();
-    demoReplicas=r.replicas; $('b-reps').textContent=r.replicas; }catch(e){}
+    if(r&&r.replicas!=null){ pendingReplicas=r.replicas; demoReplicas=r.replicas; $('b-reps').textContent=r.replicas; } }catch(e){}
 }
 async function killOne(){
   if(!demoOn) return;
@@ -321,64 +336,51 @@ setInterval(()=>{ if(chaos && demoOn && !degraded) killOne(); }, 18000);
 let ticks=0;
 async function tick(){
   try{
-    const [brain, pods, nodes, flows] = await Promise.all([
-      getJSON('/royak/v1/brain'),
-      getJSON('/royak/v1/top/pods'),
-      getJSON('/royak/v1/top/nodes').catch(()=>({items:[]})),
-      getJSON('/royak/v1/flows').catch(()=>({flows:[],topTalkers:[]})),
-    ]);
+    // ONE lock-free request — the server pre-renders this snapshot after each
+    // reconcile tick, so it never blocks even mid-reconcile under chaos.
+    const s = await getJSON('/demo/state');
     setLive(true,'live');
     ticks++;
 
-    const c = brain.cluster||{};
+    const c = s.cluster||{};
     $('s-pods').textContent   = c.pods ?? '–';
     $('s-deploys').textContent= c.deployments ?? '–';
     $('s-nodes').textContent  = c.nodes ?? '–';
     $('s-svc').textContent    = c.services ?? '–';
     $('s-ns').textContent     = c.namespaces ?? '–';
-    $('s-certs').textContent  = (brain.security&&brain.security.certs_issued) ?? 0;
+    $('s-certs').textContent  = s.certs_issued ?? 0;
     $('s-ticks').textContent  = ticks;
     $('s-up').textContent     = fmtDur(Date.now()-started);
 
-    const items = pods.items||[];
+    applyDemo(s.demo);
+
+    const items = s.pods||[];
+    const running = s.running ?? items.length;
 
     // pods running over time — a sawtooth as pods are killed and self-heal
-    podHist.push({t:Date.now(), v:items.length}); if(podHist.length>MAXPTS) podHist.shift();
-    $('v-pods').textContent = items.length;
+    podHist.push({t:Date.now(), v:running}); if(podHist.length>MAXPTS) podHist.shift();
+    $('v-pods').textContent = running;
     drawLine($('c-pods'), podHist, '#315bff');
 
     // mTLS certs issued — climbs every time a pod is (re)created and gets a cert
-    const certs = (brain.security && brain.security.certs_issued) || 0;
+    const certs = s.certs_issued || 0;
     lossHist.push({t:Date.now(), v:certs}); if(lossHist.length>MAXPTS) lossHist.shift();
     $('v-loss').textContent = certs;
     drawLine($('c-loss'), lossHist, '#7c3aed');
 
-    // per-pod cpu / mem
     // resilience: desired (demo replicas, else desired pod sum) vs actually running
     const desired = (demoOn && demoReplicas!==null) ? demoReplicas : (c.pods||0);
-    updateResil(desired, items.length, Date.now());
+    updateResil(desired, running, Date.now());
     const maxMem = Math.max(1, ...items.map(p=>p.memory_raw_mb||0));
-    $('v-cpu').textContent = items.length + ' pods';
+    $('v-cpu').textContent = running + ' pods';
     $('v-mem').textContent = items.reduce((a,p)=>a+(p.memory_raw_mb||0),0).toFixed(0)+' Mi';
     rows($('cpu-rows'), items.map(p=>({name:p.name, pct:(p.cpu_raw||0), label:(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
     rows($('mem-rows'), items.map(p=>({name:p.name, pct:(p.memory_raw_mb||0)/maxMem*100, label:(p.memory||'0Mi')})), 'mem');
-
-    // flows
-    const talkers = flows.topTalkers||[];
-    if(talkers.length){
-      $('flow-empty').style.display='none';
-      const mx=Math.max(1,...talkers.map(t=>t.count||t.bytes||0));
-      $('v-flows').textContent = talkers.length+' active';
-      rows($('flow-rows'), talkers.slice(0,8).map(t=>({name:t.name||t.dst||t.src||'?', pct:((t.count||t.bytes||0)/mx*100), label:String(t.count||t.bytes||0)})), 'cpu');
-    }else{
-      $('flow-rows').innerHTML=''; $('flow-empty').style.display='block'; $('v-flows').textContent='idle';
-    }
   }catch(e){
     setLive(false,'reconnecting…');
   }
 }
-refreshDemo(); setInterval(refreshDemo, 6000);
-tick(); setInterval(tick, 2000);
+tick(); setInterval(tick, 1500);
 </script>
 </body>
 </html>

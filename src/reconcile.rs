@@ -4253,9 +4253,14 @@ pub fn run_loop_shared_with_runtime(
             reconcile_with_runtime(&mut w, brain, use_neuropod)
         };
 
-        // Publish the lock-free ingress routing snapshot AFTER releasing the
-        // write lock, so ingress requests never block on the reconcile lock.
-        crate::api::publish_ingress_snapshot(&world.read().unwrap());
+        // Publish the lock-free read-model snapshots AFTER releasing the write
+        // lock, so ingress requests and the demo dashboard never block on the
+        // reconcile lock. One read guard feeds both.
+        {
+            let w = world.read().unwrap();
+            crate::api::publish_ingress_snapshot(&w);
+            crate::api::publish_demo_state(&w);
+        }
 
         brain.ticks += 1;
         let elapsed = start.elapsed();
