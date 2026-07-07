@@ -20,8 +20,7 @@
 
   header{padding:40px 0 20px}
   .brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:20px;letter-spacing:-.02em}
-  .brand .mk{width:26px;height:26px;border-radius:8px;
-    background:linear-gradient(135deg,var(--brand-blue),var(--brand-purple) 55%,var(--brand-red))}
+  .brand .mk{width:30px;height:30px;border-radius:7px;object-fit:contain;display:block}
   .live{display:inline-flex;align-items:center;gap:8px;margin-left:auto;background:#eef2ff;color:#3730a3;
     border-radius:999px;padding:6px 14px;font-size:13px;font-weight:700}
   .live .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(22,163,74,.5);
@@ -49,7 +48,7 @@
   .panel h3{color:#aeb4d0;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
     display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .panel h3 .v{margin-left:auto;color:var(--panel-ink);font-weight:800;font-size:15px;font-variant-numeric:tabular-nums}
-  canvas{width:100%;display:block}
+  canvas{width:100%;height:150px;display:block}
   .rows{margin:6px 0 12px}
   .row{display:flex;align-items:center;gap:10px;padding:5px 0}
   .row .nm{color:var(--panel-ink);font-size:13px;min-width:96px;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -59,6 +58,20 @@
   .row .bar i.mem{background:linear-gradient(90deg,var(--brand-purple),var(--brand-red))}
   .row .vv{color:#aeb4d0;font-size:12px;min-width:62px;text-align:right;font-variant-numeric:tabular-nums}
 
+  .chaos-banner{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--line);
+    border-left:4px solid var(--brand-red);border-radius:var(--radius);padding:14px 20px;margin:24px 0 16px;
+    box-shadow:0 1px 2px rgba(0,0,0,.04);position:relative;overflow:hidden}
+  .monkey{font-size:38px;line-height:1;display:inline-block;flex:none;transform-origin:60% 85%;
+    animation:sway 2.6s ease-in-out infinite}
+  @keyframes sway{0%,100%{transform:rotate(-8deg)}50%{transform:rotate(8deg)}}
+  .monkey.smash{animation:smash .55s ease}
+  @keyframes smash{0%{transform:scale(1) rotate(0)}25%{transform:scale(1.5) rotate(-24deg)}
+    55%{transform:scale(1.15) rotate(18deg)}100%{transform:scale(1) rotate(0)}}
+  .boom{position:absolute;left:40px;top:6px;font-size:28px;opacity:0;pointer-events:none}
+  .boom.go{animation:boom .65s ease}
+  @keyframes boom{0%{opacity:0;transform:scale(.4)}30%{opacity:1;transform:scale(1.25)}100%{opacity:0;transform:scale(1.7)}}
+  .chaos-text{color:var(--ink2);font-size:14.5px;line-height:1.5}
+  .chaos-text b{color:var(--ink)}
   .controls{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;margin-bottom:16px;
     box-shadow:0 1px 2px rgba(0,0,0,.04)}
   .controls.off{opacity:.55;pointer-events:none}
@@ -93,13 +106,19 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="brand"><span class="mk"></span>Royak
+    <div class="brand"><img class="mk" src="royak-mark.png" alt="Royak" />Royak
       <span class="live off" id="live"><span class="pulse"></span><span id="live-t">connecting…</span></span>
     </div>
     <h1>This page runs on <span class="accent">Royak</span>.</h1>
     <p class="lead">Deployed by a <code>git push</code>, built and served by Royak's own ingress. Every number
       below is this cluster's <b>real, live</b> state — polled from Royak's API every 2&nbsp;seconds.</p>
   </header>
+
+  <div class="chaos-banner">
+    <span class="monkey" id="monkey">🐵</span>
+    <span class="boom" id="boom">💥</span>
+    <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> It kills a random pod every ~20 seconds so you can watch Royak notice and heal it — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Want to help the monkey? Kill or scale pods yourself below.</div>
+  </div>
 
   <div class="stats" id="stats">
     <div class="stat"><div class="n g" id="s-pods">–</div><div class="l">Pods running</div></div>
@@ -121,7 +140,7 @@
       <button class="btn kill" id="b-kill">💥 Kill a pod</button>
       <label class="chaos"><input type="checkbox" id="b-chaos" /> Auto-chaos</label>
     </div>
-    <div class="chint" id="ctrl-hint">Kill a pod or scale the demo app — the numbers above are real, and Royak reconciles them back.</div>
+    <div class="chint" id="ctrl-hint">A chaos monkey is already killing a pod every ~20s — watch the charts sawtooth and heal. Or break it yourself: kill a pod, scale the app. Every number here is this live cluster, and Royak reconciles it back.</div>
   </div>
 
   <div class="grid">
@@ -141,7 +160,7 @@
       <canvas id="c-pods" height="150"></canvas>
     </div>
     <div class="panel">
-      <h3>Neural brain — training loss <span class="v" id="v-loss">–</span></h3>
+      <h3>mTLS certs issued <span class="v" id="v-loss">–</span></h3>
       <canvas id="c-loss" height="150"></canvas>
     </div>
     <div class="panel">
@@ -188,9 +207,11 @@ function fmtDur(ms){
 // ── minimal self-contained area/line chart on a canvas ──
 function drawLine(cv, data, color){
   const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = cv.height;
-  cv.width = w*dpr; cv.style.height = h+'px'; cv.height = h*dpr;
-  const g = cv.getContext('2d'); g.scale(dpr,dpr);
+  // Size the backing store from the CSS-computed size (pinned by `height:150px`),
+  // NOT from cv.height — reading a value we then multiply grows it every frame.
+  const w = cv.clientWidth || 300, h = cv.clientHeight || 150;
+  cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
   g.clearRect(0,0,w,h);
   // grid
   g.strokeStyle='rgba(255,255,255,.06)'; g.lineWidth=1;
@@ -237,6 +258,11 @@ function logEvent(kind, msg){
   el.insertAdjacentHTML('afterbegin', `<div class="e"><span class="t">${t}</span><span class="${cls}">${ic} ${msg}</span></div>`);
   while(el.children.length>40) el.removeChild(el.lastChild);
 }
+function monkeySmash(){
+  const m=$('monkey'), b=$('boom');
+  if(m){ m.classList.remove('smash'); void m.offsetWidth; m.classList.add('smash'); }
+  if(b){ b.classList.remove('go'); void b.offsetWidth; b.classList.add('go'); }
+}
 function updateResil(desired, running, now){
   if(prevRunning===null){ prevRunning=running; lastDesired=desired; if(running>=desired) stableSince=now; return; }
   // A disruption = we were healthy, a pod was actually LOST (running fell), and
@@ -248,6 +274,7 @@ function updateResil(desired, running, now){
     if(!degraded && wasHealthy && dropped && !raised){
       degraded=true; degradedSince=now; disruptions++; stableSince=null;
       logEvent('bad', `pod lost — ${running}/${desired} healthy, Royak reconciling…`);
+      monkeySmash();
     }
   } else {
     if(degraded){
@@ -313,19 +340,20 @@ async function tick(){
     $('s-ticks').textContent  = ticks;
     $('s-up').textContent     = fmtDur(Date.now()-started);
 
-    // pods timeline
-    podHist.push({t:Date.now(), v:c.pods||0}); if(podHist.length>MAXPTS) podHist.shift();
-    $('v-pods').textContent = c.pods ?? '–';
+    const items = pods.items||[];
+
+    // pods running over time — a sawtooth as pods are killed and self-heal
+    podHist.push({t:Date.now(), v:items.length}); if(podHist.length>MAXPTS) podHist.shift();
+    $('v-pods').textContent = items.length;
     drawLine($('c-pods'), podHist, '#315bff');
 
-    // loss timeline
-    const loss = (brain.training && typeof brain.training.loss==='number') ? brain.training.loss : null;
-    if(loss!==null){ lossHist.push({t:Date.now(), v:loss}); if(lossHist.length>MAXPTS) lossHist.shift(); }
-    $('v-loss').textContent = loss!==null ? loss.toFixed(4) : '–';
+    // mTLS certs issued — climbs every time a pod is (re)created and gets a cert
+    const certs = (brain.security && brain.security.certs_issued) || 0;
+    lossHist.push({t:Date.now(), v:certs}); if(lossHist.length>MAXPTS) lossHist.shift();
+    $('v-loss').textContent = certs;
     drawLine($('c-loss'), lossHist, '#7c3aed');
 
     // per-pod cpu / mem
-    const items = pods.items||[];
     // resilience: desired (demo replicas, else desired pod sum) vs actually running
     const desired = (demoOn && demoReplicas!==null) ? demoReplicas : (c.pods||0);
     updateResil(desired, items.length, Date.now());
