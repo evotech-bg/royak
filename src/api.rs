@@ -2565,14 +2565,14 @@ async fn handle_ingress(
     // no per-request Docker call. This is what keeps the ingress concurrent even
     // while the reconcile loop holds the write lock during a tick. Falls through
     // to the live path if the route isn't in the snapshot yet.
-    if let Some((ip, port)) = snapshot_backend(&host, &path) {
+    if let Some((ip, port, pod)) = snapshot_backend(&host, &path) {
         let method = req.method().clone();
         let req_headers = req.headers().clone();
         let body_bytes = match req.collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => Bytes::new(),
         };
-        return Ok(match proxy_request_async(&ip, port, method.as_str(), &path, &req_headers, &body_bytes).await {
+        return Ok(match proxy_request_async(&ip, port, &pod, method.as_str(), &path, &req_headers, &body_bytes).await {
             Ok((status, body, resp_headers)) => {
                 let mut builder = hyper::Response::builder().status(status);
                 for (k, v) in resp_headers { builder = builder.header(k, v); }
@@ -2620,7 +2620,7 @@ async fn handle_ingress(
 
             eprintln!("  [ingress] {} {host}{path} → {route_label}", method.as_str());
             match proxy_request_async(
-                &target_host, target_port,
+                &target_host, target_port, "",
                 method.as_str(), &path, &req_headers, &body_bytes,
             ).await {
                 Ok((status, body, resp_headers)) => {
@@ -2737,8 +2737,10 @@ fn resolve_service_to_all_pod_ips(world: &DesiredWorld, service: &str) -> Vec<St
 pub struct ResolvedRoute {
     pub host: String,
     pub path: String,
-    pub ips: Vec<String>,
-    pub port: u16,
+    /// (ip, port, target_pod). target_pod empty → connect directly to a local
+    /// pod IP. Set → ip:port is a PEER's mesh proxy; inject X-Royak-Pod so the
+    /// peer hands the request off to that pod on its own docker bridge.
+    pub backends: Vec<(String, u16, String)>,
 }
 
 fn ingress_snapshot() -> &'static std::sync::Mutex<Arc<Vec<ResolvedRoute>>> {
@@ -2746,23 +2748,52 @@ fn ingress_snapshot() -> &'static std::sync::Mutex<Arc<Vec<ResolvedRoute>>> {
     SNAP.get_or_init(|| std::sync::Mutex::new(Arc::new(Vec::new())))
 }
 
+// Peer pod census for the ingress — (peer_api_addr, pod_name) — published by the
+// reconcile loop's cluster census so the ingress can round-robin onto pods that
+// live on OTHER nodes (reached via that node's mesh proxy).
+fn peer_pods_store() -> &'static std::sync::Mutex<Vec<(String, String)>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+pub fn set_peer_pods(entries: Vec<(String, String)>) {
+    if let Ok(mut g) = peer_pods_store().lock() { *g = entries; }
+}
+
+/// Deployment name backing a service (via its `app` selector).
+fn service_deployment(world: &DesiredWorld, service: &str) -> Option<String> {
+    let svc = world.services.values().find(|s| s.name == service)?;
+    let app = svc.selector.get("app")?;
+    world.deployments.values()
+        .find(|d| &d.name == app && d.namespace == svc.namespace)
+        .map(|d| d.name.clone())
+}
+
 /// Rebuild the pre-resolved ingress routing table. Called by the reconcile loop
-/// AFTER each tick (off the write-lock), so request handling never touches the
-/// world lock or Docker. Resolving pod IPs (a Docker call) happens once per tick
-/// here instead of once per request.
+/// AFTER each tick (off the write-lock). Local pods resolve to their container
+/// IP; pods on peer nodes resolve to that peer's mesh proxy + the pod name.
 pub fn publish_ingress_snapshot(world: &DesiredWorld) {
+    let peers = peer_pods_store().lock().map(|g| g.clone()).unwrap_or_default();
     let mut routes = Vec::new();
     for ingress in world.ingresses.values() {
         for rule in &ingress.rules {
             for ip_path in &rule.paths {
-                let ips = resolve_service_to_all_pod_ips(world, &ip_path.service);
-                if !ips.is_empty() {
-                    routes.push(ResolvedRoute {
-                        host: rule.host.clone(),
-                        path: ip_path.path.clone(),
-                        ips,
-                        port: ip_path.port,
-                    });
+                let mut backends: Vec<(String, u16, String)> = Vec::new();
+                // Local pods → direct.
+                for ip in resolve_service_to_all_pod_ips(world, &ip_path.service) {
+                    backends.push((ip, ip_path.port, String::new()));
+                }
+                // Remote pods → via the owning peer's mesh proxy (:6550).
+                if let Some(dep) = service_deployment(world, &ip_path.service) {
+                    let prefix = format!("rk-{dep}-");
+                    for (addr, pod) in &peers {
+                        if pod.starts_with(&prefix) {
+                            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr.as_str());
+                            backends.push((host.to_string(), crate::cluster_mesh::DEFAULT_MESH_PORT, pod.clone()));
+                        }
+                    }
+                }
+                if !backends.is_empty() {
+                    routes.push(ResolvedRoute { host: rule.host.clone(), path: ip_path.path.clone(), backends });
                 }
             }
         }
@@ -2772,20 +2803,19 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
     }
 }
 
-/// Longest-prefix lookup in the published snapshot. Lock-free path (Arc clone).
-/// Load-balances round-robin across the matched service's pods, so repeated
-/// requests to the same host land on different pods.
-fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16)> {
+/// Longest-prefix lookup in the published snapshot. Lock-free (Arc clone).
+/// Round-robins across ALL backends — local and remote — so a refresh lands on
+/// a different pod, possibly on a different node. Returns (ip, port, target_pod).
+fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16, String)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RR: AtomicUsize = AtomicUsize::new(0);
     let snap = ingress_snapshot().lock().ok()?.clone();
     let route = snap.iter()
         .filter(|r| (r.host.is_empty() || r.host == host) && path.starts_with(&r.path))
         .max_by_key(|r| r.path.len())?;
-    if route.ips.is_empty() { return None; }
+    if route.backends.is_empty() { return None; }
     let n = RR.fetch_add(1, Ordering::Relaxed);
-    let ip = route.ips[n % route.ips.len()].clone();
-    Some((ip, route.port))
+    Some(route.backends[n % route.backends.len()].clone())
 }
 
 // ─── Consolidated demo dashboard snapshot (lock-free read model) ───
@@ -2836,8 +2866,19 @@ pub fn publish_demo_state(world: &DesiredWorld) {
             pods.push(serde_json::json!({
                 "name": name, "cpu_raw": cpu, "memory_raw_mb": mem,
                 "cpu": format!("{:.1}%", cpu), "memory": format!("{:.0}Mi", mem),
+                "remote": false,
             }));
         }
+    }
+    // Pods running on PEER nodes (from the ingress census) — so the dashboard
+    // reflects the WHOLE cluster, not just this node. Stats aren't fetched
+    // cross-node, so they show as remote.
+    let peers = peer_pods_store().lock().map(|g| g.clone()).unwrap_or_default();
+    for (_, name) in &peers {
+        pods.push(serde_json::json!({
+            "name": name, "cpu_raw": 0.0, "memory_raw_mb": 0.0,
+            "cpu": "peer", "memory": "peer", "remote": true,
+        }));
     }
     let demo = if demo_enabled() {
         let app = demo_app();
@@ -2888,6 +2929,7 @@ fn find_backend(world: &DesiredWorld, host: &str, path: &str) -> Option<(String,
 async fn proxy_request_async(
     service: &str,
     port: u16,
+    target_pod: &str,
     method: &str,
     path: &str,
     headers: &HeaderMap,
@@ -2910,6 +2952,11 @@ async fn proxy_request_async(
     // should not cross a proxy boundary).
     let mut req = format!("{method} {path} HTTP/1.1\r\n");
     req.push_str(&format!("Host: {service}\r\n"));
+    // Cross-node: {service}:{port} is the peer's mesh proxy — tell it exactly
+    // which local pod on its docker bridge to hand this request off to.
+    if !target_pod.is_empty() {
+        req.push_str(&format!("X-Royak-Pod: {target_pod}\r\n"));
+    }
     for (name, val) in headers.iter() {
         let lname = name.as_str().to_ascii_lowercase();
         if matches!(lname.as_str(),

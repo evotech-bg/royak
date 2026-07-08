@@ -4758,6 +4758,7 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
     // pod names stay globally unique. NotReady peers are skipped (unreachable →
     // would stall under the world lock); they re-count once they heartbeat back.
     let mut remote_pods: Vec<String> = Vec::new();
+    let mut peer_pod_pairs: Vec<(String, String)> = Vec::new();
     let peer_addrs: Vec<String> = desired.nodes.iter()
         .filter(|(n, node)| **n != me_name && node.status == crate::reconcile::NodeStatus::Ready)
         .map(|(_, node)| node.address.clone())
@@ -4766,11 +4767,17 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
         if let Ok(body) = http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 if let Some(arr) = v["pods"].as_array() {
-                    remote_pods.extend(arr.iter().filter_map(|p| p.as_str().map(String::from)));
+                    for p in arr.iter().filter_map(|p| p.as_str()) {
+                        remote_pods.push(p.to_string());
+                        peer_pod_pairs.push((addr.clone(), p.to_string()));
+                    }
                 }
             }
         }
     }
+    // Publish the peer census to the ingress so it can round-robin onto pods
+    // that live on other nodes (reached via that node's mesh proxy).
+    crate::api::set_peer_pods(peer_pod_pairs.clone());
 
     for (name, dep) in &desired.deployments {
         let prefix = format!("rk-{name}-");
@@ -4795,6 +4802,21 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
             let mut taken: Vec<String> = managed.iter().map(|c| c.name.clone()).collect();
             taken.extend(remote_pods.iter().cloned());
 
+            // Per-deployment load balancer: place each new pod on the node running
+            // the FEWEST of THIS deployment's pods (self + ready peers), tracking a
+            // running tally so a batch spreads evenly instead of all landing on one.
+            // (addr, is_local, count-of-this-deployment's-pods)
+            let mut node_load: Vec<(String, bool, u32)> = Vec::new();
+            node_load.push((String::new(), true, running.len() as u32));
+            for (n, node) in desired.nodes.iter() {
+                if *n != me_name && node.status == NodeStatus::Ready
+                    && !node.address.is_empty() && !node.address.starts_with("127.0.0.1") {
+                    let cnt = peer_pod_pairs.iter()
+                        .filter(|(a, p)| a == &node.address && p.starts_with(&prefix)).count() as u32;
+                    node_load.push((node.address.clone(), false, cnt));
+                }
+            }
+
             for _ in 0..to_create {
                 let mut idx = 1u32;
                 let pod_name = loop {
@@ -4804,36 +4826,27 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
                 };
                 taken.push(pod_name.clone());
 
-                // Multi-node: if the scheduler picks a reachable REMOTE node, run
-                // the pod THERE (POST to its /royak/v1/create-pod) instead of
-                // locally. This is the runtime path `watch` actually uses — the
-                // legacy docker path had routing but was never reached.
-                if desired.nodes.len() > 1 {
-                    let me = local_node_name();
-                    if let Some(target_node) = pick_node(desired) {
-                        if target_node != me {
-                            if let Some(node) = desired.nodes.get(&target_node) {
-                                let addr = node.address.clone();
-                                let is_local = addr.is_empty()
-                                    || addr.starts_with("127.0.0.1") || addr.starts_with("localhost");
-                                if !is_local {
-                                    let url = format!("http://{addr}/royak/v1/create-pod");
-                                    let body = serde_json::json!({
-                                        "pod": pod_name, "deployment": name.as_str(),
-                                        "image": *image, "replicas": 1
-                                    }).to_string();
-                                    log.push(format!("    [multi-node] {pod_name} → {target_node} ({addr})"));
-                                    let (pn, tn) = (pod_name.clone(), target_node.clone());
-                                    std::thread::spawn(move || {
-                                        if let Err(e) = http_post(&url, &body, &[("Content-Type", "application/json")]) {
-                                            eprintln!("  ⚠ [multi-node] {pn} → {tn} create-pod failed: {e}");
-                                        }
-                                    });
-                                    continue; // routed to a peer — skip local create
-                                }
-                            }
+                // Pick the least-loaded node for this pod, then bump its tally.
+                let pick = node_load.iter().enumerate()
+                    .min_by_key(|(_, (_, _, c))| *c).map(|(i, _)| i).unwrap_or(0);
+                node_load[pick].2 += 1;
+                let (addr, is_local, _) = node_load[pick].clone();
+
+                if !is_local {
+                    // Route to the peer's /royak/v1/create-pod (runs it on its Docker).
+                    let url = format!("http://{addr}/royak/v1/create-pod");
+                    let body = serde_json::json!({
+                        "pod": pod_name, "deployment": name.as_str(),
+                        "image": *image, "replicas": 1
+                    }).to_string();
+                    log.push(format!("    [multi-node] {pod_name} → {addr}"));
+                    let (pn, ad) = (pod_name.clone(), addr.clone());
+                    std::thread::spawn(move || {
+                        if let Err(e) = http_post(&url, &body, &[("Content-Type", "application/json")]) {
+                            eprintln!("  ⚠ [multi-node] {pn} → {ad} create-pod failed: {e}");
                         }
-                    }
+                    });
+                    continue; // routed to a peer — skip local create
                 }
 
                 let labels = [("app", name.as_str()), ("managed-by", "royak")];
@@ -5272,7 +5285,9 @@ pub fn check_node_health(world: &mut DesiredWorld) -> Vec<String> {
     for (name, node) in world.nodes.iter_mut() {
         if *name == me { continue; }
         let age = now.saturating_sub(node.last_heartbeat);
-        if age > 30 && node.status == NodeStatus::Ready {
+        // 90s, not 30s: heartbeats go every 3 ticks and a docker-bound tick can
+        // run ~10s, so 30s sat right on the edge and flapped a healthy peer.
+        if age > 90 && node.status == NodeStatus::Ready {
             node.status = NodeStatus::NotReady;
             log.push(format!("  ⚠ [node] {name}: no heartbeat for {age}s — marked NotReady"));
         }

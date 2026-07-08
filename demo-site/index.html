@@ -35,6 +35,20 @@
   .served{color:var(--ink3);font-size:13px;margin-top:9px}
   .served code{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:1px 7px;
     font-size:.92em;color:var(--brand-purple);font-weight:700}
+  .edge{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--line);
+    border-left:4px solid var(--brand-blue);border-radius:var(--radius);padding:14px 18px;margin:18px 0 0;
+    box-shadow:0 1px 2px rgba(0,0,0,.04);color:var(--ink2);font-size:14px;line-height:1.55}
+  .edge b{color:var(--ink)} .edge-ic{font-size:22px;line-height:1.2}
+  .bench{background:linear-gradient(120deg,#0f1230,#1a1f4a);border-radius:var(--radius);padding:18px 20px;margin:14px 0 4px;
+    box-shadow:0 8px 26px rgba(49,91,255,.22)}
+  .bench-h{color:#c7ccf0;font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px}
+  .bench-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
+  .bz{background:rgba(255,255,255,.06);border-radius:12px;padding:14px 12px;text-align:center}
+  .bn{font-size:30px;font-weight:800;color:#fff;line-height:1;font-variant-numeric:tabular-nums}
+  .bn span{font-size:15px;font-weight:600;color:#aeb4e0}
+  .bn.g{background:linear-gradient(100deg,#6ea8ff,#a98bff 60%,#ff8a7a);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .bl{color:#9aa0cf;font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;margin-top:8px}
+  .bench-sub{color:#aeb4e0;font-size:12.5px;margin-top:13px;line-height:1.5} .bench-sub b{color:#e7e9ff}
 
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:30px 0}
   .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;
@@ -134,7 +148,26 @@
   <div class="chaos-banner">
     <video class="chaos-anim" src="chaos-monkey.mp4" autoplay loop muted playsinline
       aria-label="A chaos monkey smashing pods while Royak heals them"></video>
-    <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> It kills a random pod every ~20 seconds so you can watch Royak notice and heal it — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Want to help the monkey? Kill or scale pods yourself below.</div>
+    <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> Royak kills a random pod every ~20&nbsp;seconds so you can watch it notice and self-heal — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Every number below is this live 2-node cluster.</div>
+  </div>
+
+  <div class="edge">
+    <div class="edge-ic">⚡</div>
+    <div><b>In front of Royak sits NeuroCaddy</b> — our own Rust web server + TLS edge. It terminates HTTPS
+      (Let's Encrypt), load-balances, and runs a small neural network that learns this site's traffic patterns
+      to flag anomalies and shape routing decisions. Edge, orchestrator and cross-node mesh — the whole stack is homegrown.</div>
+  </div>
+
+  <div class="bench">
+    <div class="bench-h">⚡ Benchmarked live — the whole path</div>
+    <div class="bench-grid">
+      <div class="bz"><div class="bn g">622</div><div class="bl">req / sec</div></div>
+      <div class="bz"><div class="bn">98.3%</div><div class="bl">success @ 10k req</div></div>
+      <div class="bz"><div class="bn">143<span>ms</span></div><div class="bl">p50 latency</div></div>
+      <div class="bz"><div class="bn">200</div><div class="bl">concurrent</div></div>
+    </div>
+    <div class="bench-sub">NeuroCaddy → Royak ingress → round-robin → 8 pods across 2 nodes ·
+      cluster: <b>2× Oracle Cloud Ampere, 1 vCPU / 1&nbsp;GB each</b>, cross-provider private mesh (AES-256-GCM)</div>
   </div>
 
   <div class="stats" id="stats">
@@ -146,18 +179,6 @@
     <div class="stat"><div class="n" id="s-certs">–</div><div class="l">mTLS certs</div></div>
     <div class="stat"><div class="n" id="s-ticks">–</div><div class="l">Reconcile ticks</div></div>
     <div class="stat"><div class="n" id="s-up">–</div><div class="l">Demo uptime</div></div>
-  </div>
-
-  <div class="controls" id="controls">
-    <div class="ctitle">Break it — watch Royak heal it</div>
-    <div class="btns">
-      <button class="btn" id="b-down">Scale ▼</button>
-      <span class="reps" id="b-reps">–</span>
-      <button class="btn" id="b-up">Scale ▲</button>
-      <button class="btn kill" id="b-kill">💥 Kill a pod</button>
-      <label class="chaos"><input type="checkbox" id="b-chaos" /> Auto-chaos</label>
-    </div>
-    <div class="chint" id="ctrl-hint">A chaos monkey is already killing a pod every ~20s — watch the charts sawtooth and heal. Or break it yourself: kill a pod, scale the app. Every number here is this live cluster, and Royak reconciles it back.</div>
   </div>
 
   <div class="grid">
@@ -311,43 +332,8 @@ function updateResil(desired, running, now){
     $('r-stable').textContent = stableSince? fmtDur(now-stableSince) : '–'; }
 }
 
-// ── demo controls — enabled from the same consolidated /demo/state poll ──
-let demoReplicas=null, demoOn=false, chaos=false;
-// Optimistic scale target: the snapshot lags the write by ~1 reconcile tick, so
-// after a scale we hold our intended value until the snapshot catches up —
-// otherwise the next poll briefly reverts the number to the stale count.
-let pendingReplicas=null, pendingUntil=0;
-const CTRL_ON_HINT='A chaos monkey is already killing a pod every ~20s — watch the charts sawtooth and heal. Or break it yourself: kill a pod, scale the app. Every number here is this live cluster, and Royak reconciles it back.';
-function applyDemo(d){
-  demoOn = !!(d && d.enabled);
-  if(demoOn){
-    if(pendingReplicas!==null && (d.replicas===pendingReplicas || Date.now()>pendingUntil)) pendingReplicas=null;
-    demoReplicas = pendingReplicas!==null ? pendingReplicas : d.replicas;
-    $('b-reps').textContent = demoReplicas;
-    $('controls').classList.remove('off');
-    $('ctrl-hint').textContent = CTRL_ON_HINT;
-  } else {
-    $('controls').classList.add('off');
-    $('ctrl-hint').textContent = 'Interactive controls are off for this instance.';
-  }
-}
-async function scaleBy(delta){
-  if(!demoOn||demoReplicas===null) return;
-  const n=Math.max(1,Math.min(5,demoReplicas+delta));
-  pendingReplicas=n; pendingUntil=Date.now()+12000;  // hold our target until the snapshot confirms (ceiling 12s; a scale tick is docker-bound)
-  demoReplicas=n; $('b-reps').textContent=n;
-  try{ const r=await (await fetch(API+'/demo/scale?n='+n,{method:'POST'})).json();
-    if(r&&r.replicas!=null){ pendingReplicas=r.replicas; demoReplicas=r.replicas; $('b-reps').textContent=r.replicas; } }catch(e){}
-}
-async function killOne(){
-  if(!demoOn) return;
-  try{ await fetch(API+'/demo/kill',{method:'POST'}); }catch(e){}
-}
-$('b-up').onclick=()=>scaleBy(1);
-$('b-down').onclick=()=>scaleBy(-1);
-$('b-kill').onclick=killOne;
-$('b-chaos').onchange=e=>{ chaos=e.target.checked; };
-setInterval(()=>{ if(chaos && demoOn && !degraded) killOne(); }, 18000);
+// Manual controls removed — Royak's own chaos monkey (server-side) does the
+// breaking every ~20s, reliably. The page is a pure live window into the cluster.
 
 let ticks=0;
 async function tick(){
@@ -368,8 +354,6 @@ async function tick(){
     $('s-ticks').textContent  = ticks;
     $('s-up').textContent     = fmtDur(Date.now()-started);
 
-    applyDemo(s.demo);
-
     const items = s.pods||[];
     const running = s.running ?? items.length;
 
@@ -384,14 +368,14 @@ async function tick(){
     $('v-loss').textContent = certs;
     drawLine($('c-loss'), lossHist, '#7c3aed');
 
-    // resilience: desired (demo replicas, else desired pod sum) vs actually running
-    const desired = (demoOn && demoReplicas!==null) ? demoReplicas : (c.pods||0);
-    updateResil(desired, running, Date.now());
+    // resilience: total desired pods vs actually running — the chaos monkey
+    // drops one, Royak heals it, and this panel tracks the disruption + recovery.
+    updateResil(c.pods||running, running, Date.now());
     const maxMem = Math.max(1, ...items.map(p=>p.memory_raw_mb||0));
     $('v-cpu').textContent = running + ' pods';
     $('v-mem').textContent = items.reduce((a,p)=>a+(p.memory_raw_mb||0),0).toFixed(0)+' Mi';
-    rows($('cpu-rows'), items.map(p=>({name:p.name, pct:(p.cpu_raw||0), label:(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
-    rows($('mem-rows'), items.map(p=>({name:p.name, pct:(p.memory_raw_mb||0)/maxMem*100, label:(p.memory||'0Mi')})), 'mem');
+    rows($('cpu-rows'), items.map(p=>({name:p.remote?p.name+' ◆ server 2':p.name, pct:p.remote?6:(p.cpu_raw||0), label:p.remote?'on peer':(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
+    rows($('mem-rows'), items.map(p=>({name:p.remote?p.name+' ◆ server 2':p.name, pct:p.remote?6:(p.memory_raw_mb||0)/maxMem*100, label:p.remote?'peer':(p.memory||'0Mi')})), 'mem');
 
     // live orchestrator activity — royak's real reconcile decisions
     const act = s.activity || [];

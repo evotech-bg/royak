@@ -147,6 +147,19 @@ fn parse_host_header(head: &str) -> String {
     String::new()
 }
 
+/// Case-insensitive lookup of a request header value from the raw head.
+fn parse_header(head: &str, name: &str) -> Option<String> {
+    for line in head.lines() {
+        if line.is_empty() { break; } // end of headers
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse the namespace from a hostname of the form
 /// `<service>.<namespace>.svc.cluster.local` or just `<service>`.
 /// Falls back to "default".
@@ -268,6 +281,24 @@ async fn handle_conn(
     }
 
     let head = String::from_utf8_lossy(&buf[..n]);
+
+    // Explicit-target fast path: a peer's ingress already resolved the pod and
+    // tells us EXACTLY which local container to hand off to (X-Royak-Pod). A
+    // worker node has no service/deployment definition to resolve against, so
+    // this is how cross-node ingress reaches a pod that lives here.
+    if let Some(pod) = parse_header(&head, "x-royak-pod") {
+        match docker::container_ip(&pod) {
+            Ok(ip) if !ip.is_empty() => {
+                let mut upstream = TcpStream::connect(format!("{ip}:80")).await
+                    .map_err(|e| format!("connect {ip}:80: {e}"))?;
+                upstream.write_all(&buf[..n]).await.map_err(|e| format!("write head: {e}"))?;
+                splice(client, upstream).await;
+                return Ok(());
+            }
+            _ => return reply_status(&mut client, 502, "target pod not on this node").await,
+        }
+    }
+
     let host = parse_host_header(&head);
     let (service, namespace) = parse_ns(&host);
     if service.is_empty() {

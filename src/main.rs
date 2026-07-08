@@ -934,8 +934,46 @@ fn main() {
                 println!("  ⊘ ingress disabled (--ingress-port 0)");
             }
 
+            // Cross-node mesh proxy (:6550) — lets this node's ingress reach pods
+            // running on a PEER (their pods sit on the peer's docker bridge, not
+            // routable from here). node 1's ingress forwards to the peer's mesh
+            // with an explicit X-Royak-Pod header; the peer hands off locally.
+            {
+                let mesh_world = Arc::clone(&world_arc);
+                let mesh_node = reconcile::local_node_name();
+                rt.spawn(cluster_mesh::run_proxy(cluster_mesh::DEFAULT_MESH_PORT, mesh_node, mesh_world));
+            }
+
             // ServiceLB — NodePort listeners (userspace, klipper-lb-style)
             rt.spawn(servicelb::run(Arc::clone(&world_arc)));
+
+            // Server-side chaos monkey — when ROYAK_DEMO is on, reliably kill a
+            // random pod of the chaos app (default demosite) every ~20s so the
+            // self-heal is ALWAYS visible without a browser, clicks, or luck.
+            if std::env::var("ROYAK_DEMO").map(|v| v == "1" || v == "true").unwrap_or(false) {
+                std::thread::spawn(|| {
+                    let app = std::env::var("ROYAK_CHAOS_APP").unwrap_or_else(|_| "demosite".to_string());
+                    let prefix = format!("rk-{app}-");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(20));
+                        let running: Vec<(String, String)> = docker::list_containers(false)
+                            .unwrap_or_default().into_iter()
+                            .filter(|c| c.state == "running"
+                                && c.names.iter().any(|n| n.trim_start_matches('/').starts_with(&prefix)))
+                            .filter_map(|c| c.names.first()
+                                .map(|n| (c.id.clone(), n.trim_start_matches('/').to_string())))
+                            .collect();
+                        if running.len() <= 1 { continue; } // always leave one serving
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let (id, name) = &running[(now as usize) % running.len()];
+                        if docker::remove_container(id, true).is_ok() {
+                            crate::api::push_activity(&format!("[chaos] killed {name} — Royak reconciling…"));
+                            println!("  🐒 [chaos] killed {name}");
+                        }
+                    }
+                });
+            }
 
             println!("  Watching cluster (Ctrl+C to stop)...");
             if discover { println!("  Autodiscovery: UDP broadcast on port 9443"); }
