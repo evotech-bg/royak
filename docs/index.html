@@ -155,6 +155,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);fo
       <a href="#deploy">Deploy from source</a>
       <a href="#beta">Beta status</a>
       <a href="#install">Install</a>
+      <a href="https://demo.royak.io" target="_blank" rel="noopener">Live demo&nbsp;↗</a>
       <a class="gh-btn" href="https://github.com/evotech-bg/royak">★ Star on GitHub</a>
     </div>
   </div>
@@ -169,9 +170,12 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);fo
     Kubernetes does — deployments, rolling updates, services, RBAC, autoscaling — in a single
     <b>~5&nbsp;MB</b> binary. No etcd, no control-plane zoo, nothing to babysit.</p>
     <div class="ctas">
-      <a class="btn btn-primary" href="https://github.com/evotech-bg/royak">View on GitHub</a>
+      <a class="btn btn-primary" href="https://demo.royak.io" target="_blank" rel="noopener">▶ Watch the live cluster</a>
+      <a class="btn btn-ghost" href="https://github.com/evotech-bg/royak">View on GitHub</a>
       <a class="btn btn-ghost" href="#install">Install from source</a>
     </div>
+    <p class="sub" style="margin-top:14px;font-size:15px"><b>demo.royak.io</b> — a real 2-node Royak cluster running
+      this very stack: a chaos monkey kills a pod every&nbsp;~20s and you watch it self-heal, live.</p>
     <div class="install-line">
       <code id="install-cmd">git clone https://github.com/evotech-bg/royak && cd royak && cargo build --release</code>
       <button class="copy-btn" onclick="copyCmd()" id="copybtn">Copy</button>

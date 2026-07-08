@@ -2844,8 +2844,30 @@ pub fn push_activity(line: &str) {
     }
 }
 
+/// When this cluster first came alive (unix secs). Persisted to a file so it
+/// survives royak restarts/redeploys — this is real *cluster* uptime, not a
+/// per-page or per-process timer.
+fn cluster_born_secs() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let path = format!("{home}/.royak/born");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(t) = s.trim().parse::<u64>() { if t > 0 { return t; } }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        std::fs::create_dir_all(format!("{home}/.royak")).ok();
+        std::fs::write(&path, now.to_string()).ok();
+        now
+    })
+}
+
 pub fn publish_demo_state(world: &DesiredWorld) {
     let certs_issued = world.cluster_ca.as_ref().map(|ca| ca.issued_count).unwrap_or(0);
+    let uptime_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        .saturating_sub(cluster_born_secs());
     let cluster = serde_json::json!({
         "pods": world.deployments.values().map(|d| d.replicas).sum::<u32>(),
         "deployments": world.deployments.len(),
@@ -2896,6 +2918,7 @@ pub fn publish_demo_state(world: &DesiredWorld) {
         "pods": pods,
         "demo": demo,
         "activity": activity,
+        "uptime_secs": uptime_secs,
     }).to_string();
     if let Ok(mut g) = demo_state_snapshot().lock() {
         *g = Arc::new(body);
