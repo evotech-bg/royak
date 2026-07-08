@@ -10,7 +10,7 @@
 > in [Limitations](#limitations) and scheduled in [ROADMAP.md](ROADMAP.md) — nothing is swept under a rug.
 
 Royak (*рояк* — Bulgarian for "swarm") manages Docker containers the way Kubernetes does —
-deployments, scaling, rolling updates, RBAC, services — in a single ~5.2 MB Rust binary
+deployments, scaling, rolling updates, RBAC, services — in a single ~7.3 MB Rust binary
 instead of a control plane you have to babysit.
 
 🌐 **Website:** https://evotech-bg.github.io/royak/
@@ -225,7 +225,7 @@ src/consensus.rs       ~240 lines   Command log + ConsensusBackend trait
 mcp/royak.py           ~310 lines   MCP server
 ```
 
-Binary: **~5.2 MB** | ~16,000 lines of Rust
+Binary: **~7.3 MB** | ~16,000 lines of Rust
 
 ## How it works
 
