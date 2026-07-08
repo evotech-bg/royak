@@ -2320,6 +2320,8 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                 } else {
                     None
                 };
+                log.push(format!("    [multi-node] {} node(s) known, pick_node({pod_name}) → {:?}",
+                    desired.nodes.len(), target_node));
                 if let Some(ref node_name) = target_node {
                     if let Some(node) = desired.nodes.get(node_name) {
                         let is_local = node.address.starts_with("127.0.0.1")
@@ -2335,16 +2337,16 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                                 "replicas": 1
                             });
                             log.push(format!("    [multi-node] routing {pod_name} → {node_name} ({url})"));
-                            // Fire-and-forget: best effort remote creation
+                            // Fire-and-forget over the private subnet — but a
+                            // PROPER request. The old hand-rolled HTTP had no Host
+                            // header, which the peer's HTTP server rejects, so no
+                            // pod was ever actually created remotely.
                             if let Ok(body_str) = serde_json::to_string(&body) {
+                                let (u, p, nn) = (url.clone(), pod_name.clone(), node_name.clone());
                                 std::thread::spawn(move || {
-                                    let _ = std::net::TcpStream::connect_timeout(
-                                        &url.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 6443))),
-                                        std::time::Duration::from_secs(5)
-                                    ).and_then(|mut stream| {
-                                        use std::io::Write;
-                                        write!(stream, "POST /royak/v1/create-pod HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}", body_str.len(), body_str)
-                                    });
+                                    if let Err(e) = http_post(&u, &body_str, &[("Content-Type", "application/json")]) {
+                                        eprintln!("  ⚠ [multi-node] {p} → {nn} create-pod failed: {e}");
+                                    }
                                 });
                             }
                             // Update node pod count
@@ -2976,15 +2978,20 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_secs();
-    // Find local node by address containing 127.0.0.1 or by first node
-    let local_node_name = desired.nodes.iter()
-        .find(|(_, n)| n.address.contains("127.0.0.1"))
-        .or_else(|| desired.nodes.iter().next())
-        .map(|(name, _)| name.clone());
-    if let Some(name) = local_node_name {
+    // Refresh OUR OWN node entry every tick so we never mark ourselves NotReady.
+    // Match by our node name first (works even with a real advertise address);
+    // fall back to a loopback address, then the first node.
+    let me = local_node_name();
+    let local_name = desired.nodes.get(&me).map(|_| me.clone())
+        .or_else(|| desired.nodes.iter().find(|(_, n)| n.address.contains("127.0.0.1")).map(|(n, _)| n.clone()))
+        .or_else(|| desired.nodes.keys().next().cloned());
+    if let Some(name) = local_name {
         if let Some(local) = desired.nodes.get_mut(&name) {
             local.last_heartbeat = now;
             local.pod_count = pod_count;
+            // We are, by definition, alive here — never leave ourselves NotReady
+            // (check_node_health only demotes; the endpoint promotes peers).
+            local.status = NodeStatus::Ready;
         }
     }
 
@@ -4159,7 +4166,17 @@ pub fn run_loop(desired: &mut DesiredWorld, brain: &mut OrinBrain, interval_secs
         brain.set("cluster.last_reconcile_ms".to_string(), format!("{:.1}", elapsed.as_secs_f64() * 1000.0));
 
         println!("  ── tick {} ({:.1}ms) ──", brain.ticks, elapsed.as_secs_f64() * 1000.0);
-        for line in &log { println!("{line}"); }
+        for line in &log {
+            println!("{line}");
+            // Surface the interesting decisions to the demo's live activity feed.
+            let l = line.trim();
+            if l.starts_with("[scale]") || l.starts_with("[multi-node]") || l.starts_with("[create]")
+                || l.starts_with("[quota]") || l.contains("chaos") || l.contains("recovered")
+                || l.contains("healing") || l.contains("pod lost") || l.contains("reconciling")
+                || l.contains("rolling update") {
+                crate::api::push_activity(l);
+            }
+        }
 
         // Node health + heartbeat every 3 ticks (~15s)
         if brain.ticks % 3 == 0 && desired.nodes.len() > 1 {
@@ -4268,7 +4285,17 @@ pub fn run_loop_shared_with_runtime(
         brain.set("cluster.last_reconcile_ms".to_string(), format!("{:.1}", elapsed.as_secs_f64() * 1000.0));
 
         println!("  ── tick {} ({:.1}ms) ──", brain.ticks, elapsed.as_secs_f64() * 1000.0);
-        for line in &log { println!("{line}"); }
+        for line in &log {
+            println!("{line}");
+            // Surface the interesting decisions to the demo's live activity feed.
+            let l = line.trim();
+            if l.starts_with("[scale]") || l.starts_with("[multi-node]") || l.starts_with("[create]")
+                || l.starts_with("[quota]") || l.contains("chaos") || l.contains("recovered")
+                || l.contains("healing") || l.contains("pod lost") || l.contains("reconciling")
+                || l.contains("rolling update") {
+                crate::api::push_activity(l);
+            }
+        }
 
         // Node health + heartbeat every 3 ticks (~15s)
         if brain.ticks % 3 == 0 {
@@ -4286,25 +4313,42 @@ pub fn run_loop_shared_with_runtime(
                     &std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST")).unwrap_or_default()
                 );
                 std::thread::spawn(move || {
-                    let mut w = hb_world.write().unwrap();
-                    // Inline minimal heartbeat (can't pass brain to thread)
-                    let local_hostname = std::env::var("HOSTNAME")
-                        .or_else(|_| std::env::var("HOST")).unwrap_or_default();
+                    // Snapshot what we need under a BRIEF read lock, then do the
+                    // network POSTs with NO lock held. Holding world.write() across
+                    // http_post stalled the whole reconcile + ingress (site down)
+                    // whenever a peer was slow — a 37s tick and 502s.
                     let token_b64 = OrinBrain::identity_base64(&hb_brain_identity);
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    let local = w.nodes.get(&local_hostname);
-                    let cpu = local.map(|n| n.cpu_used).unwrap_or(0.0);
-                    let mem = local.map(|n| n.mem_used).unwrap_or(0.0);
-                    let pods = local.map(|n| n.pod_count).unwrap_or(0);
-                    let body = serde_json::json!({"node": local_hostname, "cpu_used": cpu, "mem_used": mem, "pod_count": pods, "timestamp": now}).to_string();
-                    let peers: Vec<(String, String)> = w.nodes.iter()
-                        .filter(|(name, _)| **name != local_hostname)
-                        .map(|(name, n)| (name.clone(), n.address.clone())).collect();
+                    let (body, peers) = {
+                        let w = hb_world.read().unwrap();
+                        let local_hostname = local_node_name();
+                        let local = w.nodes.get(&local_hostname);
+                        let cpu = local.map(|n| n.cpu_used).unwrap_or(0.0);
+                        let mem = local.map(|n| n.mem_used).unwrap_or(0.0);
+                        let pods = local.map(|n| n.pod_count).unwrap_or(0);
+                        let body = serde_json::json!({"node": local_hostname, "cpu_used": cpu, "mem_used": mem, "pod_count": pods, "timestamp": now}).to_string();
+                        let peers: Vec<(String, String)> = w.nodes.iter()
+                            .filter(|(name, _)| **name != local_hostname)
+                            .map(|(name, n)| (name.clone(), n.address.clone())).collect();
+                        (body, peers)
+                    };
+                    // Network I/O — lock-free
+                    let mut reached = Vec::new();
                     for (name, addr) in &peers {
                         if http_post(&format!("http://{addr}/royak/v1/heartbeat"), &body,
                             &[("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")]).is_ok() {
-                            if let Some(node) = w.nodes.get_mut(name) { node.last_heartbeat = now; }
+                            reached.push(name.clone());
+                        }
+                    }
+                    // Brief write lock only to apply the results.
+                    if !reached.is_empty() {
+                        let mut w = hb_world.write().unwrap();
+                        for name in reached {
+                            if let Some(node) = w.nodes.get_mut(&name) {
+                                node.last_heartbeat = now;
+                                node.status = NodeStatus::Ready; // reached it → alive
+                            }
                         }
                     }
                 });
@@ -4702,26 +4746,96 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
         .filter(|c| c.name.contains("rk-"))
         .collect();
 
+    // Reflect THIS node's real pod count so pick_node penalises us correctly.
+    // Without it our pod_count stays 0, we always win our own scheduling, and
+    // nothing ever routes to a peer.
+    let me_name = local_node_name();
+    let local_pods = managed.iter().filter(|c| c.state == ContainerState::Running).count() as u32;
+    if let Some(n) = desired.nodes.get_mut(&me_name) { n.pod_count = local_pods; }
+
+    // Cluster-wide pod census: ask each READY peer for its running pods, so a
+    // deployment's replicas are counted across ALL nodes (not just local) and
+    // pod names stay globally unique. NotReady peers are skipped (unreachable →
+    // would stall under the world lock); they re-count once they heartbeat back.
+    let mut remote_pods: Vec<String> = Vec::new();
+    let peer_addrs: Vec<String> = desired.nodes.iter()
+        .filter(|(n, node)| **n != me_name && node.status == crate::reconcile::NodeStatus::Ready)
+        .map(|(_, node)| node.address.clone())
+        .collect();
+    for addr in &peer_addrs {
+        if let Ok(body) = http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(arr) = v["pods"].as_array() {
+                    remote_pods.extend(arr.iter().filter_map(|p| p.as_str().map(String::from)));
+                }
+            }
+        }
+    }
+
     for (name, dep) in &desired.deployments {
         let prefix = format!("rk-{name}-");
         let running: Vec<&&runtime::Container> = managed.iter()
             .filter(|c| c.name.starts_with(&prefix) && c.state == ContainerState::Running)
             .collect();
+        let remote_running = remote_pods.iter().filter(|p| p.starts_with(&prefix)).count() as u32;
 
-        let current = running.len() as u32;
+        let current = running.len() as u32 + remote_running;
         let target = dep.replicas;
 
         if current < target {
             let to_create = target - current;
-            log.push(format!("  [scale] {name}: {current} → {target} (+{to_create})"));
+            log.push(format!("  [scale] {name}: {current} → {target} (+{to_create}) [{} local + {remote_running} remote]", running.len()));
             let image = &dep.containers.first().map(|c| c.image.as_str()).unwrap_or(&dep.image);
 
             if let Err(e) = rt.pull(image) {
                 log.push(format!("    [warn] pull {image}: {e}"));
             }
 
-            for i in 0..to_create {
-                let pod_name = format!("rk-{name}-{}", current + i + 1);
+            // Reserve globally-unique names across local AND remote pods.
+            let mut taken: Vec<String> = managed.iter().map(|c| c.name.clone()).collect();
+            taken.extend(remote_pods.iter().cloned());
+
+            for _ in 0..to_create {
+                let mut idx = 1u32;
+                let pod_name = loop {
+                    let cand = format!("rk-{name}-{idx}");
+                    if !taken.iter().any(|n| n == &cand) { break cand; }
+                    idx += 1;
+                };
+                taken.push(pod_name.clone());
+
+                // Multi-node: if the scheduler picks a reachable REMOTE node, run
+                // the pod THERE (POST to its /royak/v1/create-pod) instead of
+                // locally. This is the runtime path `watch` actually uses — the
+                // legacy docker path had routing but was never reached.
+                if desired.nodes.len() > 1 {
+                    let me = local_node_name();
+                    if let Some(target_node) = pick_node(desired) {
+                        if target_node != me {
+                            if let Some(node) = desired.nodes.get(&target_node) {
+                                let addr = node.address.clone();
+                                let is_local = addr.is_empty()
+                                    || addr.starts_with("127.0.0.1") || addr.starts_with("localhost");
+                                if !is_local {
+                                    let url = format!("http://{addr}/royak/v1/create-pod");
+                                    let body = serde_json::json!({
+                                        "pod": pod_name, "deployment": name.as_str(),
+                                        "image": *image, "replicas": 1
+                                    }).to_string();
+                                    log.push(format!("    [multi-node] {pod_name} → {target_node} ({addr})"));
+                                    let (pn, tn) = (pod_name.clone(), target_node.clone());
+                                    std::thread::spawn(move || {
+                                        if let Err(e) = http_post(&url, &body, &[("Content-Type", "application/json")]) {
+                                            eprintln!("  ⚠ [multi-node] {pn} → {tn} create-pod failed: {e}");
+                                        }
+                                    });
+                                    continue; // routed to a peer — skip local create
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let labels = [("app", name.as_str()), ("managed-by", "royak")];
                 let cmd_opt: Option<&[&str]> = None;
                 match rt.create(&pod_name, image, cmd_opt, &dep.env, &labels) {
@@ -4787,16 +4901,41 @@ fn check_probe(container_id: &str, probe: &StoredProbe) -> bool {
 // ─── Multi-Node Cluster ───
 
 /// Register the local node in the cluster
-pub fn register_local_node(world: &mut DesiredWorld, brain: &OrinBrain, api_port: u16) {
-    let hostname = std::env::var("HOSTNAME")
+/// This process's node name — the key it registers under AND heartbeats as.
+/// Must be identical across registration, the heartbeat sender, and the local
+/// metric update, or heartbeats won't match by name and every node flaps to
+/// NotReady after 30s (which disables multi-node scheduling entirely).
+pub fn local_node_name() -> String {
+    std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| {
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
             std::process::Command::new("hostname")
                 .output().ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "royak-node-0".to_string())
-        });
+        })
+}
+
+/// The address peers should use to reach THIS node's API. Multi-node pod
+/// routing (reconcile → POST /royak/v1/create-pod) needs a routable address
+/// here, not 127.0.0.1 / 0.0.0.0. `ROYAK_ADVERTISE_ADDR` (host or host:port)
+/// overrides; otherwise falls back to loopback (single-node default).
+pub fn advertised_address(api_port: u16) -> String {
+    if let Ok(a) = std::env::var("ROYAK_ADVERTISE_ADDR") {
+        let a = a.trim();
+        if !a.is_empty() {
+            return if a.contains(':') { a.to_string() } else { format!("{a}:{api_port}") };
+        }
+    }
+    format!("127.0.0.1:{api_port}")
+}
+
+pub fn register_local_node(world: &mut DesiredWorld, brain: &OrinBrain, api_port: u16) {
+    let hostname = local_node_name();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4806,7 +4945,7 @@ pub fn register_local_node(world: &mut DesiredWorld, brain: &OrinBrain, api_port
 
     world.nodes.insert(hostname.clone(), ClusterNode {
         name: hostname.clone(),
-        address: format!("127.0.0.1:{api_port}"),
+        address: advertised_address(api_port),
         cpu_capacity: 100.0,
         mem_capacity: get_system_mem(),
         cpu_used: 0.0,
@@ -4821,15 +4960,7 @@ pub fn register_local_node(world: &mut DesiredWorld, brain: &OrinBrain, api_port
 
 /// Join a remote node to the cluster with REAL networking
 pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &str, local_port: u16) -> Result<String, String> {
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| {
-            std::process::Command::new("hostname")
-                .output().ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "new-node".to_string())
-        });
+    let hostname = local_node_name();
 
     let our_token = brain.neural_identity(&hostname);
     let token_b64 = OrinBrain::identity_base64(&our_token);
@@ -4840,7 +4971,7 @@ pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &
     // 1. Register ourselves locally
     world.nodes.insert(hostname.clone(), ClusterNode {
         name: hostname.clone(),
-        address: format!("0.0.0.0:{local_port}"),
+        address: advertised_address(local_port),
         cpu_capacity: 100.0,
         mem_capacity: get_system_mem(),
         cpu_used: 0.0, mem_used: 0.0, pod_count: 0,
@@ -5083,9 +5214,7 @@ pub fn merge_state(local: &mut DesiredWorld, remote: &serde_json::Value) -> Vec<
 
 /// Send heartbeat to all peer nodes
 pub fn send_heartbeats(world: &mut DesiredWorld, brain: &OrinBrain) {
-    let local_hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let local_hostname = local_node_name();
     let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&local_hostname));
 
     // Collect peer addresses (skip ourselves)
@@ -5118,6 +5247,10 @@ pub fn send_heartbeats(world: &mut DesiredWorld, brain: &OrinBrain) {
             Ok(_) => {
                 if let Some(node) = world.nodes.get_mut(name) {
                     node.last_heartbeat = now;
+                    // A successful POST means we reached the peer's API → it is
+                    // alive and serving. Promote it (check_node_health only
+                    // demotes; a fresh heartbeat alone never restores Ready).
+                    node.status = NodeStatus::Ready;
                 }
             }
             Err(_) => {} // check_node_health will handle stale nodes
@@ -5132,7 +5265,12 @@ pub fn check_node_health(world: &mut DesiredWorld) -> Vec<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_secs();
 
+    // We are running this check → we are alive. Never demote ourselves (the
+    // self-heartbeat refresh is racy with two health-check sites + the async
+    // heartbeat thread, which made the local node flap to NotReady).
+    let me = local_node_name();
     for (name, node) in world.nodes.iter_mut() {
+        if *name == me { continue; }
         let age = now.saturating_sub(node.last_heartbeat);
         if age > 30 && node.status == NodeStatus::Ready {
             node.status = NodeStatus::NotReady;

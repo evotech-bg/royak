@@ -552,6 +552,52 @@ fn route_request(
             (200, serde_json::json!({"status": "ok"}).to_string())
         }
 
+        // ─── Multi-node: run a pod on THIS node (receiver of scheduling) ───
+        // Another node's reconcile picked us and POSTs the pod here; we create it
+        // on our local Docker. The sender is fire-and-forget over the private
+        // subnet. Custom images built on another node must be pre-distributed —
+        // we pull public images, and fail loudly for local-only ones.
+        ("POST", "/royak/v1/create-pod") => {
+            let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            let pod = v["pod"].as_str().unwrap_or("").to_string();
+            let deployment = v["deployment"].as_str().unwrap_or("").to_string();
+            let image = v["image"].as_str().unwrap_or("").to_string();
+            if pod.is_empty() || image.is_empty() {
+                return (400, r#"{"kind":"Status","status":"Failure","message":"pod and image required","code":400}"#.to_string());
+            }
+            if !docker::image_exists_locally(&image) {
+                if let Err(e) = docker::pull_image(&image) {
+                    eprintln!("  ⚠ [multi-node] {pod}: image {image} not local + pull failed: {e}");
+                    return (503, serde_json::json!({"status":"error","pod":pod,"message":format!("image '{image}' unavailable on this node (needs distribution): {e}")}).to_string());
+                }
+            }
+            let labels = [("royak.managed", "true"), ("royak.deployment", deployment.as_str()), ("app", deployment.as_str())];
+            match docker::create_container(&pod, &image, None, &[], &labels) {
+                Ok(id) => {
+                    // create ≠ start — must start it or it sits in "Created".
+                    if let Err(e) = docker::start_container(&id) {
+                        return (500, serde_json::json!({"status":"error","pod":pod,"message":format!("created but start failed: {e}")}).to_string());
+                    }
+                    eprintln!("  ✓ [multi-node] created + started {pod} here ({})", &id[..12.min(id.len())]);
+                    (200, serde_json::json!({"status":"ok","pod":pod,"id":id}).to_string())
+                }
+                Err(e) => (500, serde_json::json!({"status":"error","pod":pod,"message":e}).to_string()),
+            }
+        }
+
+        // ─── Multi-node: this node's running managed pods ───
+        // Peers query this to count a deployment's replicas across the whole
+        // cluster (so we don't over-provision or collide on pod names).
+        ("GET", "/royak/v1/pods") => {
+            let names: Vec<String> = docker::list_containers(false).unwrap_or_default()
+                .into_iter()
+                .filter(|c| c.state == "running"
+                    && c.names.iter().any(|n| n.trim_start_matches('/').starts_with("rk-")))
+                .filter_map(|c| c.names.first().map(|n| n.trim_start_matches('/').to_string()))
+                .collect();
+            (200, serde_json::json!({"pods": names}).to_string())
+        }
+
         // ─── PATCH with a partial body (no "kind"): strategic merge ───
         // kubectl's client-side apply and `kubectl patch` send partial
         // patches. We merge them into the stored manifest and re-apply.
@@ -2652,18 +2698,33 @@ fn resolve_canary_target(world: &DesiredWorld, service: &str, port: u16) -> Opti
 /// pod that matches the service's app selector and belongs to the same
 /// deployment; round-robin across pods is a v0.3 follow-up.
 fn resolve_service_to_pod_ip(world: &DesiredWorld, service: &str) -> Option<String> {
-    let svc = world.services.values().find(|s| s.name == service)?;
-    let app = svc.selector.get("app")?.clone();
-    let deployment = world.deployments.values()
-        .find(|d| d.name == app && d.namespace == svc.namespace)?;
-    if deployment.replicas == 0 { return None; }
-    for i in 1..=deployment.replicas {
-        let pod = format!("rk-{}-{}", deployment.name, i);
-        if let Ok(ip) = docker::container_ip(&pod) {
-            if !ip.is_empty() { return Some(ip); }
+    resolve_service_to_all_pod_ips(world, service).into_iter().next()
+}
+
+/// All ready pod IPs backing a service — the ingress load-balances across these
+/// (round-robin), so hitting the same host lands on different pods per request.
+fn resolve_service_to_all_pod_ips(world: &DesiredWorld, service: &str) -> Vec<String> {
+    let Some(svc) = world.services.values().find(|s| s.name == service) else { return Vec::new() };
+    let Some(app) = svc.selector.get("app").cloned() else { return Vec::new() };
+    let Some(deployment) = world.deployments.values()
+        .find(|d| d.name == app && d.namespace == svc.namespace) else { return Vec::new() };
+    // Enumerate the ACTUAL running pods (rk-<deployment>-*) rather than guessing
+    // ordinals 1..replicas — after a scale-down the survivors keep their original
+    // numbers (e.g. rk-demosite-9/10/11), so index-guessing resolved nothing → 502.
+    let prefix = format!("rk-{}-", deployment.name);
+    let mut ips = Vec::new();
+    if let Ok(containers) = docker::list_containers(false) {
+        for c in containers.iter().filter(|c| c.state == "running"
+            && c.names.iter().any(|n| n.trim_start_matches('/').starts_with(&prefix)))
+        {
+            if let Some(name) = c.names.first().map(|n| n.trim_start_matches('/')) {
+                if let Ok(ip) = docker::container_ip(name) {
+                    if !ip.is_empty() { ips.push(ip); }
+                }
+            }
         }
     }
-    None
+    ips
 }
 
 // ─── Lock-free ingress route snapshot ───
@@ -2676,7 +2737,7 @@ fn resolve_service_to_pod_ip(world: &DesiredWorld, service: &str) -> Option<Stri
 pub struct ResolvedRoute {
     pub host: String,
     pub path: String,
-    pub ip: String,
+    pub ips: Vec<String>,
     pub port: u16,
 }
 
@@ -2694,11 +2755,12 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
     for ingress in world.ingresses.values() {
         for rule in &ingress.rules {
             for ip_path in &rule.paths {
-                if let Some(pod_ip) = resolve_service_to_pod_ip(world, &ip_path.service) {
+                let ips = resolve_service_to_all_pod_ips(world, &ip_path.service);
+                if !ips.is_empty() {
                     routes.push(ResolvedRoute {
                         host: rule.host.clone(),
                         path: ip_path.path.clone(),
-                        ip: pod_ip,
+                        ips,
                         port: ip_path.port,
                     });
                 }
@@ -2711,12 +2773,19 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
 }
 
 /// Longest-prefix lookup in the published snapshot. Lock-free path (Arc clone).
+/// Load-balances round-robin across the matched service's pods, so repeated
+/// requests to the same host land on different pods.
 fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RR: AtomicUsize = AtomicUsize::new(0);
     let snap = ingress_snapshot().lock().ok()?.clone();
-    snap.iter()
+    let route = snap.iter()
         .filter(|r| (r.host.is_empty() || r.host == host) && path.starts_with(&r.path))
-        .max_by_key(|r| r.path.len())
-        .map(|r| (r.ip.clone(), r.port))
+        .max_by_key(|r| r.path.len())?;
+    if route.ips.is_empty() { return None; }
+    let n = RR.fetch_add(1, Ordering::Relaxed);
+    let ip = route.ips[n % route.ips.len()].clone();
+    Some((ip, route.port))
 }
 
 // ─── Consolidated demo dashboard snapshot (lock-free read model) ───
@@ -2729,6 +2798,20 @@ fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16)> {
 fn demo_state_snapshot() -> &'static std::sync::Mutex<Arc<String>> {
     static SNAP: std::sync::OnceLock<std::sync::Mutex<Arc<String>>> = std::sync::OnceLock::new();
     SNAP.get_or_init(|| std::sync::Mutex::new(Arc::new(String::from("{}"))))
+}
+
+// ─── Live activity feed — royak's reconcile decisions, for the demo ───
+fn activity_log() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static LOG: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+/// Record an interesting reconcile decision (scale / routing / create / chaos /
+/// heal) for the demo's live activity panel — you watch the orchestrator think.
+pub fn push_activity(line: &str) {
+    if let Ok(mut q) = activity_log().lock() {
+        q.push_back(line.trim().to_string());
+        while q.len() > 60 { q.pop_front(); }
+    }
 }
 
 pub fn publish_demo_state(world: &DesiredWorld) {
@@ -2763,12 +2846,15 @@ pub fn publish_demo_state(world: &DesiredWorld) {
     } else {
         serde_json::json!({"enabled": false})
     };
+    let activity: Vec<String> = activity_log().lock()
+        .map(|q| q.iter().cloned().collect()).unwrap_or_default();
     let body = serde_json::json!({
         "cluster": cluster,
         "certs_issued": certs_issued,
         "running": pods.len(),
         "pods": pods,
         "demo": demo,
+        "activity": activity,
     }).to_string();
     if let Ok(mut g) = demo_state_snapshot().lock() {
         *g = Arc::new(body);

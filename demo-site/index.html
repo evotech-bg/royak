@@ -32,6 +32,9 @@
     -webkit-background-clip:text;background-clip:text;color:transparent}
   .lead{color:var(--ink2);font-size:18px;max-width:720px}
   .lead code{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:.9em}
+  .served{color:var(--ink3);font-size:13px;margin-top:9px}
+  .served code{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:1px 7px;
+    font-size:.92em;color:var(--brand-purple);font-weight:700}
 
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:30px 0}
   .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;
@@ -102,6 +105,13 @@
   .evlog{margin-top:10px;max-height:132px;overflow:auto;font-family:ui-monospace,monospace;font-size:12.5px}
   .evlog .e{color:var(--ink2);padding:3px 0;border-top:1px solid rgba(0,0,0,.06)}
   .evlog .e .ok{color:var(--ok)}.evlog .e .bad{color:var(--brand-red)}.evlog .e .t{color:var(--ink3);margin-right:8px}
+  .actlog{margin-top:6px;max-height:230px;overflow:auto;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.75;
+    background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .actlog .a{padding:1px 0;color:var(--ink2);white-space:pre-wrap;word-break:break-word}
+  .actlog .a.route{color:var(--brand-purple);font-weight:700}
+  .actlog .a.create{color:var(--ok);font-weight:600}
+  .actlog .a.scale{color:var(--brand-blue);font-weight:600}
+  .actlog .a.chaos{color:var(--brand-red);font-weight:600}
   .panel h3 .v.healing{color:#fbbf24}
 
   .foot{color:var(--ink3);font-size:14px;text-align:center;padding:34px 0 46px;border-top:1px solid var(--line);margin-top:34px}
@@ -117,6 +127,8 @@
     <h1>This page runs on <span class="accent">Royak</span>.</h1>
     <p class="lead">Deployed by a <code>git push</code>, built and served by Royak's own ingress. Every number
       below is this cluster's <b>real, live</b> state — polled from Royak's API every 2&nbsp;seconds.</p>
+    <p class="served">This response served by pod <code id="pod">__POD__</code> · <span id="served-at">now</span>
+      — refresh and Royak's ingress round-robins you to a different replica. Not a static page.</p>
   </header>
 
   <div class="chaos-banner">
@@ -175,6 +187,10 @@
     <div class="panel">
       <h3>Per-pod memory <span class="v" id="v-mem">–</span></h3>
       <div class="rows" id="mem-rows"></div>
+    </div>
+    <div class="panel" style="grid-column:1/-1">
+      <h3>Live orchestrator activity <span class="v" id="v-act">watching…</span></h3>
+      <div class="actlog" id="actlog"><div class="a">waiting for Royak to reconcile…</div></div>
     </div>
   </div>
 
@@ -376,10 +392,28 @@ async function tick(){
     $('v-mem').textContent = items.reduce((a,p)=>a+(p.memory_raw_mb||0),0).toFixed(0)+' Mi';
     rows($('cpu-rows'), items.map(p=>({name:p.name, pct:(p.cpu_raw||0), label:(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
     rows($('mem-rows'), items.map(p=>({name:p.name, pct:(p.memory_raw_mb||0)/maxMem*100, label:(p.memory||'0Mi')})), 'mem');
+
+    // live orchestrator activity — royak's real reconcile decisions
+    const act = s.activity || [];
+    if(act.length){
+      $('v-act').textContent = act.length + ' events';
+      $('actlog').innerHTML = act.slice().reverse().slice(0,45).map(l=>{
+        const t = l.replace(/[<>]/g,'');
+        let cls='a';
+        if(t.includes('[multi-node]')) cls+=' route';
+        else if(t.includes('[create]')) cls+=' create';
+        else if(t.includes('[scale]')) cls+=' scale';
+        else if(t.includes('chaos')||t.includes('pod lost')||t.includes('reconciling')) cls+=' chaos';
+        return `<div class="${cls}">${t}</div>`;
+      }).join('');
+    }
   }catch(e){
     setLive(false,'reconnecting…');
   }
 }
+// Stamp when THIS page load rendered — with the baked pod id above, proves the
+// response is fresh from a live pod, not a cached static file.
+try{ $('served-at').textContent = 'rendered ' + new Date().toLocaleTimeString(); }catch(e){}
 tick(); setInterval(tick, 1500);
 </script>
 </body>
