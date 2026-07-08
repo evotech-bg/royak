@@ -938,7 +938,9 @@ fn main() {
             // running on a PEER (their pods sit on the peer's docker bridge, not
             // routable from here). node 1's ingress forwards to the peer's mesh
             // with an explicit X-Royak-Pod header; the peer hands off locally.
-            {
+            // Only in cluster mode (--node-id): a single-node watch has no peers
+            // to serve, and binding :6550 there collides with `royak mesh`.
+            if node_id.is_some() {
                 let mesh_world = Arc::clone(&world_arc);
                 let mesh_node = reconcile::local_node_name();
                 rt.spawn(cluster_mesh::run_proxy(cluster_mesh::DEFAULT_MESH_PORT, mesh_node, mesh_world));
