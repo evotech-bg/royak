@@ -5808,6 +5808,59 @@ pub fn cluster_pod_count(name: &str, local_pod_names: &[String]) -> u32 {
     names.len() as u32
 }
 
+/// CLI helper: every peer's pods as `(node_name, pod_name)`, by querying each
+/// non-local node's `/royak/v1/pods`. Lets `royak get pods` show pods that live
+/// on OTHER nodes (they're invisible via local Docker alone). Best-effort —
+/// unreachable peers are simply skipped.
+pub fn peer_pod_inventory(world: &DesiredWorld) -> Vec<(String, String)> {
+    let me = local_node_name();
+    let mut out = Vec::new();
+    for (nname, node) in &world.nodes {
+        if *nname == me || node.address.is_empty()
+            || node.address.starts_with("127.0.0.1") || node.address.starts_with("localhost") {
+            continue;
+        }
+        if let Ok(body) = http_get(&format!("http://{}/royak/v1/pods", node.address), &[]) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(arr) = v["pods"].as_array() {
+                    for p in arr.iter().filter_map(|p| p.as_str()) {
+                        out.push((nname.clone(), p.trim_start_matches('/').to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// CLI helper: which node runs `pod_name`? Returns `(node_name, api_address)`
+/// for the peer that has it, or None (caller treats it as local). Lets
+/// `royak logs` fetch a remote pod's logs from the node that actually runs it.
+pub fn find_pod_node(world: &DesiredWorld, pod_name: &str) -> Option<(String, String)> {
+    let me = local_node_name();
+    let want = pod_name.trim_start_matches('/');
+    for (nname, node) in &world.nodes {
+        if *nname == me || node.address.is_empty() || node.address.starts_with("127.0.0.1") {
+            continue;
+        }
+        if let Ok(body) = http_get(&format!("http://{}/royak/v1/pods", node.address), &[]) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if v["pods"].as_array().map(|arr|
+                    arr.iter().filter_map(|p| p.as_str()).any(|p| p.trim_start_matches('/') == want)
+                ).unwrap_or(false) {
+                    return Some((nname.clone(), node.address.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// CLI helper: fetch a pod's logs from the peer that runs it (`/pods/<name>/log`).
+pub fn fetch_remote_logs(peer_addr: &str, pod_name: &str) -> Result<String, String> {
+    http_get(&format!("http://{peer_addr}/api/v1/namespaces/default/pods/{pod_name}/log"), &[])
+}
+
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).
 /// No external crate, matching the project's philosophy. Returns None on an
 /// invalid character or non-UTF8 result, so callers can fall back to the raw

@@ -469,18 +469,41 @@ fn main() {
                                 .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
                                 .collect();
 
-                            if managed.is_empty() {
+                            // Cluster-aware: also list pods running on peer nodes,
+                            // so `get pods` on any node shows the WHOLE cluster
+                            // (a peer's pods are invisible via local Docker alone).
+                            let world = load_state(&state_path);
+                            let me = reconcile::local_node_name();
+                            let peer_pods = if world.nodes.len() > 1 {
+                                reconcile::peer_pod_inventory(&world)
+                            } else { Vec::new() };
+
+                            if managed.is_empty() && peer_pods.is_empty() {
                                 println!("  No managed pods found.");
                                 println!("  Use 'royak apply <file>' to deploy.");
                             } else {
-                                println!("  {:<20} {:<25} {:<12} {}", "NAME", "IMAGE", "STATE", "STATUS");
-                                println!("  {}", "─".repeat(70));
+                                let clustered = !peer_pods.is_empty();
+                                if clustered {
+                                    println!("  {:<20} {:<14} {:<22} {:<11} {}", "NAME", "NODE", "IMAGE", "STATE", "STATUS");
+                                    println!("  {}", "─".repeat(84));
+                                } else {
+                                    println!("  {:<20} {:<25} {:<12} {}", "NAME", "IMAGE", "STATE", "STATUS");
+                                    println!("  {}", "─".repeat(70));
+                                }
                                 for c in &managed {
                                     let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-                                    println!("  {:<20} {:<25} {:<12} {}",
-                                        name, c.image, c.state, c.status);
+                                    if clustered {
+                                        println!("  {:<20} {:<14} {:<22} {:<11} {}", name, me, c.image, c.state, c.status);
+                                    } else {
+                                        println!("  {:<20} {:<25} {:<12} {}", name, c.image, c.state, c.status);
+                                    }
                                 }
-                                println!("\n  {} pod(s) total", managed.len());
+                                // Peer pods — the /royak/v1/pods census returns names
+                                // only, so image/status show as "—" (remote node).
+                                for (node, pod) in &peer_pods {
+                                    println!("  {:<20} {:<14} {:<22} {:<11} {}", pod, node, "—", "running", "(remote)");
+                                }
+                                println!("\n  {} pod(s) total", managed.len() + peer_pods.len());
                             }
                         }
                         Err(e) => eprintln!("  Error: {e}"),
@@ -1379,11 +1402,32 @@ fn main() {
                                     }
                                 }
                             }
-                        } else if let Ok(logs) = fetch_logs(&full_name, tail) {
-                            let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
-                            println!("{clean}");
+                        } else if matching.len() == 1 {
+                            // Exactly one LOCAL pod — use its container id (get_logs
+                            // returns a 404 body as Ok, so decide by locality, not
+                            // by whether the fetch "errored").
+                            match fetch_logs(&matching[0].id[..12], tail) {
+                                Ok(logs) => {
+                                    let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
+                                    println!("{clean}");
+                                }
+                                Err(e) => eprintln!("  Error: {e}"),
+                            }
                         } else {
-                            eprintln!("  Pod '{full_name}' not found");
+                            // Not on this node — in a cluster the pod may live on a
+                            // peer. Find its owner and fetch the logs from there.
+                            let world = load_state(&state_path);
+                            match reconcile::find_pod_node(&world, &full_name) {
+                                Some((node, addr)) => match reconcile::fetch_remote_logs(&addr, &full_name) {
+                                    Ok(logs) => {
+                                        let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
+                                        println!("  ── {full_name} (on {node}){stream_label} ──");
+                                        println!("{clean}");
+                                    }
+                                    Err(e) => eprintln!("  Pod '{full_name}' is on {node} but log fetch failed: {e}"),
+                                },
+                                None => eprintln!("  Pod '{full_name}' not found"),
+                            }
                         }
                     }
                     Err(e) => eprintln!("  Error: {e}"),
