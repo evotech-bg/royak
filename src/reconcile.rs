@@ -636,6 +636,51 @@ pub struct StoredHPA {
     pub max_replicas: u32,
     pub target_cpu: f32,       // target CPU % (e.g. 70.0)
     pub history: Vec<f32>,     // CPU history for neural prediction
+    pub last_scaled: Option<u64>, // unix ts of last scale action (stabilization window)
+}
+
+/// Stabilization/cooldown window (seconds). After scaling an HPA's target we
+/// hold it for this long before scaling again, so CPU crossing the threshold on
+/// consecutive ticks can't thrash the deployment up and down. Symmetric window
+/// (K8s uses 300s down / 0s up; a single ~60s window is simpler for this tool).
+pub const HPA_STABILIZATION_SECS: u64 = 60;
+
+/// Pure scaling decision for a single HPA. Returns the new replica count, or
+/// `None` to hold (either no threshold crossed, or we're still inside the
+/// stabilization window). Kept side-effect-free so it is unit-testable.
+///
+/// `secs_since_last_scale` should be a large value (e.g. `u64::MAX`) when the
+/// HPA has never scaled, so the cooldown never blocks the first action.
+pub fn hpa_decision(
+    current_replicas: u32,
+    avg_cpu: f32,
+    target_cpu: f32,
+    min: u32,
+    max: u32,
+    secs_since_last_scale: u64,
+    stabilization_secs: u64,
+) -> Option<u32> {
+    // Desired replica count from CPU thresholds (clamped to [min, max]).
+    let desired = if avg_cpu > target_cpu && current_replicas < max {
+        let ratio = avg_cpu / target_cpu;
+        Some(((current_replicas as f32 * ratio).ceil() as u32).min(max))
+    } else if avg_cpu < target_cpu * 0.5 && current_replicas > min {
+        Some((current_replicas - 1).max(min))
+    } else {
+        None
+    };
+
+    match desired {
+        // Only act on a real change, and only once the cooldown has elapsed.
+        Some(target) if target != current_replicas => {
+            if secs_since_last_scale < stabilization_secs {
+                None // inside stabilization window → hold (anti-thrash)
+            } else {
+                Some(target)
+            }
+        }
+        _ => None,
+    }
 }
 
 pub struct StoredDaemonSet {
@@ -1643,6 +1688,7 @@ impl DesiredWorld {
                     max_replicas,
                     target_cpu,
                     history: Vec::new(),
+                    last_scaled: None,
                 });
                 Ok(format!("hpa/{name} → {deployment} (min={min_replicas}, max={max_replicas}, cpu={target_cpu}%)"))
             }
@@ -3220,8 +3266,11 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     }
 
     // 5. HPA — PREDICTIVE auto-scaling (not just reactive)
+    let hpa_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let mut hpa_scale_actions: Vec<(String, u32)> = Vec::new();
-    for (_name, hpa) in desired.hpas.iter() {
+    let mut hpa_scaled_names: Vec<String> = Vec::new();
+    for (hpa_key, hpa) in desired.hpas.iter() {
         if let Some(dep) = desired.deployments.get(&hpa.deployment) {
             let prefix = format!("/rk-{}-", hpa.deployment);
             let running_count = managed.iter()
@@ -3255,20 +3304,41 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                 }
             }
 
-            // Reactive scaling (immediate need)
-            if simulated_cpu > hpa.target_cpu && current < hpa.max_replicas {
-                let ratio = simulated_cpu / hpa.target_cpu;
-                let target = ((current as f32 * ratio).ceil() as u32).min(hpa.max_replicas);
-                log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% > {:.0}% target → scale {current} → {target} (trend: {trend})",
-                    hpa.deployment, hpa.target_cpu));
-                hpa_scale_actions.push((hpa.deployment.clone(), target));
-            } else if simulated_cpu < hpa.target_cpu * 0.5 && current > hpa.min_replicas {
-                let target = (current - 1).max(hpa.min_replicas);
-                log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% < {:.0}% → scale down {current} → {target} (trend: {trend})",
-                    hpa.deployment, hpa.target_cpu * 0.5));
-                hpa_scale_actions.push((hpa.deployment.clone(), target));
-            } else {
-                log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% — {current} replicas ok (trend: {trend})", hpa.deployment));
+            // Reactive scaling (immediate need), guarded by a stabilization
+            // window so CPU crossing the threshold on consecutive ticks can't
+            // thrash the deployment up and down.
+            let secs_since_scale = hpa.last_scaled
+                .map(|t| hpa_now.saturating_sub(t))
+                .unwrap_or(u64::MAX);
+            let decision = hpa_decision(
+                current, simulated_cpu, hpa.target_cpu,
+                hpa.min_replicas, hpa.max_replicas,
+                secs_since_scale, HPA_STABILIZATION_SECS,
+            );
+            match decision {
+                Some(target) if target > current => {
+                    log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% > {:.0}% target → scale {current} → {target} (trend: {trend})",
+                        hpa.deployment, hpa.target_cpu));
+                    hpa_scale_actions.push((hpa.deployment.clone(), target));
+                    hpa_scaled_names.push(hpa_key.clone());
+                }
+                Some(target) => {
+                    log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% < {:.0}% → scale down {current} → {target} (trend: {trend})",
+                        hpa.deployment, hpa.target_cpu * 0.5));
+                    hpa_scale_actions.push((hpa.deployment.clone(), target));
+                    hpa_scaled_names.push(hpa_key.clone());
+                }
+                None => {
+                    // Distinguish "held by cooldown" from "nothing to do" for clarity.
+                    let would_change = (simulated_cpu > hpa.target_cpu && current < hpa.max_replicas)
+                        || (simulated_cpu < hpa.target_cpu * 0.5 && current > hpa.min_replicas);
+                    if would_change && secs_since_scale < HPA_STABILIZATION_SECS {
+                        log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% — holding {current} replicas ({}s into {HPA_STABILIZATION_SECS}s stabilization window)",
+                            hpa.deployment, secs_since_scale));
+                    } else {
+                        log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% — {current} replicas ok (trend: {trend})", hpa.deployment));
+                    }
+                }
             }
         }
     }
@@ -3276,6 +3346,13 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     for (dep_name, target) in hpa_scale_actions {
         if let Some(dep) = desired.deployments.get_mut(&dep_name) {
             dep.replicas = target;
+        }
+    }
+    // Stamp last_scaled so the stabilization window starts now (deferred to
+    // avoid a mutable borrow while iterating hpas above).
+    for hpa_key in hpa_scaled_names {
+        if let Some(hpa) = desired.hpas.get_mut(&hpa_key) {
+            hpa.last_scaled = Some(hpa_now);
         }
     }
 
@@ -4582,6 +4659,67 @@ mod lease_tests {
         release_lease(&path, "node-b");
         assert!(std::path::Path::new(&format!("{path}.leader")).exists());
         cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod hpa_tests {
+    use super::{hpa_decision, HPA_STABILIZATION_SECS};
+
+    const NEVER: u64 = u64::MAX; // never scaled → cooldown never blocks
+
+    #[test]
+    fn scales_up_when_over_threshold_and_cooldown_elapsed() {
+        // 2 replicas, CPU 140% vs 70% target → ratio 2.0 → 4 replicas.
+        let d = hpa_decision(2, 140.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(d, Some(4));
+        // Also fine when the last scale is older than the window.
+        let d2 = hpa_decision(2, 140.0, 70.0, 1, 10, HPA_STABILIZATION_SECS + 1, HPA_STABILIZATION_SECS);
+        assert_eq!(d2, Some(4));
+    }
+
+    #[test]
+    fn holds_within_cooldown_window_the_thrash_case() {
+        // Over threshold, but we scaled 10s ago and the window is 60s → hold.
+        let up = hpa_decision(2, 140.0, 70.0, 1, 10, 10, HPA_STABILIZATION_SECS);
+        assert_eq!(up, None);
+        // Symmetric: a scale-down that lands inside the window is also held.
+        let down = hpa_decision(4, 10.0, 70.0, 1, 10, 5, HPA_STABILIZATION_SECS);
+        assert_eq!(down, None);
+    }
+
+    #[test]
+    fn scales_down_when_under_half_target() {
+        // CPU 20% < 35% (half of 70%) → step down by one.
+        let d = hpa_decision(4, 20.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(d, Some(3));
+    }
+
+    #[test]
+    fn holds_when_cpu_in_normal_band() {
+        // 50% is above the 35% scale-down floor and below the 70% scale-up line.
+        let d = hpa_decision(3, 50.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn clamps_to_max_on_scale_up() {
+        // ratio would ask for far more than max → clamp to 10.
+        let d = hpa_decision(8, 700.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(d, Some(10));
+        // Already at max under high load → no change, no thrash.
+        let at_max = hpa_decision(10, 700.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(at_max, None);
+    }
+
+    #[test]
+    fn clamps_to_min_on_scale_down() {
+        // At min already, low CPU → hold (can't go below min).
+        let at_min = hpa_decision(1, 5.0, 70.0, 1, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(at_min, None);
+        // Stepping down from 2 with min=2 → no change.
+        let floor = hpa_decision(2, 5.0, 70.0, 2, 10, NEVER, HPA_STABILIZATION_SECS);
+        assert_eq!(floor, None);
     }
 }
 

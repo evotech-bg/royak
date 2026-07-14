@@ -2353,6 +2353,7 @@ fn load_state(path: &str) -> DesiredWorld {
                         max_replicas: item["max"].as_u64().unwrap_or(10) as u32,
                         target_cpu: item["cpu"].as_f64().unwrap_or(70.0) as f32,
                         history: Vec::new(),
+                        last_scaled: None,
                     };
                     world.hpas.insert(h.name.clone(), h);
                 }
