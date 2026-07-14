@@ -632,6 +632,20 @@ pub fn container_stats(id: &str) -> Result<(f32, f32), String> {
     out
 }
 
+/// Warm the stats cache for many containers CONCURRENTLY. Docker samples each
+/// container's CPU for ~1-2s per `/stats` call; the reconcile tick has several
+/// call-sites that read stats, and the first one otherwise pays N*~1.8s walking
+/// containers one at a time (~11s for 6 pods) — stretching the whole tick and
+/// causing intermittent 502s. One parallel warm up front costs ~a single
+/// sample's wall time and turns every later container_stats() call into a cache
+/// hit for the next 8s.
+pub fn prewarm_stats(ids: &[String]) {
+    let handles: Vec<_> = ids.iter().cloned()
+        .map(|id| std::thread::spawn(move || { let _ = container_stats(&id); }))
+        .collect();
+    for h in handles { let _ = h.join(); }
+}
+
 fn container_stats_uncached(id: &str) -> Result<(f32, f32), String> {
     // Docker stats API (one-shot, no stream)
     let resp = docker_request("GET", &format!("/containers/{id}/stats?stream=false"), None)?;

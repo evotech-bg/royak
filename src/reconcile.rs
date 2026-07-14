@@ -4746,6 +4746,17 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
         .filter(|c| c.name.contains("rk-"))
         .collect();
 
+    // Warm the per-container stats cache in ONE parallel pass up front. Several
+    // call-sites below (HPA average CPU, the demo snapshot, brain observation)
+    // read container_stats(); without this the first of them samples every
+    // container serially at Docker's ~1-2s/call, stretching the tick to ~N*2s
+    // and causing intermittent 502s. Parallel warm ≈ one sample's wall time.
+    let stat_ids: Vec<String> = managed.iter()
+        .filter(|c| c.state == ContainerState::Running)
+        .map(|c| c.id[..12.min(c.id.len())].to_string())
+        .collect();
+    crate::docker::prewarm_stats(&stat_ids);
+
     // Reflect THIS node's real pod count so pick_node penalises us correctly.
     // Without it our pod_count stays 0, we always win our own scheduling, and
     // nothing ever routes to a peer.
