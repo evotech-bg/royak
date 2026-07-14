@@ -1106,12 +1106,15 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let mut data = HashMap::new();
-
-                if let Some(spec_val) = &resource.spec {
-                    if let Some(mapping) = spec_val.as_mapping() {
+                // K8s-standard top-level `data:` wins; legacy `spec:` is kept as a
+                // fallback so pre-existing Royak manifests still work. (Real kubectl
+                // ConfigMaps put their keys under `data:`, so reading only `spec:`
+                // made them come in empty.)
+                for src in [&resource.data, &resource.spec] {
+                    if let Some(mapping) = src.as_ref().and_then(|v| v.as_mapping()) {
                         for (k, v) in mapping {
                             if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
-                                data.insert(key.to_string(), val.to_string());
+                                data.entry(key.to_string()).or_insert_with(|| val.to_string());
                             }
                         }
                     }
@@ -1163,13 +1166,31 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let mut data = HashMap::new();
-
-                if let Some(spec_val) = &resource.spec {
-                    if let Some(mapping) = spec_val.as_mapping() {
-                        for (k, v) in mapping {
-                            if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
-                                data.insert(key.to_string(), val.to_string());
-                            }
+                // K8s precedence: stringData: (plaintext) > data: (base64) ; legacy
+                // spec: (plaintext) kept last as a fallback for existing Royak
+                // manifests. Reading only `spec:` before meant real kubectl Secrets
+                // (which use base64 `data:`) came in empty.
+                if let Some(mapping) = resource.string_data.as_ref().and_then(|v| v.as_mapping()) {
+                    for (k, v) in mapping {
+                        if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                            data.entry(key.to_string()).or_insert_with(|| val.to_string());
+                        }
+                    }
+                }
+                if let Some(mapping) = resource.data.as_ref().and_then(|v| v.as_mapping()) {
+                    for (k, v) in mapping {
+                        if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                            // Secret `data:` is base64 in K8s — decode; fall back to
+                            // the raw string if it isn't valid base64.
+                            let decoded = base64_decode(val).unwrap_or_else(|| val.to_string());
+                            data.entry(key.to_string()).or_insert(decoded);
+                        }
+                    }
+                }
+                if let Some(mapping) = resource.spec.as_ref().and_then(|v| v.as_mapping()) {
+                    for (k, v) in mapping {
+                        if let (Some(key), Some(val)) = (k.as_str(), v.as_str()) {
+                            data.entry(key.to_string()).or_insert_with(|| val.to_string());
                         }
                     }
                 }
@@ -4491,6 +4512,17 @@ mod lease_tests {
     }
 
     #[test]
+    fn base64_decodes_standard_and_falls_back() {
+        assert_eq!(super::base64_decode("aGVsbG8=").as_deref(), Some("hello"));
+        assert_eq!(super::base64_decode("cGFzc3dvcmQxMjM=").as_deref(), Some("password123"));
+        assert_eq!(super::base64_decode("").as_deref(), Some(""));
+        // whitespace inside the value is tolerated (kubectl wraps long secrets)
+        assert_eq!(super::base64_decode("aGVs\nbG8=").as_deref(), Some("hello"));
+        // invalid input → None so the caller keeps the raw string
+        assert_eq!(super::base64_decode("not valid!!"), None);
+    }
+
+    #[test]
     fn holder_can_renew() {
         let path = tmp("renew");
         cleanup(&path);
@@ -5018,6 +5050,37 @@ pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &
     }
 
     Ok(format!("{hostname} joined cluster via {peer_address} ({} nodes)", world.nodes.len()))
+}
+
+/// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).
+/// No external crate, matching the project's philosophy. Returns None on an
+/// invalid character or non-UTF8 result, so callers can fall back to the raw
+/// string. Ignores whitespace and `=` padding.
+fn base64_decode(s: &str) -> Option<String> {
+    fn sixbit(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for c in s.bytes() {
+        if c.is_ascii_whitespace() || c == b'=' { continue; }
+        acc = (acc << 6) | sixbit(c)?;
+        nbits += 6;
+        while nbits >= 8 {
+            nbits -= 8;
+            bytes.push((acc >> nbits) as u8);
+        }
+        acc &= (1u32 << nbits) - 1;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 // ─── HTTP Client (raw TCP, same philosophy as docker.rs) ───
