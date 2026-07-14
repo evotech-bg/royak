@@ -682,6 +682,69 @@ pub fn spawn_stats_sampler() {
 }
 
 fn container_stats_uncached(id: &str) -> Result<(f32, f32), String> {
+    // Fast path: read cgroup v2 counters straight from the filesystem —
+    // microseconds, no Docker `/stats` sampling (~1-2s/container). Falls back to
+    // the Docker API when the unified-hierarchy scope isn't directly readable
+    // (cgroupfs driver, cgroup v1, macOS/Colima, non-docker runtime).
+    if let Some(v) = cgroup_stats_v2(id) {
+        return Ok(v);
+    }
+    container_stats_docker_api(id)
+}
+
+/// Previous cgroup CPU-time reading per container, to compute CPU% as a rate
+/// between samples (the background sampler polls every ~4s).
+fn cgroup_prev() -> &'static std::sync::Mutex<HashMap<String, (u64, std::time::Instant)>> {
+    static PREV: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, std::time::Instant)>>> = std::sync::OnceLock::new();
+    PREV.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Read CPU%/mem directly from cgroup v2 for a container (matched by short id).
+/// Returns None when the systemd-driver scope dir isn't found, so the caller
+/// falls back to the Docker API. CPU% is a rate vs the previous sample — 0 on a
+/// container's first read, then real once the sampler has two data points.
+fn cgroup_stats_v2(id: &str) -> Option<(f32, f32)> {
+    let base = "/sys/fs/cgroup/system.slice";
+    let prefix = format!("docker-{id}");
+    let dir = std::fs::read_dir(base).ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with(&prefix) && n.ends_with(".scope"))?;
+    let scope = format!("{base}/{dir}");
+
+    // CPU: cumulative usage_usec (across all cores) → % as delta over wall time.
+    // Same convention as Docker: 100% == one full core, so a 2-core burn reads 200%.
+    let usage_usec: u64 = std::fs::read_to_string(format!("{scope}/cpu.stat")).ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("usage_usec ").and_then(|v| v.trim().parse().ok()))?;
+    let now = std::time::Instant::now();
+    let cpu_pct = {
+        let mut prev = cgroup_prev().lock().unwrap();
+        let pct = match prev.get(id) {
+            Some((u0, t0)) => {
+                let dw = now.duration_since(*t0).as_micros();
+                if dw > 0 { (usage_usec.saturating_sub(*u0) as f64 / dw as f64 * 100.0) as f32 } else { 0.0 }
+            }
+            None => 0.0,
+        };
+        prev.insert(id.to_string(), (usage_usec, now));
+        pct
+    };
+
+    // Memory working set = memory.current − inactive_file (raw memory.current
+    // includes reclaimable page cache; subtracting it matches Docker's number).
+    let mem_current: u64 = std::fs::read_to_string(format!("{scope}/memory.current")).ok()?
+        .trim().parse().ok()?;
+    let inactive_file: u64 = std::fs::read_to_string(format!("{scope}/memory.stat")).ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("inactive_file ").and_then(|v| v.trim().parse().ok())))
+        .unwrap_or(0);
+    let mem_mb = mem_current.saturating_sub(inactive_file) as f32 / 1_048_576.0;
+
+    Some((cpu_pct, mem_mb))
+}
+
+/// Docker `/stats` API (one-shot). Fallback for when cgroup v2 can't be read directly.
+fn container_stats_docker_api(id: &str) -> Result<(f32, f32), String> {
     // Docker stats API (one-shot, no stream)
     let resp = docker_request("GET", &format!("/containers/{id}/stats?stream=false"), None)?;
 
