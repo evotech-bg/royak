@@ -159,7 +159,7 @@
   <div class="chaos-banner">
     <video class="chaos-anim" src="chaos-monkey.mp4" autoplay loop muted playsinline
       aria-label="A chaos monkey smashing pods while Royak heals them"></video>
-    <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> Royak kills a random pod every ~20&nbsp;seconds so you can watch it notice and self-heal — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Every number below is this live 2-node cluster.</div>
+    <div class="chaos-text"><b>A chaos monkey is loose on purpose.</b> Royak kills a random pod every ~20&nbsp;seconds so you can watch it notice and self-heal — every time, automatically. Nothing here is broken; the pods dying and coming back <i>is</i> the demo. Every number below is this live cluster.</div>
   </div>
 
   <div class="edge">
@@ -177,8 +177,8 @@
       <div class="bz"><div class="bn">143<span>ms</span></div><div class="bl">p50 latency</div></div>
       <div class="bz"><div class="bn">200</div><div class="bl">concurrent</div></div>
     </div>
-    <div class="bench-sub">NeuroCaddy → Royak ingress → round-robin → 8 pods across 2 nodes ·
-      cluster: <b>2× Oracle Cloud Ampere, 1 vCPU / 1&nbsp;GB each</b>, cross-provider private mesh (AES-256-GCM)</div>
+    <div class="bench-sub">NeuroCaddy → Royak ingress → round-robin across replicas ·
+      cluster: <b>Oracle Cloud VM, 1 vCPU / ~1&nbsp;GB</b>, in-cluster mesh (AES-256-GCM)</div>
   </div>
 
   <div class="stats" id="stats">
