@@ -2565,14 +2565,14 @@ async fn handle_ingress(
     // no per-request Docker call. This is what keeps the ingress concurrent even
     // while the reconcile loop holds the write lock during a tick. Falls through
     // to the live path if the route isn't in the snapshot yet.
-    if let Some((ip, port, pod)) = snapshot_backend(&host, &path) {
+    if let Some((ip, port, pod, pod_port)) = snapshot_backend(&host, &path) {
         let method = req.method().clone();
         let req_headers = req.headers().clone();
         let body_bytes = match req.collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => Bytes::new(),
         };
-        return Ok(match proxy_request_async(&ip, port, &pod, method.as_str(), &path, &req_headers, &body_bytes).await {
+        return Ok(match proxy_request_async(&ip, port, &pod, pod_port, method.as_str(), &path, &req_headers, &body_bytes).await {
             Ok((status, body, resp_headers)) => {
                 let mut builder = hyper::Response::builder().status(status);
                 for (k, v) in resp_headers { builder = builder.header(k, v); }
@@ -2620,7 +2620,7 @@ async fn handle_ingress(
 
             eprintln!("  [ingress] {} {host}{path} → {route_label}", method.as_str());
             match proxy_request_async(
-                &target_host, target_port, "",
+                &target_host, target_port, "", 0,
                 method.as_str(), &path, &req_headers, &body_bytes,
             ).await {
                 Ok((status, body, resp_headers)) => {
@@ -2759,10 +2759,12 @@ fn resolve_target_port(world: &DesiredWorld, service: &str, rule_port: u16) -> u
 pub struct ResolvedRoute {
     pub host: String,
     pub path: String,
-    /// (ip, port, target_pod). target_pod empty → connect directly to a local
-    /// pod IP. Set → ip:port is a PEER's mesh proxy; inject X-Royak-Pod so the
-    /// peer hands the request off to that pod on its own docker bridge.
-    pub backends: Vec<(String, u16, String)>,
+    /// (ip, port, target_pod, pod_port). target_pod empty → connect directly to
+    /// a local pod IP (pod_port unused). Set → ip:port is a PEER's mesh proxy;
+    /// inject X-Royak-Pod so the peer hands the request off to that pod, plus
+    /// X-Royak-Port = pod_port (the pod's resolved Service targetPort) so the
+    /// peer dials the pod on the port it actually listens on, not a hardcoded 80.
+    pub backends: Vec<(String, u16, String, u16)>,
 }
 
 fn ingress_snapshot() -> &'static std::sync::Mutex<Arc<Vec<ResolvedRoute>>> {
@@ -2799,22 +2801,24 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
     for ingress in world.ingresses.values() {
         for rule in &ingress.rules {
             for ip_path in &rule.paths {
-                let mut backends: Vec<(String, u16, String)> = Vec::new();
+                let mut backends: Vec<(String, u16, String, u16)> = Vec::new();
                 // The ingress rule targets the Service's published `port` (e.g. 80),
                 // but the pods listen on the Service's `targetPort` (e.g. 8080). We
                 // connect straight to pod IPs, so resolve rule port → targetPort.
                 let pod_port = resolve_target_port(world, &ip_path.service, ip_path.port);
-                // Local pods → direct.
+                // Local pods → direct (pod_port used as the connect port).
                 for ip in resolve_service_to_all_pod_ips(world, &ip_path.service) {
-                    backends.push((ip, pod_port, String::new()));
+                    backends.push((ip, pod_port, String::new(), pod_port));
                 }
-                // Remote pods → via the owning peer's mesh proxy (:6550).
+                // Remote pods → via the owning peer's mesh proxy (:6550). We connect
+                // to the mesh proxy port, but carry the pod's real targetPort as the
+                // 4th field so the peer dials the pod on it (X-Royak-Port) not :80.
                 if let Some(dep) = service_deployment(world, &ip_path.service) {
                     let prefix = format!("rk-{dep}-");
                     for (addr, pod) in &peers {
                         if pod.starts_with(&prefix) {
                             let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr.as_str());
-                            backends.push((host.to_string(), crate::cluster_mesh::DEFAULT_MESH_PORT, pod.clone()));
+                            backends.push((host.to_string(), crate::cluster_mesh::DEFAULT_MESH_PORT, pod.clone(), pod_port));
                         }
                     }
                 }
@@ -2832,7 +2836,7 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
 /// Longest-prefix lookup in the published snapshot. Lock-free (Arc clone).
 /// Round-robins across ALL backends — local and remote — so a refresh lands on
 /// a different pod, possibly on a different node. Returns (ip, port, target_pod).
-fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16, String)> {
+fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16, String, u16)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RR: AtomicUsize = AtomicUsize::new(0);
     let snap = ingress_snapshot().lock().ok()?.clone();
@@ -3082,10 +3086,23 @@ fn find_backend(world: &DesiredWorld, host: &str, path: &str) -> Option<(String,
 /// the raw response bytes (binary-safe; works for images, gzipped, etc.).
 /// Replaces the old blocking std::net version that broke both the tokio
 /// runtime (sync read in async context) and non-UTF8 payloads (String read).
+/// Build the cross-node handoff header lines for a mesh hop. Empty when
+/// target_pod is empty (same-node / direct-to-pod, no handoff). When set, emits
+/// both X-Royak-Pod (which pod on the peer's docker bridge) and X-Royak-Port
+/// (the pod's resolved Service targetPort) so the peer dials the right port.
+fn handoff_headers(target_pod: &str, pod_port: u16) -> String {
+    if target_pod.is_empty() {
+        String::new()
+    } else {
+        format!("X-Royak-Pod: {target_pod}\r\nX-Royak-Port: {pod_port}\r\n")
+    }
+}
+
 async fn proxy_request_async(
     service: &str,
     port: u16,
     target_pod: &str,
+    pod_port: u16,
     method: &str,
     path: &str,
     headers: &HeaderMap,
@@ -3109,10 +3126,9 @@ async fn proxy_request_async(
     let mut req = format!("{method} {path} HTTP/1.1\r\n");
     req.push_str(&format!("Host: {service}\r\n"));
     // Cross-node: {service}:{port} is the peer's mesh proxy — tell it exactly
-    // which local pod on its docker bridge to hand this request off to.
-    if !target_pod.is_empty() {
-        req.push_str(&format!("X-Royak-Pod: {target_pod}\r\n"));
-    }
+    // which local pod on its docker bridge to hand this request off to, and on
+    // which port (the resolved Service targetPort) to dial it.
+    req.push_str(&handoff_headers(target_pod, pod_port));
     for (name, val) in headers.iter() {
         let lname = name.as_str().to_ascii_lowercase();
         if matches!(lname.as_str(),
@@ -3609,6 +3625,39 @@ mod ingress_port_tests {
         let ports = vec![svc_port(80, 8080), svc_port(443, 8443)];
         assert_eq!(target_port_for(&ports, 443), 8443);
         assert_eq!(target_port_for(&ports, 80), 8080);
+    }
+
+    #[test]
+    fn handoff_headers_carry_pod_and_port() {
+        // A cross-node hop (target_pod set) must emit BOTH X-Royak-Pod and the
+        // resolved targetPort as X-Royak-Port so the peer stops hardcoding :80.
+        let h = handoff_headers("rk-web-1", 8080);
+        assert!(h.contains("X-Royak-Pod: rk-web-1\r\n"), "missing pod header: {h:?}");
+        assert!(h.contains("X-Royak-Port: 8080\r\n"), "missing port header: {h:?}");
+    }
+
+    #[test]
+    fn handoff_headers_empty_for_direct_pod() {
+        // Same-node / direct-to-pod (no handoff) → no injected headers.
+        assert_eq!(handoff_headers("", 8080), "");
+    }
+
+    #[test]
+    fn handoff_round_trips_through_mesh_parser() {
+        // End-to-end of the wire contract: what the ingress writes is exactly
+        // what the peer's mesh proxy reads back for the pod dial port.
+        let head = format!(
+            "GET / HTTP/1.1\r\nHost: web-svc\r\n{}\r\n",
+            handoff_headers("rk-web-3", 8443)
+        );
+        assert_eq!(crate::cluster_mesh::parse_pod_port(&head), 8443);
+    }
+
+    #[test]
+    fn handoff_absent_port_defaults_to_80_at_peer() {
+        // Direct-pod head (no X-Royak-Port) → peer falls back to 80.
+        let head = "GET / HTTP/1.1\r\nHost: web-svc\r\n\r\n";
+        assert_eq!(crate::cluster_mesh::parse_pod_port(head), 80);
     }
 }
 

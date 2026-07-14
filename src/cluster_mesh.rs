@@ -102,6 +102,19 @@ impl<'a> Router<'a> {
     /// that explicitly, so the MVP assumes "pod is on local node" for
     /// non-cross-node clusters. The cross-node integration test will
     /// populate this via the scheduler.
+    ///
+    /// NOTE (intentionally still None — out of scope for the port fix):
+    /// api.rs::peer_pods_store() already holds a `(peer_api_addr, pod_name)`
+    /// census of pods living on OTHER nodes, which is enough to answer this.
+    /// Wiring it up, however, is a larger change than this PR: the census keys
+    /// on the peer's *api address*, not its node name, so Router would need the
+    /// census threaded in AND an addr→node reverse map against `world.nodes` to
+    /// return a name that `resolve()` can match. It would also deliberately
+    /// break `remote_endpoint_uses_node_address`, which pins the current
+    /// "always Local" contract. Left for the cross-node service-name routing PR;
+    /// the ingress path already reaches remote pods via peer_pods_store directly
+    /// (publish_ingress_snapshot), so autonomous Host-header cross-node routing
+    /// is the only thing still gated on this.
     fn lookup_pod_node(&self, _pod_name: &str) -> Option<String> {
         None
     }
@@ -155,6 +168,46 @@ fn parse_header(head: &str, name: &str) -> Option<String> {
             if k.trim().eq_ignore_ascii_case(name) {
                 return Some(v.trim().to_string());
             }
+        }
+    }
+    None
+}
+
+/// Parse the `X-Royak-Port` handoff header — the pod's Service `targetPort`
+/// that the ingress already resolved on the sending node. Falls back to 80 when
+/// the header is absent, empty, zero, or unparseable, keeping us backward
+/// compatible with older peers that only send `X-Royak-Pod`.
+pub(crate) fn parse_pod_port(head: &str) -> u16 {
+    parse_header(head, "x-royak-port")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .unwrap_or(80)
+}
+
+/// Resolve a Service's `targetPort` from the world so a Host-routed mesh hop
+/// (no `X-Royak-Port` header available) dials the pod on the port it actually
+/// listens on rather than a hardcoded :80. Prefers the ServicePort whose
+/// published `port` matches `svc_port` (from the Host header), else the first
+/// declared port. Falls back to 80 when the service/port is unknown.
+fn service_target_port(world: &DesiredWorld, service: &str, namespace: &str, svc_port: Option<u16>) -> u16 {
+    let svc = match world.services.values()
+        .find(|s| s.name == service && s.namespace == namespace) {
+        Some(s) => s,
+        None => return 80,
+    };
+    let chosen = svc_port
+        .and_then(|p| svc.ports.iter().find(|sp| sp.port == p))
+        .or_else(|| svc.ports.first());
+    chosen.map(|sp| sp.target_port).filter(|&p| p != 0).unwrap_or(80)
+}
+
+/// Parse the port out of a raw `Host:` header value (e.g. `web-svc:8080` → 8080).
+/// Returns None when no explicit port is present.
+fn parse_host_port(head: &str) -> Option<u16> {
+    for line in head.lines() {
+        if line.is_empty() { break; }
+        if let Some(value) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
+            return value.trim().rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
         }
     }
     None
@@ -287,10 +340,15 @@ async fn handle_conn(
     // worker node has no service/deployment definition to resolve against, so
     // this is how cross-node ingress reaches a pod that lives here.
     if let Some(pod) = parse_header(&head, "x-royak-pod") {
+        // The sending ingress resolved the pod's Service targetPort and carried
+        // it in X-Royak-Port; dial that, not a hardcoded :80. Absent header (old
+        // peer) → 80.
+        let port = parse_pod_port(&head);
         match docker::container_ip(&pod) {
             Ok(ip) if !ip.is_empty() => {
-                let mut upstream = TcpStream::connect(format!("{ip}:80")).await
-                    .map_err(|e| format!("connect {ip}:80: {e}"))?;
+                let addr = format!("{ip}:{port}");
+                let mut upstream = TcpStream::connect(&addr).await
+                    .map_err(|e| format!("connect {addr}: {e}"))?;
                 upstream.write_all(&buf[..n]).await.map_err(|e| format!("write head: {e}"))?;
                 splice(client, upstream).await;
                 return Ok(());
@@ -313,10 +371,16 @@ async fn handle_conn(
 
     match endpoint {
         Endpoint::Local { pod_name } => {
+            // Host-routed hop (no X-Royak-Port header): resolve the Service's
+            // targetPort from the world so we dial the pod's real port, not :80.
+            let pod_port = {
+                let w = world.read().unwrap();
+                service_target_port(&w, &service, &namespace, parse_host_port(&head))
+            };
             let ip = docker::container_ip(&pod_name)
                 .map_err(|_| "no container ip".to_string());
             let upstream_addr = match ip {
-                Ok(ip) => format!("{ip}:80"),
+                Ok(ip) => format!("{ip}:{pod_port}"),
                 Err(_) => return reply_status(&mut client, 502, "no container ip").await,
             };
             let mut upstream = TcpStream::connect(&upstream_addr).await
@@ -461,15 +525,20 @@ async fn serve_encrypted_peer(
         }
     }
 
-    let host = parse_host_header(&String::from_utf8_lossy(&plain));
+    let plain_head = String::from_utf8_lossy(&plain).to_string();
+    let host = parse_host_header(&plain_head);
     let (service, namespace) = parse_ns(&host);
-    let endpoint = {
+    let (endpoint, pod_port) = {
         let w = world.read().unwrap();
-        Router::new(&w, &local_node).resolve(&service, &namespace)
+        let ep = Router::new(&w, &local_node).resolve(&service, &namespace);
+        // Encrypted Host-routed hop carries no X-Royak-Port; resolve the
+        // Service's targetPort from the world so we dial the pod's real port.
+        let port = service_target_port(&w, &service, &namespace, parse_host_port(&plain_head));
+        (ep, port)
     };
     let upstream_addr = match endpoint {
         Endpoint::Local { pod_name } => match docker::container_ip(&pod_name) {
-            Ok(ip) => format!("{ip}:80"),
+            Ok(ip) => format!("{ip}:{pod_port}"),
             Err(_) => return Err("peer: no container ip".into()),
         },
         // A peer only forwards to us because WE host the pod; anything else
@@ -545,7 +614,7 @@ fn http_reason(code: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reconcile::{ClusterNode, NodeStatus, StoredService, StoredDeployment};
+    use crate::reconcile::{ClusterNode, NodeStatus, StoredService, StoredDeployment, ServicePort};
     use std::collections::HashMap;
 
     fn empty_world() -> DesiredWorld {
@@ -684,6 +753,66 @@ mod tests {
     fn parse_host_missing_returns_empty() {
         let head = "GET / HTTP/1.1\r\nX-Other: v\r\n\r\n";
         assert_eq!(parse_host_header(head), "");
+    }
+
+    #[test]
+    fn parse_pod_port_reads_header() {
+        let head = "GET / HTTP/1.1\r\nX-Royak-Pod: rk-web-1\r\nX-Royak-Port: 8080\r\n\r\n";
+        assert_eq!(parse_pod_port(head), 8080);
+    }
+
+    #[test]
+    fn parse_pod_port_absent_falls_back_to_80() {
+        // Older peer sends only X-Royak-Pod → we must default to 80.
+        let head = "GET / HTTP/1.1\r\nX-Royak-Pod: rk-web-1\r\n\r\n";
+        assert_eq!(parse_pod_port(head), 80);
+    }
+
+    #[test]
+    fn parse_pod_port_invalid_or_zero_falls_back_to_80() {
+        assert_eq!(parse_pod_port("GET / HTTP/1.1\r\nX-Royak-Port: nope\r\n\r\n"), 80);
+        assert_eq!(parse_pod_port("GET / HTTP/1.1\r\nX-Royak-Port: 0\r\n\r\n"), 80);
+        assert_eq!(parse_pod_port("GET / HTTP/1.1\r\nX-Royak-Port:   \r\n\r\n"), 80);
+    }
+
+    #[test]
+    fn parse_pod_port_case_insensitive_header_name() {
+        let head = "GET / HTTP/1.1\r\nx-royak-port: 9090\r\n\r\n";
+        assert_eq!(parse_pod_port(head), 9090);
+    }
+
+    #[test]
+    fn parse_host_port_extracts_explicit_port() {
+        assert_eq!(parse_host_port("GET / HTTP/1.1\r\nHost: web-svc:8080\r\n\r\n"), Some(8080));
+        assert_eq!(parse_host_port("GET / HTTP/1.1\r\nHost: web-svc\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn service_target_port_resolves_from_world() {
+        let mut world = empty_world();
+        world.services.insert("web-svc".to_string(), StoredService {
+            name: "web-svc".to_string(),
+            namespace: "default".to_string(),
+            selector: HashMap::new(),
+            ports: vec![
+                ServicePort { port: 80, target_port: 8080, protocol: "TCP".to_string(), node_port: None },
+                ServicePort { port: 443, target_port: 8443, protocol: "TCP".to_string(), node_port: None },
+            ],
+            service_type: "ClusterIP".to_string(),
+        });
+        // Port from Host header picks the matching mapping's targetPort.
+        assert_eq!(service_target_port(&world, "web-svc", "default", Some(443)), 8443);
+        assert_eq!(service_target_port(&world, "web-svc", "default", Some(80)), 8080);
+        // No Host port → first declared port's targetPort.
+        assert_eq!(service_target_port(&world, "web-svc", "default", None), 8080);
+        // Unknown service → 80.
+        assert_eq!(service_target_port(&world, "ghost", "default", Some(80)), 80);
+    }
+
+    #[test]
+    fn service_target_port_unknown_service_falls_back_to_80() {
+        let world = empty_world();
+        assert_eq!(service_target_port(&world, "nope", "default", None), 80);
     }
 
     #[test]
