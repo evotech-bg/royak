@@ -154,8 +154,8 @@
   <div class="edge">
     <div class="edge-ic">⚡</div>
     <div><b>In front of Royak sits NeuroCaddy</b> — our own Rust web server + TLS edge. It terminates HTTPS
-      (Let's Encrypt), load-balances, and runs a small neural network that learns this site's traffic patterns
-      to flag anomalies and shape routing decisions. Edge, orchestrator and cross-node mesh — the whole stack is homegrown.</div>
+      (Let's Encrypt) and load-balances across replicas; a small model watches this site's traffic and
+      flags statistical anomalies (z-score outlier detection). Edge, orchestrator and cross-node mesh — the whole stack is homegrown.</div>
   </div>
 
   <div class="bench">
@@ -176,7 +176,7 @@
     <div class="stat"><div class="n" id="s-nodes">–</div><div class="l">Nodes</div></div>
     <div class="stat"><div class="n" id="s-svc">–</div><div class="l">Services</div></div>
     <div class="stat"><div class="n" id="s-ns">–</div><div class="l">Namespaces</div></div>
-    <div class="stat"><div class="n" id="s-certs">–</div><div class="l">mTLS certs</div></div>
+    <div class="stat"><div class="n" id="s-certs">–</div><div class="l">Pod identity certs</div></div>
     <div class="stat"><div class="n" id="s-ticks">–</div><div class="l">Reconcile ticks</div></div>
     <div class="stat"><div class="n" id="s-up">–</div><div class="l">Cluster uptime</div></div>
   </div>
@@ -198,7 +198,7 @@
       <canvas id="c-pods" height="150"></canvas>
     </div>
     <div class="panel">
-      <h3>mTLS certs issued <span class="v" id="v-loss">–</span></h3>
+      <h3>Pod identity certs issued <span class="v" id="v-loss">–</span></h3>
       <canvas id="c-loss" height="150"></canvas>
     </div>
     <div class="panel">
@@ -363,7 +363,7 @@ async function tick(){
     $('v-pods').textContent = running;
     drawLine($('c-pods'), podHist, '#315bff');
 
-    // mTLS certs issued — climbs every time a pod is (re)created and gets a cert
+    // pod identity certs issued — climbs every time a pod is (re)created and the cluster CA signs it a cert + token
     const certs = s.certs_issued || 0;
     lossHist.push({t:Date.now(), v:certs}); if(lossHist.length>MAXPTS) lossHist.shift();
     $('v-loss').textContent = certs;

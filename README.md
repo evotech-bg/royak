@@ -105,7 +105,7 @@ kubectl --server=http://localhost:6443 get pods
 | **Rollback** | Reverse rolling update — works even after rollout completes |
 | **Services** | `kind: Service` with selector + ports. ClusterIP with pod→svc DNS; NodePort served by the built-in ServiceLB (userspace LB, works on macOS too) |
 | **ConfigMaps/Secrets** | `envFrom` env injection AND file projection as volumes (secrets 0600) |
-| **RBAC** | Native `Role`/`ClusterRole`/`RoleBinding`/`ServiceAccount` + Royak `RbacRole` — enforced on all API writes |
+| **RBAC** | Native `Role`/`ClusterRole`/`RoleBinding`/`ServiceAccount` + Royak `RbacRole` — checked on API writes (403 on a denied verb+resource+namespace). Note: the role is read from the `x-royak-role` header (self-asserted, **defaults to `admin`**) and is **open-by-default** when no roles are defined — it authorizes a stated role, it does not authenticate the caller |
 | **Admission webhooks** | `ValidatingWebhookConfiguration` — Royak calls your webhook URL and honours allow/deny |
 | **Operators** | `kind: Operator` + `kind: CustomResource` — auto-provision, lifecycle hooks |
 | **Guards** | Auto-remediation: pod_crash → restart, high_memory → scale_up |
@@ -296,6 +296,13 @@ deployments. Here is the honest ledger:
   but is not end-to-end wired.
 - **Anomaly/prediction is statistical** (z-scores, linear regression) in the public path; the
   neural brain trains via backprop but is a monitor, not the decision-maker in the reconcile loop.
+  Autoscaling is **reactive on real Docker CPU stats**; the load-prediction (`[PREDICT]`) line is
+  logged for observability only and does not itself drive replica counts.
+- **Node-to-node mesh is AES-256-GCM encrypted** (symmetric, shared cluster secret — see
+  `mesh_crypto.rs`). A cluster CA also mints a per-pod certificate + identity token and injects it
+  into each container (`ROYAK_POD_TOKEN`), but these identities are **issued, not yet verified**:
+  `verify_pod_token` and the `mtls` NetworkPolicy flag are not enforced on the live path, so the
+  mesh is encrypted transport, not per-pod mutual-TLS authentication.
 - **State is JSON + binary neural.** Writes are atomic (write-tmp, rename) with a Unix `flock`
   guard. No distributed consensus on the live path yet — source of truth is whichever node writes
   last.

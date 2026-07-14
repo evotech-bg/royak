@@ -54,7 +54,7 @@ Legend: ✅ works · 🟡 partial · ❌ not yet (→ [ROADMAP.md](ROADMAP.md))
 |---|---|---|
 | Namespaces | ✅ | Isolation via per-namespace Docker networks |
 | RBAC enforcement | ✅ | Native `Role`/`ClusterRole`/`RoleBinding` accepted and enforced (subject GET 200 / POST 403 verified), plus Royak's own `RbacRole` |
-| ServiceAccount | 🟡 | Accepted as a manifest and usable as an RBAC subject via RoleBinding; no auto-mounted tokens (Royak pods get their own identity tokens + mTLS certs) |
+| ServiceAccount | 🟡 | Accepted as a manifest and usable as an RBAC subject via RoleBinding; no auto-mounted tokens (Royak pods get their own CA-signed identity cert + token injected as env, though these identities are not yet verified on the live path) |
 | Admission webhooks (validating) | ✅ | `ValidatingWebhookConfiguration` with `clientConfig.url` — Royak POSTs an AdmissionReview and honours allow/deny + failurePolicy. Verified live (allowed 201 / denied 403). No CA-bundle/mutating webhooks yet |
 
 ## kubectl
@@ -88,7 +88,7 @@ Tested with kubectl **v1.36** against `royak api`:
 | HPA | ✅ | Scales on real Docker CPU stats |
 | Graceful shutdown | ✅ | SIGTERM saves state atomically, containers preserved |
 | API write durability | ✅ | Mutations persisted to disk **before** the 201 ack (write-through); verified with kill -9 immediately after ack |
-| HA control plane (Raft) | ✅ | Real 3-node openraft consensus over HTTP: election, replication through the leader, and leader failover verified live (`test-raft-cluster.sh`). In-process chaos test proves the invariant: partition to a minority → no quorum → writes do NOT commit; heal → commit resumes; no committed op lost across a leader kill. Enable with `--node-id`/`--peers`/`--bootstrap`. The file lease remains the default single-node writer |
+| HA control plane (Raft) | 🟡 | openraft is integrated and exercised: real 3-node consensus over HTTP — election, replication through the leader, and leader failover verified live (`test-raft-cluster.sh`). In-process chaos test proves the invariant: partition to a minority → no quorum → writes do NOT commit; heal → commit resumes; no committed op lost across a leader kill. Enable with `--node-id`/`--peers`/`--bootstrap`. **Not yet the live write path:** normal `apply`/`scale`/reconcile writes still go through the single-writer file lease — only the dedicated `/royak/v1/raft/scale` endpoint currently proposes a command through consensus. Routing the reconcile write path through Raft is the v0.4 milestone |
 | Prometheus `/metrics` | ✅ | |
 | Dashboard | ✅ | Built-in web UI |
 | Traffic observability | ✅ | Flow tap on ServiceLB/ingress/mesh: source→service, bytes ↑↓, duration, top-talkers. `royak flows` / `GET /royak/v1/flows`. Metadata only (no payload capture). Verified live |
