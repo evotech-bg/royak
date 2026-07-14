@@ -130,6 +130,17 @@
 
   .foot{color:var(--ink3);font-size:14px;text-align:center;padding:34px 0 46px;border-top:1px solid var(--line);margin-top:34px}
   .empty{color:#7b829e;font-size:13px;padding:18px 0 22px;text-align:center}
+
+  .dl{margin:6px 0 12px;font-size:13px}
+  .dl .di{display:flex;align-items:baseline;gap:10px;padding:7px 0;border-top:1px solid rgba(0,0,0,.06)}
+  .dl .di:first-child{border-top:none}
+  .dl .k{font-family:ui-monospace,monospace;color:var(--panel-ink);font-weight:700;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;flex:none;max-width:52%}
+  .dl .sub{color:var(--ink3);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dl .meta{margin-left:auto;color:var(--ink2);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums;
+    font-family:ui-monospace,monospace;flex:none}
+  .pill{display:inline-block;background:var(--panel2);color:var(--panel-ink);border-radius:6px;padding:1px 8px;
+    font-size:11.5px;font-weight:700;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -210,6 +221,18 @@
       <div class="rows" id="mem-rows"></div>
     </div>
     <div class="panel" style="grid-column:1/-1">
+      <h3>Services <span class="v" id="v-svc">–</span></h3>
+      <div class="dl" id="svc-list"><div class="empty">waiting for Royak…</div></div>
+    </div>
+    <div class="panel">
+      <h3>Ingress routes <span class="v" id="v-ing">–</span></h3>
+      <div class="dl" id="ing-list"><div class="empty">waiting for Royak…</div></div>
+    </div>
+    <div class="panel">
+      <h3>Autoscalers <span class="v" id="v-hpa">–</span></h3>
+      <div class="dl" id="hpa-list"><div class="empty">waiting for Royak…</div></div>
+    </div>
+    <div class="panel" style="grid-column:1/-1">
       <h3>Live orchestrator activity <span class="v" id="v-act">watching…</span></h3>
       <div class="actlog" id="actlog"><div class="a">waiting for Royak to reconcile…</div></div>
     </div>
@@ -224,6 +247,7 @@
 // (e.g. <script>window.ROYAK_API='http://127.0.0.1:6443'<\/script> before this).
 const API = (window.ROYAK_API || '').replace(/\/$/,'');
 const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const started = Date.now();
 
 const podHist = [];   // {t, v}
@@ -345,7 +369,9 @@ async function tick(){
     ticks++;
 
     const c = s.cluster||{};
-    $('s-pods').textContent   = c.pods ?? '–';
+    // "Pods running" = pods ACTUALLY up right now, not the desired target (c.pods
+    // is Σ replicas). Mid-heal the two differ; the tile must show the real count.
+    $('s-pods').textContent   = c.pods_running ?? s.running ?? '–';
     $('s-deploys').textContent= c.deployments ?? '–';
     $('s-nodes').textContent  = c.nodes ?? '–';
     $('s-svc').textContent    = c.services ?? '–';
@@ -377,6 +403,33 @@ async function tick(){
     $('v-mem').textContent = items.reduce((a,p)=>a+(p.memory_raw_mb||0),0).toFixed(0)+' Mi';
     rows($('cpu-rows'), items.map(p=>({name:p.remote?p.name+' ◆ server 2':p.name, pct:p.remote?6:(p.cpu_raw||0), label:p.remote?'on peer':(p.cpu_raw||0).toFixed(1)+'%'})), 'cpu');
     rows($('mem-rows'), items.map(p=>({name:p.remote?p.name+' ◆ server 2':p.name, pct:p.remote?6:(p.memory_raw_mb||0)/maxMem*100, label:p.remote?'peer':(p.memory||'0Mi')})), 'mem');
+
+    // service / ingress / HPA detail — the actual objects, not just counts
+    const svcs = s.services || [];
+    $('v-svc').textContent = svcs.length;
+    $('svc-list').innerHTML = svcs.length ? svcs.map(v=>{
+      const ports = (v.ports||[]).map(p=>p.port+'→'+p.target_port).join(', ');
+      const sub = (v.app ? 'app='+esc(v.app) : esc(v.type||'')) + (ports?' · '+ports:'');
+      return `<div class="di"><span class="k">${esc(v.name)}</span>`
+        + `<span class="sub">${sub}</span>`
+        + `<span class="meta"><span class="pill">${v.backends} pod${v.backends===1?'':'s'}</span></span></div>`;
+    }).join('') : '<div class="empty">no services</div>';
+
+    const ings = s.ingresses || [];
+    $('v-ing').textContent = ings.length;
+    $('ing-list').innerHTML = ings.length ? ings.map(v=>{
+      const host = v.host ? esc(v.host) : '*';
+      return `<div class="di"><span class="k">${host}${esc(v.path||'')}</span>`
+        + `<span class="meta">→ ${esc(v.service)}:${v.port}</span></div>`;
+    }).join('') : '<div class="empty">no ingress rules</div>';
+
+    const hpas = s.hpas || [];
+    $('v-hpa').textContent = hpas.length;
+    $('hpa-list').innerHTML = hpas.length ? hpas.map(v=>{
+      return `<div class="di"><span class="k">${esc(v.deployment)}</span>`
+        + `<span class="sub">${v.min}–${v.max} replicas · target ${v.target_cpu}% CPU</span>`
+        + `<span class="meta"><span class="pill">${v.replicas} now</span></span></div>`;
+    }).join('') : '<div class="empty">no autoscalers</div>';
 
     // live orchestrator activity — royak's real reconcile decisions
     const act = s.activity || [];
