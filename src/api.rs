@@ -2782,6 +2782,12 @@ fn peer_pods_store() -> &'static std::sync::Mutex<Vec<(String, String)>> {
 pub fn set_peer_pods(entries: Vec<(String, String)>) {
     if let Ok(mut g) = peer_pods_store().lock() { *g = entries; }
 }
+/// Snapshot the cross-node pod census — `(peer_api_addr, pod_name)` pairs for
+/// pods living on OTHER nodes. The mesh proxy's Router uses this to resolve a
+/// Host-routed service to the peer that actually hosts its pods.
+pub fn peer_pods() -> Vec<(String, String)> {
+    peer_pods_store().lock().map(|g| g.clone()).unwrap_or_default()
+}
 
 /// Deployment name backing a service (via its `app` selector).
 fn service_deployment(world: &DesiredWorld, service: &str) -> Option<String> {

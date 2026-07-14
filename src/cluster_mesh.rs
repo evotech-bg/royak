@@ -31,23 +31,38 @@ pub enum Endpoint {
     /// Service has a pod on this node — send traffic to the local container.
     Local { pod_name: String },
     /// Service's pods live on another node — forward to that node's mesh proxy.
-    Remote { node_name: String, node_addr: String },
+    /// Carries the target pod name so the sending node can inject the
+    /// `X-Royak-Pod` handoff header (the peer has no service/deployment
+    /// definitions to re-resolve against).
+    Remote { node_name: String, node_addr: String, pod_name: String },
     /// Service exists but has no ready pods.
     NoBackend,
     /// Service not known to the cluster.
     Unknown,
 }
 
-/// Stateless router. Takes a snapshot of the world and a service name,
-/// decides where traffic should go. Pure function — trivial to test.
+/// Stateless router. Takes a snapshot of the world, the cross-node pod census,
+/// and a service name, decides where traffic should go. Pure function — trivial
+/// to test.
 pub struct Router<'a> {
     world: &'a DesiredWorld,
     local_node: &'a str,
+    /// Cross-node pod census: `(peer_api_addr, pod_name)` for pods living on
+    /// OTHER nodes (from `crate::api::peer_pods()`). Empty on a single node.
+    peer_pods: Vec<(String, String)>,
 }
 
 impl<'a> Router<'a> {
+    /// Router without a peer census (single-node / tests that only exercise the
+    /// local path). Equivalent to `with_peers(.., vec![])`.
     pub fn new(world: &'a DesiredWorld, local_node: &'a str) -> Self {
-        Self { world, local_node }
+        Self { world, local_node, peer_pods: Vec::new() }
+    }
+
+    /// Router aware of the cross-node pod census, so a Host-routed service whose
+    /// pods live on a peer resolves to `Endpoint::Remote`.
+    pub fn with_peers(world: &'a DesiredWorld, local_node: &'a str, peer_pods: Vec<(String, String)>) -> Self {
+        Self { world, local_node, peer_pods }
     }
 
     /// Resolve a service name (namespace-scoped) to an endpoint.
@@ -73,50 +88,70 @@ impl<'a> Router<'a> {
             None => return Endpoint::NoBackend,
         };
 
-        // 3. Which node runs this deployment? The scheduler stamps node on
-        //    each pod; for the MVP we treat the deployment as homogeneous
-        //    and read the first pod's node. If no pods yet, NoBackend.
+        // 3. Which node runs this deployment's pods? The MVP names pods
+        //    `rk-<deployment>-<n>` for n in 1..=replicas. A pod present in the
+        //    cross-node census lives on that peer; a pod ABSENT from the census
+        //    is local to this node. We prefer a local pod (return the first one
+        //    we find) and only route Remote when EVERY known pod lives on a peer.
         if deployment.replicas == 0 {
             return Endpoint::NoBackend;
         }
 
-        // MVP simplification: pod-0 defines the node. In v0.3 proper we
-        // track per-pod placement in a field stamped by the scheduler.
-        let pod_name = format!("rk-{}-1", deployment.name);
-        let node_for_pod = self.lookup_pod_node(&pod_name).unwrap_or_else(|| self.local_node.to_string());
-
-        if node_for_pod == self.local_node {
-            Endpoint::Local { pod_name }
-        } else {
-            match self.world.nodes.get(&node_for_pod) {
-                Some(node) => Endpoint::Remote {
-                    node_name: node_for_pod.clone(),
-                    node_addr: node.address.clone(),
-                },
-                None => Endpoint::NoBackend,
+        let replicas = deployment.replicas.max(1);
+        let mut remote: Option<(String, String)> = None; // (pod_name, peer_api_addr)
+        for i in 1..=replicas {
+            let pod = format!("rk-{}-{}", deployment.name, i);
+            match self.lookup_pod_node(&pod) {
+                // Pod lives on a peer node — remember the first, keep scanning
+                // in case a later replica turns out to be local (prefer local).
+                Some(peer_api_addr) => {
+                    if remote.is_none() { remote = Some((pod, peer_api_addr)); }
+                }
+                // Not in the census → local pod. Prefer it immediately.
+                None => return Endpoint::Local { pod_name: pod },
             }
+        }
+
+        // No local pod found — every known replica lives on a peer.
+        match remote {
+            Some((pod, peer_api_addr)) => {
+                // The census keys on the peer's api address (:6443); the mesh
+                // proxy forward path turns that into the peer's mesh addr (:6550)
+                // via remote_mesh_addr. node_name is best-effort for logging.
+                let node_name = self.node_name_for_addr(&peer_api_addr)
+                    .unwrap_or_else(|| peer_api_addr.clone());
+                Endpoint::Remote { node_name, node_addr: peer_api_addr, pod_name: pod }
+            }
+            // Unreachable in practice (loop returns Local when remote stays None),
+            // but keep a sane local fallback rather than a panic.
+            None => Endpoint::Local { pod_name: format!("rk-{}-1", deployment.name) },
         }
     }
 
-    /// For v0.3 this reads a per-pod node field. In v0.2 we don't track
-    /// that explicitly, so the MVP assumes "pod is on local node" for
-    /// non-cross-node clusters. The cross-node integration test will
-    /// populate this via the scheduler.
+    /// Which node hosts `pod_name`? Returns the peer's api address (e.g.
+    /// `10.0.0.2:6443`) when the pod is found in the cross-node census, or
+    /// `None` when the pod is NOT on any peer — i.e. it lives on this node.
     ///
-    /// NOTE (intentionally still None — out of scope for the port fix):
-    /// api.rs::peer_pods_store() already holds a `(peer_api_addr, pod_name)`
-    /// census of pods living on OTHER nodes, which is enough to answer this.
-    /// Wiring it up, however, is a larger change than this PR: the census keys
-    /// on the peer's *api address*, not its node name, so Router would need the
-    /// census threaded in AND an addr→node reverse map against `world.nodes` to
-    /// return a name that `resolve()` can match. It would also deliberately
-    /// break `remote_endpoint_uses_node_address`, which pins the current
-    /// "always Local" contract. Left for the cross-node service-name routing PR;
-    /// the ingress path already reaches remote pods via peer_pods_store directly
-    /// (publish_ingress_snapshot), so autonomous Host-header cross-node routing
-    /// is the only thing still gated on this.
-    fn lookup_pod_node(&self, _pod_name: &str) -> Option<String> {
-        None
+    /// The census (`crate::api::peer_pods()`) only ever lists pods on OTHER
+    /// nodes, so "absent from census" == "local", which is exactly the
+    /// prefer-local semantics `resolve()` relies on. As a defensive guard, a
+    /// census entry whose address is OUR OWN node's address is treated as local
+    /// (None) so we never hairpin a request back through our own mesh proxy.
+    fn lookup_pod_node(&self, pod_name: &str) -> Option<String> {
+        let local_addr = self.world.nodes.get(self.local_node).map(|n| n.address.as_str());
+        self.peer_pods.iter()
+            .find(|(addr, pod)| pod == pod_name && Some(addr.as_str()) != local_addr)
+            .map(|(addr, _pod)| addr.clone())
+    }
+
+    /// Best-effort reverse lookup: node NAME for a given api address, so a
+    /// `Remote` endpoint can carry a friendly node name for logs. Falls back to
+    /// the address itself when no `ClusterNode` matches (routing uses the
+    /// address, not the name, so this is cosmetic).
+    fn node_name_for_addr(&self, api_addr: &str) -> Option<String> {
+        self.world.nodes.values()
+            .find(|n| n.address == api_addr)
+            .map(|n| n.name.clone())
     }
 }
 
@@ -199,6 +234,29 @@ fn service_target_port(world: &DesiredWorld, service: &str, namespace: &str, svc
         .and_then(|p| svc.ports.iter().find(|sp| sp.port == p))
         .or_else(|| svc.ports.first());
     chosen.map(|sp| sp.target_port).filter(|&p| p != 0).unwrap_or(80)
+}
+
+/// Inject the cross-node handoff headers (`X-Royak-Pod` / `X-Royak-Port`) into a
+/// raw HTTP request head, right after the request line. Lets the sending node
+/// tell the receiving peer EXACTLY which local pod (and port) to hand the
+/// request off to, so the peer never has to re-resolve the service (a worker
+/// node holds no service/deployment definitions). Byte-safe; if the request has
+/// no CRLF (malformed) we prepend, best-effort.
+pub(crate) fn inject_handoff(raw: &[u8], pod: &str, port: u16) -> Vec<u8> {
+    let inject = format!("X-Royak-Pod: {pod}\r\nX-Royak-Port: {port}\r\n");
+    let mut out = Vec::with_capacity(raw.len() + inject.len());
+    match raw.windows(2).position(|w| w == b"\r\n") {
+        Some(pos) => {
+            out.extend_from_slice(&raw[..pos + 2]);
+            out.extend_from_slice(inject.as_bytes());
+            out.extend_from_slice(&raw[pos + 2..]);
+        }
+        None => {
+            out.extend_from_slice(inject.as_bytes());
+            out.extend_from_slice(raw);
+        }
+    }
+    out
 }
 
 /// Parse the port out of a raw `Host:` header value (e.g. `web-svc:8080` → 8080).
@@ -363,10 +421,12 @@ async fn handle_conn(
         return reply_status(&mut client, 400, "missing Host header").await;
     }
 
-    // Resolve via Router (snapshot of world, then drop the guard).
+    // Resolve via Router (snapshot of world + cross-node census, then drop the
+    // guard). The census makes a service whose pods live on a peer resolve to
+    // Endpoint::Remote instead of always falling back to Local.
     let endpoint = {
         let w = world.read().unwrap();
-        Router::new(&w, &local_node).resolve(&service, &namespace)
+        Router::with_peers(&w, &local_node, crate::api::peer_pods()).resolve(&service, &namespace)
     };
 
     match endpoint {
@@ -389,21 +449,30 @@ async fn handle_conn(
             splice(client, upstream).await;
             Ok(())
         }
-        Endpoint::Remote { node_addr, .. } => {
+        Endpoint::Remote { node_addr, pod_name, .. } => {
             let peer = remote_mesh_addr(&node_addr);
+            // The peer node has no service/deployment definitions to re-resolve
+            // this Host against, so we hand it the answer: inject X-Royak-Pod
+            // (which local-to-the-peer pod) + X-Royak-Port (the pod's Service
+            // targetPort). The peer's handoff fast-path then dials it directly.
+            let pod_port = {
+                let w = world.read().unwrap();
+                service_target_port(&w, &service, &namespace, parse_host_port(&head))
+            };
+            let framed = inject_handoff(&buf[..n], &pod_name, pod_port);
             // Encrypt only when enabled AND we actually hold a cluster secret.
             // No secret → fail SAFE to plaintext with a visible warning, never
             // to a fake/hardcoded key that would give false confidence.
             let secret = if mesh_encrypt_on() { cluster_secret() } else { None };
             if let Some(secret) = secret {
-                forward_encrypted_to_peer(client, &buf[..n], &peer, &secret).await
+                forward_encrypted_to_peer(client, &framed, &peer, &secret).await
             } else {
                 if mesh_encrypt_on() {
                     eprintln!("  [security] mesh encryption requested but no cluster secret available — forwarding PLAINTEXT to {peer}");
                 }
                 let mut upstream = TcpStream::connect(&peer).await
                     .map_err(|e| format!("connect {peer}: {e}"))?;
-                upstream.write_all(&buf[..n]).await.map_err(|e| format!("write head: {e}"))?;
+                upstream.write_all(&framed).await.map_err(|e| format!("write head: {e}"))?;
                 splice(client, upstream).await;
                 Ok(())
             }
@@ -526,24 +595,40 @@ async fn serve_encrypted_peer(
     }
 
     let plain_head = String::from_utf8_lossy(&plain).to_string();
-    let host = parse_host_header(&plain_head);
-    let (service, namespace) = parse_ns(&host);
-    let (endpoint, pod_port) = {
-        let w = world.read().unwrap();
-        let ep = Router::new(&w, &local_node).resolve(&service, &namespace);
-        // Encrypted Host-routed hop carries no X-Royak-Port; resolve the
-        // Service's targetPort from the world so we dial the pod's real port.
-        let port = service_target_port(&w, &service, &namespace, parse_host_port(&plain_head));
-        (ep, port)
-    };
-    let upstream_addr = match endpoint {
-        Endpoint::Local { pod_name } => match docker::container_ip(&pod_name) {
-            Ok(ip) => format!("{ip}:{pod_port}"),
-            Err(_) => return Err("peer: no container ip".into()),
-        },
-        // A peer only forwards to us because WE host the pod; anything else
-        // is a routing error — don't double-hop.
-        _ => return Err("peer: service not local".into()),
+
+    // Explicit-target fast path (mirrors the plaintext handle_conn path): the
+    // sending node already resolved the pod and told us exactly which local
+    // container + port to hand off to. A worker node has no service/deployment
+    // definitions to re-resolve against, so this is how autonomous Host-routed
+    // cross-node traffic (and cross-node ingress) reaches the pod living here.
+    let upstream_addr = if let Some(pod) = parse_header(&plain_head, "x-royak-pod") {
+        let port = parse_pod_port(&plain_head);
+        match docker::container_ip(&pod) {
+            Ok(ip) if !ip.is_empty() => format!("{ip}:{port}"),
+            _ => return Err("peer: handoff pod not on this node".into()),
+        }
+    } else {
+        // No handoff header — resolve the Host ourselves (only works when we
+        // hold the service/deployment definitions, e.g. control-plane node).
+        let host = parse_host_header(&plain_head);
+        let (service, namespace) = parse_ns(&host);
+        let (endpoint, pod_port) = {
+            let w = world.read().unwrap();
+            let ep = Router::new(&w, &local_node).resolve(&service, &namespace);
+            // Encrypted Host-routed hop carries no X-Royak-Port; resolve the
+            // Service's targetPort from the world so we dial the pod's real port.
+            let port = service_target_port(&w, &service, &namespace, parse_host_port(&plain_head));
+            (ep, port)
+        };
+        match endpoint {
+            Endpoint::Local { pod_name } => match docker::container_ip(&pod_name) {
+                Ok(ip) => format!("{ip}:{pod_port}"),
+                Err(_) => return Err("peer: no container ip".into()),
+            },
+            // A peer only forwards to us because WE host the pod; anything else
+            // is a routing error — don't double-hop.
+            _ => return Err("peer: service not local".into()),
+        }
     };
 
     let upstream = TcpStream::connect(&upstream_addr).await
@@ -861,18 +946,155 @@ mod tests {
 
     #[test]
     fn remote_endpoint_uses_node_address() {
-        // Remote path exists in the code for when per-pod placement is
-        // wired up. Smoke-test by crafting a world where lookup_pod_node
-        // would return a remote node, simulated via a second-node presence.
+        // UPDATED (feat/mesh-lookup-pod-node): this test previously pinned the
+        // OLD "lookup_pod_node is a stub → always Local" contract. That contract
+        // is gone — the Router now consults the cross-node pod census. With the
+        // deployment's only pod living on peer host-b, the service must resolve
+        // to Remote carrying host-b's api address (which the forward path turns
+        // into host-b's mesh :6550 via remote_mesh_addr) and the pod name for
+        // the X-Royak-Pod handoff.
         let mut world = empty_world();
         make_service(&mut world, "web-svc", "default", "web");
         make_deployment(&mut world, "web", "default", 1);
         make_node(&mut world, "host-b", "10.0.0.2:6443");
-        // Even with host-b present, current MVP returns Local because
-        // lookup_pod_node is a stub. This test pins that contract so the
-        // v0.3 upgrade deliberately breaks it and forces pod-placement wiring.
-        let r = Router::new(&world, "host-a");
+        // Census: the single pod rk-web-1 lives on host-b (its api addr).
+        let census = vec![("10.0.0.2:6443".to_string(), "rk-web-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
+        match r.resolve("web-svc", "default") {
+            Endpoint::Remote { node_name, node_addr, pod_name } => {
+                assert_eq!(node_addr, "10.0.0.2:6443");
+                assert_eq!(node_name, "host-b"); // reverse-looked-up from world.nodes
+                assert_eq!(pod_name, "rk-web-1"); // carried for the handoff
+                // The forward path converts the api addr to the peer mesh addr.
+                assert_eq!(remote_mesh_addr(&node_addr), "10.0.0.2:6550");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_census_resolves_local() {
+        // No peer census (single node) → the pod is local, as before.
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 1);
+        let r = Router::with_peers(&world, "host-a", vec![]);
+        match r.resolve("web-svc", "default") {
+            Endpoint::Local { pod_name } => assert_eq!(pod_name, "rk-web-1"),
+            other => panic!("expected Local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_pod_resolves_remote_without_node_entry() {
+        // The census alone is enough to route Remote: even if world.nodes has no
+        // matching ClusterNode (node_name reverse lookup misses), we still emit
+        // Remote with node_addr = the peer api addr (node_name falls back to it).
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 1);
+        let census = vec![("10.9.9.9:6443".to_string(), "rk-web-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
+        match r.resolve("web-svc", "default") {
+            Endpoint::Remote { node_name, node_addr, pod_name } => {
+                assert_eq!(node_addr, "10.9.9.9:6443");
+                assert_eq!(node_name, "10.9.9.9:6443"); // no ClusterNode → addr fallback
+                assert_eq!(pod_name, "rk-web-1");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefers_local_when_pods_on_both_nodes() {
+        // Deployment has 2 replicas: rk-web-1 on peer host-b, rk-web-2 local
+        // (absent from census). Must prefer the LOCAL pod.
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 2);
+        make_node(&mut world, "host-b", "10.0.0.2:6443");
+        let census = vec![("10.0.0.2:6443".to_string(), "rk-web-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
+        match r.resolve("web-svc", "default") {
+            Endpoint::Local { pod_name } => assert_eq!(pod_name, "rk-web-2",
+                "should skip the peer-hosted rk-web-1 and pick the local rk-web-2"),
+            other => panic!("expected Local (prefer local), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_replicas_remote_resolves_remote() {
+        // Both replicas live on the peer → no local pod → Remote (first replica).
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 2);
+        make_node(&mut world, "host-b", "10.0.0.2:6443");
+        let census = vec![
+            ("10.0.0.2:6443".to_string(), "rk-web-1".to_string()),
+            ("10.0.0.2:6443".to_string(), "rk-web-2".to_string()),
+        ];
+        let r = Router::with_peers(&world, "host-a", census);
+        match r.resolve("web-svc", "default") {
+            Endpoint::Remote { node_addr, pod_name, .. } => {
+                assert_eq!(node_addr, "10.0.0.2:6443");
+                assert_eq!(pod_name, "rk-web-1"); // first remote replica
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn census_entry_for_unrelated_pod_stays_local() {
+        // Census lists a pod for a DIFFERENT deployment; our service's pod is
+        // not in it → local. Guards against matching by node rather than pod.
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 1);
+        make_node(&mut world, "host-b", "10.0.0.2:6443");
+        let census = vec![("10.0.0.2:6443".to_string(), "rk-api-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
         assert!(matches!(r.resolve("web-svc", "default"), Endpoint::Local { .. }),
-            "v0.2 MVP: pod placement unavailable, must fall back to Local");
+            "unrelated peer pod must not make our local service resolve Remote");
+    }
+
+    #[test]
+    fn census_entry_pointing_at_self_stays_local() {
+        // Defensive: if the census somehow lists a pod at OUR OWN address, treat
+        // it as local rather than hairpinning back through our own mesh proxy.
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 1);
+        make_node(&mut world, "host-a", "10.0.0.1:6443"); // us
+        let census = vec![("10.0.0.1:6443".to_string(), "rk-web-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
+        assert!(matches!(r.resolve("web-svc", "default"), Endpoint::Local { .. }),
+            "a census entry at our own address must resolve Local, not Remote");
+    }
+
+    #[test]
+    fn unknown_pod_defaults_local() {
+        // A service whose deployment pod name is not in the census at all →
+        // Local (documented sane default: absent-from-census == on this node).
+        let mut world = empty_world();
+        make_service(&mut world, "web-svc", "default", "web");
+        make_deployment(&mut world, "web", "default", 1);
+        // Non-empty census but for other pods entirely.
+        let census = vec![("10.0.0.2:6443".to_string(), "rk-other-1".to_string())];
+        let r = Router::with_peers(&world, "host-a", census);
+        assert!(matches!(r.resolve("web-svc", "default"), Endpoint::Local { .. }));
+    }
+
+    #[test]
+    fn inject_handoff_inserts_headers_after_request_line() {
+        let raw = b"GET / HTTP/1.1\r\nHost: web-svc\r\n\r\n";
+        let out = inject_handoff(raw, "rk-web-1", 8080);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("GET / HTTP/1.1\r\n"), "request line must stay first: {s:?}");
+        assert!(s.contains("X-Royak-Pod: rk-web-1\r\n"), "missing pod header: {s:?}");
+        assert!(s.contains("X-Royak-Port: 8080\r\n"), "missing port header: {s:?}");
+        assert!(s.contains("Host: web-svc\r\n"), "original headers must survive: {s:?}");
+        // And the peer can read them straight back out.
+        assert_eq!(parse_header(&s, "x-royak-pod").as_deref(), Some("rk-web-1"));
+        assert_eq!(parse_pod_port(&s), 8080);
     }
 }
