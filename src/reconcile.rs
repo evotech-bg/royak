@@ -526,6 +526,7 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
                 paused: false,
                 idle_since: None,
                 stateful: false,
+                owner_ref: Some(cr_name.clone()),
             });
             log.push(format!("    [{}] {} × {} ✓", component.role, component.image, if component.role == "primary" { 1 } else { replicas }));
         }
@@ -543,6 +544,18 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
             cr.status = CRStatus::Provisioning;
         }
     }
+}
+
+/// Cascade-delete selection (pure): names of deployments owned by `cr_name`.
+///
+/// A deployment is owned iff its `owner_ref` equals `Some(cr_name)`. Deployments
+/// with no owner ref (user-created) are never selected, so unrelated workloads
+/// are left untouched when a CustomResource is deleted.
+pub fn deployments_owned_by(desired: &DesiredWorld, cr_name: &str) -> Vec<String> {
+    desired.deployments.values()
+        .filter(|d| d.owner_ref.as_deref() == Some(cr_name))
+        .map(|d| d.name.clone())
+        .collect()
 }
 
 /// Rolling update state
@@ -737,6 +750,9 @@ pub struct StoredDeployment {
     // previous must be running), highest-ordinal-first scale-down, and per-
     // ordinal volumes ("vct:" host prefixes resolved at pod creation).
     pub stateful: bool,
+    // Cascade-delete: name of the CustomResource that provisioned this
+    // deployment (owner reference). None = user-owned, never GC'd on CR delete.
+    pub owner_ref: Option<String>,
 }
 
 pub struct StoredContainer {
@@ -1122,6 +1138,7 @@ impl DesiredWorld {
                     paused: false,
                     idle_since: None,
                     stateful: resource.kind == "StatefulSet",
+                    owner_ref: None,
                 });
 
                 if let Some(old_image) = rolling {
@@ -2232,7 +2249,19 @@ impl DesiredWorld {
             "repositories" => self.repositories.remove(name).is_some(),
             "guards" => self.guards.remove(name).is_some(),
             "operators" => self.operators.remove(name).is_some(),
-            "customresources" => self.custom_resources.remove(name).is_some(),
+            "customresources" => {
+                // Cascade-delete (owner-reference GC): removing a CR must clean
+                // up the deployments its operator provisioned. Collect owned
+                // names first (immutable borrow), then drop them — the reconcile
+                // loop tears down their containers on the next cycle.
+                let existed = self.custom_resources.remove(name).is_some();
+                if existed {
+                    for dep_name in deployments_owned_by(self, name) {
+                        self.deployments.remove(&dep_name);
+                    }
+                }
+                existed
+            }
             "rbacroles" => self.rbac_roles.remove(name).is_some(),
             _ => false,
         }
@@ -4723,6 +4752,137 @@ mod hpa_tests {
     }
 }
 
+#[cfg(test)]
+mod cascade_delete_tests {
+    use super::*;
+
+    /// Minimal deployment with an explicit owner ref (None = user-owned).
+    fn dep(name: &str, owner: Option<&str>) -> StoredDeployment {
+        StoredDeployment {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            replicas: 1,
+            init_containers: Vec::new(),
+            containers: Vec::new(),
+            image: "nginx:alpine".to_string(),
+            previous_image: None,
+            command: None,
+            env: Vec::new(),
+            resource_limits: None,
+            strategy: None,
+            pause_after_idle: None,
+            paused: false,
+            idle_since: None,
+            stateful: false,
+            owner_ref: owner.map(|s| s.to_string()),
+        }
+    }
+
+    /// An operator that provisions a single "primary" component for `kind`.
+    fn operator(name: &str, kind: &str) -> Operator {
+        Operator {
+            name: name.to_string(),
+            custom_kind: kind.to_string(),
+            provision: vec![OperatorComponent {
+                role: "primary".to_string(),
+                image: "postgres:16".to_string(),
+                replicas: 1,
+                env: vec![],
+                volumes: vec![],
+                ports: vec![],
+            }],
+            hooks: HashMap::new(),
+            rules: vec![],
+        }
+    }
+
+    fn custom_resource(name: &str, kind: &str) -> CustomResource {
+        CustomResource {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            namespace: "default".to_string(),
+            spec: serde_json::json!({}),
+            status: CRStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn provisioning_stamps_owner_ref() {
+        let mut world = DesiredWorld::new();
+        world.operators.insert("pg-op".into(), operator("pg-op", "PostgresCluster"));
+        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
+
+        let mut log = Vec::new();
+        reconcile_operators(&mut world, &mut log);
+
+        let provisioned = world.deployments.get("db-primary")
+            .expect("operator should provision db-primary");
+        assert_eq!(provisioned.owner_ref.as_deref(), Some("db"),
+            "provisioned deployment must carry the owning CR as its owner ref");
+    }
+
+    #[test]
+    fn selection_picks_only_owned_deployments() {
+        let mut world = DesiredWorld::new();
+        world.deployments.insert("db-primary".into(), dep("db-primary", Some("db")));
+        world.deployments.insert("db-replica".into(), dep("db-replica", Some("db")));
+        world.deployments.insert("cache-primary".into(), dep("cache-primary", Some("cache")));
+        world.deployments.insert("web".into(), dep("web", None));
+
+        let mut owned = deployments_owned_by(&world, "db");
+        owned.sort();
+        assert_eq!(owned, vec!["db-primary".to_string(), "db-replica".to_string()]);
+    }
+
+    #[test]
+    fn deleting_cr_removes_exactly_its_owned_deployments() {
+        let mut world = DesiredWorld::new();
+        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
+        world.deployments.insert("db-primary".into(), dep("db-primary", Some("db")));
+        world.deployments.insert("db-replica".into(), dep("db-replica", Some("db")));
+        world.deployments.insert("cache-primary".into(), dep("cache-primary", Some("cache")));
+        world.deployments.insert("web".into(), dep("web", None));
+
+        let deleted = world.delete_resource("customresources", "db");
+        assert!(deleted, "CR delete should report success");
+
+        // Owned deployments are gone.
+        assert!(!world.deployments.contains_key("db-primary"));
+        assert!(!world.deployments.contains_key("db-replica"));
+        // Another CR's deployment and the user-owned one are untouched.
+        assert!(world.deployments.contains_key("cache-primary"));
+        assert!(world.deployments.contains_key("web"));
+        assert_eq!(world.deployments.len(), 2);
+        // CR itself removed.
+        assert!(!world.custom_resources.contains_key("db"));
+    }
+
+    #[test]
+    fn unowned_deployment_is_never_gcd() {
+        let mut world = DesiredWorld::new();
+        // A CR named "db" exists, and a user deployment happens to be "db"-ish
+        // but has no owner ref — it must survive the cascade.
+        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
+        world.deployments.insert("db".into(), dep("db", None));
+
+        world.delete_resource("customresources", "db");
+
+        assert!(world.deployments.contains_key("db"),
+            "a deployment with no owner ref must never be garbage-collected");
+    }
+
+    #[test]
+    fn deleting_missing_cr_touches_nothing() {
+        let mut world = DesiredWorld::new();
+        world.deployments.insert("web".into(), dep("web", Some("ghost")));
+
+        let deleted = world.delete_resource("customresources", "ghost");
+        assert!(!deleted, "deleting a non-existent CR returns false");
+        // The CR never existed, so no cascade runs — the orphan stays put.
+        assert!(world.deployments.contains_key("web"));
+    }
+}
+
 // ─── UDP Autodiscovery: nodes find each other on the network ───
 //
 // Protocol:
@@ -5341,7 +5501,7 @@ pub fn export_state(world: &DesiredWorld) -> serde_json::Value {
         }))).collect::<serde_json::Map<String, serde_json::Value>>(),
         "deployments": world.deployments.iter().map(|(k, d)| (k.clone(), serde_json::json!({
             "name": d.name, "namespace": d.namespace, "replicas": d.replicas,
-            "image": d.image, "paused": d.paused,
+            "image": d.image, "paused": d.paused, "ownerRef": d.owner_ref,
             "containers": d.containers.iter().map(|c| serde_json::json!({"name": c.name, "image": c.image, "env": c.env})).collect::<Vec<_>>()
         }))).collect::<serde_json::Map<String, serde_json::Value>>(),
         "configmaps": world.configmaps.iter().map(|(k, c)| (k.clone(), serde_json::json!({
@@ -5432,6 +5592,7 @@ pub fn merge_state(local: &mut DesiredWorld, remote: &serde_json::Value) -> Vec<
                     resource_limits: None,
                     strategy: None,
                     pause_after_idle: None, paused: false, idle_since: None, stateful: false,
+                    owner_ref: val["ownerRef"].as_str().map(|s| s.to_string()),
                 });
                 log.push(format!("deployment/{name} synced from peer"));
             }

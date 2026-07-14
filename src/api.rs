@@ -3470,6 +3470,7 @@ mod demo_detail_tests {
             image: String::new(), previous_image: None, command: None, env: Vec::new(),
             resource_limits: None, strategy: None,
             pause_after_idle: None, paused: false, idle_since: None, stateful: false,
+            owner_ref: None,
         }
     }
     fn svc(name: &str, app: &str, ports: Vec<ServicePort>) -> StoredService {

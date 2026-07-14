@@ -1854,6 +1854,7 @@ pub fn save_state(path: &str, world: &DesiredWorld) {
             "name": d.name, "namespace": d.namespace, "replicas": d.replicas,
             "image": d.image, "previousImage": d.previous_image, "command": d.command, "env": d.env,
             "paused": d.paused, "pauseAfterIdle": d.pause_after_idle, "stateful": d.stateful,
+            "ownerRef": d.owner_ref,
             "containers": d.containers.iter().map(|c| {
                 let mut cj = serde_json::json!({
                     "name": c.name, "image": c.image, "command": c.command, "env": c.env,
@@ -2230,6 +2231,7 @@ fn load_state(path: &str) -> DesiredWorld {
                         paused: item["paused"].as_bool().unwrap_or(false),
                         idle_since: None,
                         stateful: item["stateful"].as_bool().unwrap_or(false),
+                        owner_ref: item["ownerRef"].as_str().map(|s| s.to_string()),
                         containers: item["containers"].as_array()
                             .map(|arr| arr.iter().map(|c| parse_container(c)).collect())
                             .unwrap_or_else(|| vec![parse_container(&serde_json::json!({
@@ -2792,6 +2794,45 @@ mod state_tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["schemaVersion"].as_u64(), Some(STATE_SCHEMA_VERSION as u64));
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn owner_ref_survives_save_load_roundtrip() {
+        let path = tmp_path("ownerref");
+        cleanup(&path);
+
+        let mk = |name: &str, owner: Option<&str>| reconcile::StoredDeployment {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            replicas: 1,
+            init_containers: Vec::new(),
+            containers: Vec::new(),
+            image: "postgres:16".to_string(),
+            previous_image: None,
+            command: None,
+            env: Vec::new(),
+            resource_limits: None,
+            strategy: None,
+            pause_after_idle: None,
+            paused: false,
+            idle_since: None,
+            stateful: false,
+            owner_ref: owner.map(|s| s.to_string()),
+        };
+
+        let mut world = DesiredWorld::new();
+        world.deployments.insert("db-primary".to_string(), mk("db-primary", Some("db")));
+        // A second, user-owned deployment with no owner ref.
+        world.deployments.insert("web".to_string(), mk("web", None));
+
+        save_state(&path, &world);
+        let loaded = load_state(&path);
+
+        assert_eq!(loaded.deployments["db-primary"].owner_ref.as_deref(), Some("db"),
+            "owner ref must survive the save/load JSON round-trip");
+        assert_eq!(loaded.deployments["web"].owner_ref, None,
+            "absent owner ref must load back as None");
         cleanup(&path);
     }
 
