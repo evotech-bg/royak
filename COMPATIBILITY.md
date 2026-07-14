@@ -53,7 +53,7 @@ Legend: ✅ works · 🟡 partial · ❌ not yet (→ [ROADMAP.md](ROADMAP.md))
 | Kubernetes native | Status | Verified behaviour |
 |---|---|---|
 | Namespaces | ✅ | Isolation via per-namespace Docker networks |
-| RBAC enforcement | ✅ | Native `Role`/`ClusterRole`/`RoleBinding` accepted and enforced (subject GET 200 / POST 403 verified), plus Royak's own `RbacRole` |
+| RBAC enforcement | 🟡 | Native `Role`/`ClusterRole`/`RoleBinding` accepted; the verb+resource+namespace check runs on API writes (subject GET 200 / POST 403 verified), plus Royak's own `RbacRole`. But the caller's role is **self-asserted** via the `x-royak-role` header (defaults to `admin`) and is **open-by-default** — it authorizes a stated role, it does not authenticate the caller |
 | ServiceAccount | 🟡 | Accepted as a manifest and usable as an RBAC subject via RoleBinding; no auto-mounted tokens (Royak pods get their own CA-signed identity cert + token injected as env, though these identities are not yet verified on the live path) |
 | Admission webhooks (validating) | ✅ | `ValidatingWebhookConfiguration` with `clientConfig.url` — Royak POSTs an AdmissionReview and honours allow/deny + failurePolicy. Verified live (allowed 201 / denied 403). No CA-bundle/mutating webhooks yet |
 
