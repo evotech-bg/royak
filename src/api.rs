@@ -2889,21 +2889,107 @@ fn cluster_born_secs() -> u64 {
     })
 }
 
+/// Desired pod count = Σ deployment replicas. This is the *target* the cluster
+/// is reconciling toward, NOT how many are currently running — a chaos kill or a
+/// mid-rollout gap makes the two diverge. Pure; unit-tested.
+pub(crate) fn desired_pod_count(world: &DesiredWorld) -> u32 {
+    world.deployments.values().map(|d| d.replicas).sum()
+}
+
+/// Per-Service detail for the demo page: name, namespace, app selector, type,
+/// ports (port→targetPort) and how many running pods currently back it.
+///
+/// Pure and lock-free — the caller passes the running-pod NAME census it already
+/// gathered for this same snapshot (local container names + peer-node pods), and
+/// backing pods are counted by the `rk-<deployment>-*` name prefix, the same
+/// convention the ingress resolver uses. No docker calls, no world locks here, so
+/// it is safe on the reconcile thread and unit-testable.
+pub(crate) fn demo_service_details(
+    world: &DesiredWorld,
+    running_pod_names: &[String],
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = world.services.values().map(|svc| {
+        let app = svc.selector.get("app").cloned().unwrap_or_default();
+        // Deployment backing this service (matched on app selector + namespace).
+        let deployment = world.deployments.values()
+            .find(|d| d.name == app && d.namespace == svc.namespace)
+            .map(|d| d.name.clone());
+        let backends = deployment.as_ref().map(|dep| {
+            let prefix = format!("rk-{dep}-");
+            running_pod_names.iter()
+                .filter(|n| n.trim_start_matches('/').starts_with(&prefix))
+                .count()
+        }).unwrap_or(0);
+        let ports: Vec<serde_json::Value> = svc.ports.iter().map(|p| serde_json::json!({
+            "port": p.port, "target_port": p.target_port,
+        })).collect();
+        serde_json::json!({
+            "name": svc.name,
+            "namespace": svc.namespace,
+            "app": app,
+            "type": svc.service_type,
+            "ports": ports,
+            "backends": backends,
+        })
+    }).collect();
+    out.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    out
+}
+
+/// Per-Ingress-rule detail for the demo page: host, path → backend service:port.
+/// Pure; derived straight from the world snapshot.
+pub(crate) fn demo_ingress_details(world: &DesiredWorld) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for ing in world.ingresses.values() {
+        for rule in &ing.rules {
+            for p in &rule.paths {
+                out.push(serde_json::json!({
+                    "host": rule.host,
+                    "path": p.path,
+                    "service": p.service,
+                    "port": p.port,
+                }));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        let ka = (a["host"].as_str().unwrap_or(""), a["path"].as_str().unwrap_or(""));
+        let kb = (b["host"].as_str().unwrap_or(""), b["path"].as_str().unwrap_or(""));
+        ka.cmp(&kb)
+    });
+    out
+}
+
+/// Per-HPA detail for the demo page: target deployment, min/max, target CPU% and
+/// the deployment's current replica count. Pure; derived from the world snapshot.
+pub(crate) fn demo_hpa_details(world: &DesiredWorld) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = world.hpas.values().map(|h| {
+        let replicas = world.deployments.values()
+            .find(|d| d.name == h.deployment)
+            .map(|d| d.replicas)
+            .unwrap_or(0);
+        serde_json::json!({
+            "name": h.name,
+            "deployment": h.deployment,
+            "min": h.min_replicas,
+            "max": h.max_replicas,
+            "target_cpu": h.target_cpu,
+            "replicas": replicas,
+        })
+    }).collect();
+    out.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    out
+}
+
 pub fn publish_demo_state(world: &DesiredWorld) {
     let certs_issued = world.cluster_ca.as_ref().map(|ca| ca.issued_count).unwrap_or(0);
     let uptime_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
         .saturating_sub(cluster_born_secs());
-    let cluster = serde_json::json!({
-        "pods": world.deployments.values().map(|d| d.replicas).sum::<u32>(),
-        "deployments": world.deployments.len(),
-        "nodes": world.nodes.len(),
-        "services": world.services.len(),
-        "namespaces": world.namespaces.len(),
-    });
     // Per-pod cpu/mem from the 8s-cached docker stats (cheap; runs on the
     // reconcile thread between ticks, never on a request path).
     let mut pods = Vec::new();
+    let mut pod_names: Vec<String> = Vec::new();  // running-pod name census (local + peer)
     if let Ok(containers) = docker::list_containers(true) {
         for c in containers.iter()
             .filter(|c| c.state == "running" && c.names.iter().any(|n| n.contains("rk-")))
@@ -2911,6 +2997,7 @@ pub fn publish_demo_state(world: &DesiredWorld) {
             let short = &c.id[..12.min(c.id.len())];
             let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
             let (cpu, mem) = docker::container_stats_peek(short).unwrap_or((0.0, 0.0));
+            pod_names.push(name.to_string());
             pods.push(serde_json::json!({
                 "name": name, "cpu_raw": cpu, "memory_raw_mb": mem,
                 "cpu": format!("{:.1}%", cpu), "memory": format!("{:.0}Mi", mem),
@@ -2923,11 +3010,28 @@ pub fn publish_demo_state(world: &DesiredWorld) {
     // cross-node, so they show as remote.
     let peers = peer_pods_store().lock().map(|g| g.clone()).unwrap_or_default();
     for (_, name) in &peers {
+        pod_names.push(name.clone());
         pods.push(serde_json::json!({
             "name": name, "cpu_raw": 0.0, "memory_raw_mb": 0.0,
             "cpu": "peer", "memory": "peer", "remote": true,
         }));
     }
+    // `pods` = Σ desired replicas (the reconcile TARGET); `pods_running` = pods
+    // actually up right now (this snapshot's census). The two diverge whenever a
+    // pod is mid-heal — the page's "Pods running" tile must use the actual one.
+    let cluster = serde_json::json!({
+        "pods": desired_pod_count(world),
+        "pods_running": pods.len(),
+        "deployments": world.deployments.len(),
+        "nodes": world.nodes.len(),
+        "services": world.services.len(),
+        "namespaces": world.namespaces.len(),
+    });
+    // Compact per-object detail so the page can SHOW the services / ingress /
+    // HPAs, not just their counts. All derived lock-free from this snapshot.
+    let services = demo_service_details(world, &pod_names);
+    let ingresses = demo_ingress_details(world);
+    let hpas = demo_hpa_details(world);
     let demo = if demo_enabled() {
         let app = demo_app();
         let reps = world.deployments.get(&app).map(|d| d.replicas).unwrap_or(0);
@@ -2942,6 +3046,9 @@ pub fn publish_demo_state(world: &DesiredWorld) {
         "certs_issued": certs_issued,
         "running": pods.len(),
         "pods": pods,
+        "services": services,
+        "ingresses": ingresses,
+        "hpas": hpas,
         "demo": demo,
         "activity": activity,
         "uptime_secs": uptime_secs,
@@ -3348,6 +3455,116 @@ fn b64_bytes(bytes: &[u8]) -> String {
         if chunk.len() > 2 { out.push(B64[(triple & 0x3F) as usize] as char); } else { out.push('='); }
     }
     out
+}
+
+#[cfg(test)]
+mod demo_detail_tests {
+    use super::*;
+    use crate::reconcile::{DesiredWorld, StoredService, StoredDeployment, StoredHPA, ServicePort, IngressRule, IngressPath, StoredIngress};
+    use std::collections::HashMap;
+
+    fn deploy(name: &str, replicas: u32) -> StoredDeployment {
+        StoredDeployment {
+            name: name.to_string(), namespace: "default".to_string(), replicas,
+            init_containers: Vec::new(), containers: Vec::new(),
+            image: String::new(), previous_image: None, command: None, env: Vec::new(),
+            resource_limits: None, strategy: None,
+            pause_after_idle: None, paused: false, idle_since: None, stateful: false,
+        }
+    }
+    fn svc(name: &str, app: &str, ports: Vec<ServicePort>) -> StoredService {
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), app.to_string());
+        StoredService {
+            name: name.to_string(), namespace: "default".to_string(),
+            selector, ports, service_type: "ClusterIP".to_string(),
+        }
+    }
+    fn port(p: u16, tp: u16) -> ServicePort {
+        ServicePort { port: p, target_port: tp, protocol: "TCP".to_string(), node_port: None }
+    }
+
+    #[test]
+    fn desired_pod_count_sums_replicas_and_differs_from_running() {
+        // Two deployments desire 3 + 2 = 5 pods total.
+        let mut w = DesiredWorld::new();
+        w.deployments.insert("web".into(), deploy("web", 3));
+        w.deployments.insert("api".into(), deploy("api", 2));
+        assert_eq!(desired_pod_count(&w), 5);
+
+        // The chaos monkey just killed one → only 4 running names in the census.
+        // Desired (target) must NOT equal actual-running: this is exactly the
+        // distinction the "Pods running" tile has to report honestly.
+        let running = vec![
+            "rk-web-1".to_string(), "rk-web-2".to_string(),
+            "rk-api-1".to_string(), "rk-api-2".to_string(),
+        ];
+        assert_ne!(desired_pod_count(&w) as usize, running.len());
+        assert_eq!(running.len(), 4);
+    }
+
+    #[test]
+    fn service_details_count_backing_pods_by_name_prefix() {
+        let mut w = DesiredWorld::new();
+        w.deployments.insert("web".into(), deploy("web", 3));
+        w.services.insert("web-svc".into(), svc("web-svc", "web", vec![port(80, 8080)]));
+        // Census: 2 web pods running (one killed), plus an unrelated pod.
+        let running = vec![
+            "rk-web-4".to_string(), "/rk-web-7".to_string(), "rk-other-1".to_string(),
+        ];
+        let details = demo_service_details(&w, &running);
+        assert_eq!(details.len(), 1);
+        let s = &details[0];
+        assert_eq!(s["name"], "web-svc");
+        assert_eq!(s["app"], "web");
+        assert_eq!(s["backends"], 2);  // rk-web-4 and /rk-web-7, not rk-other-1
+        assert_eq!(s["ports"][0]["port"], 80);
+        assert_eq!(s["ports"][0]["target_port"], 8080);
+    }
+
+    #[test]
+    fn service_with_no_backing_deployment_reports_zero() {
+        let mut w = DesiredWorld::new();
+        w.services.insert("ghost".into(), svc("ghost", "missing", vec![port(80, 80)]));
+        let details = demo_service_details(&w, &["rk-web-1".to_string()]);
+        assert_eq!(details[0]["backends"], 0);
+    }
+
+    #[test]
+    fn ingress_details_flatten_host_path_to_backend() {
+        let mut w = DesiredWorld::new();
+        w.ingresses.insert("ing".into(), StoredIngress {
+            name: "ing".into(), namespace: "default".into(), ingress_class: None,
+            rules: vec![IngressRule {
+                host: "app.example.com".into(),
+                paths: vec![IngressPath { path: "/api".into(), service: "api-svc".into(), port: 80 }],
+            }],
+        });
+        let details = demo_ingress_details(&w);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["host"], "app.example.com");
+        assert_eq!(details[0]["path"], "/api");
+        assert_eq!(details[0]["service"], "api-svc");
+        assert_eq!(details[0]["port"], 80);
+    }
+
+    #[test]
+    fn hpa_details_report_current_replicas_of_target() {
+        let mut w = DesiredWorld::new();
+        w.deployments.insert("web".into(), deploy("web", 4));
+        w.hpas.insert("web-hpa".into(), StoredHPA {
+            name: "web-hpa".into(), deployment: "web".into(),
+            min_replicas: 1, max_replicas: 5, target_cpu: 70.0,
+            history: Vec::new(), last_scaled: None,
+        });
+        let details = demo_hpa_details(&w);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["deployment"], "web");
+        assert_eq!(details[0]["min"], 1);
+        assert_eq!(details[0]["max"], 5);
+        assert_eq!(details[0]["target_cpu"], 70.0);
+        assert_eq!(details[0]["replicas"], 4);  // current desired replicas of target
+    }
 }
 
 #[cfg(test)]
