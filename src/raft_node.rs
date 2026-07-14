@@ -703,6 +703,42 @@ pub async fn raft_status() -> (Option<NeuroNodeId>, Option<NeuroNodeId>) {
     }
 }
 
+/// Set true once this process runs clustered (`--node-id` + `--peers`). When
+/// false (single-node) the reconcile loop always schedules — the local file
+/// lease is the only writer, exactly as before Raft existed.
+pub static CLUSTER_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Cached "am I the Raft leader" flag, refreshed by [`leadership_poller`]. The
+/// reconcile loop is synchronous and cannot await `current_leader()` each tick,
+/// so a background task keeps this fresh. Starts false so a booting follower
+/// does NOT schedule before an election confirms a leader.
+static IS_RAFT_LEADER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The scheduler gate for the reconcile loop: only the node that owns
+/// desired-state reconciliation creates / scales / routes pods. Single-node
+/// (Raft off) → always true. Clustered → true only on the confirmed leader.
+/// Followers still manage their own pods' health; they just don't schedule,
+/// which is what stops both nodes independently satisfying the same deployment.
+pub fn is_cluster_scheduler() -> bool {
+    use std::sync::atomic::Ordering;
+    !CLUSTER_MODE.load(Ordering::Acquire) || IS_RAFT_LEADER.load(Ordering::Acquire)
+}
+
+/// Background task (clustered mode only): refresh [`IS_RAFT_LEADER`] ~4×/sec
+/// from live Raft state. Treats "Raft not up yet" as NOT leader so no follower
+/// schedules during the startup/election window.
+pub async fn leadership_poller() {
+    use std::sync::atomic::Ordering;
+    loop {
+        let is_leader = match RAFT.get() {
+            Some(h) => h.raft.current_leader().await == Some(h.node_id),
+            None => false,
+        };
+        IS_RAFT_LEADER.store(is_leader, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 // ─── Bootstrap helper ──────────────────────────────────────────────────
 pub async fn build_single_node(
     node_id: NeuroNodeId,

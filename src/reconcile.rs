@@ -2403,16 +2403,29 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
 
         let current = running.len() as u32;
         let desired_count = dep.replicas;
+        // Cluster-wide count: the leader owns scheduling and must count pods on
+        // ALL nodes (local + peer census + just-dispatched), or routing a pod to
+        // a peer leaves the local count low and it over-provisions. Single-node
+        // (no peers, no pending) → equals local `current`.
+        let local_pod_names: Vec<String> = running.iter()
+            .flat_map(|c| c.names.iter().map(|n| n.trim_start_matches('/').to_string()))
+            .collect();
+        let cluster_current = cluster_pod_count(name, &local_pod_names);
+        // Only the desired-state owner schedules — single-node always, clustered
+        // only on the Raft leader. Followers still fall through to the health /
+        // crashloop management below; they simply never create or scale, which is
+        // what stops both nodes independently satisfying the same deployment.
+        let may_schedule = crate::raft_node::is_cluster_scheduler();
 
-        if current < desired_count {
+        if may_schedule && cluster_current < desired_count {
             // Scale UP — check quota first
-            let needed = desired_count - current;
+            let needed = desired_count - cluster_current;
             if let Err(reason) = desired.check_quota(&dep.namespace, needed) {
                 log.push(format!("  [quota] {name}: BLOCKED — {reason}"));
                 pending_events.push(("Deployment".into(), name.clone(), "QuotaExceeded".into(), reason, "Warning".into()));
                 continue;
             }
-            log.push(format!("  [scale] {name}: {current} → {desired_count} (+{needed})"));
+            log.push(format!("  [scale] {name}: {cluster_current} → {desired_count} (+{needed})"));
             pending_events.push(("Deployment".into(), name.clone(), "ScalingUp".into(), format!("{current} → {desired_count} (+{needed})"), "Normal".into()));
 
             // Pull all images
@@ -2425,10 +2438,16 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                 }
             }
 
-            // Collect all existing container names for collision-free naming
-            let all_names: Vec<String> = managed.iter()
+            // Collect all existing container names for collision-free naming —
+            // LOCAL containers plus the peer census, so a pod routed to another
+            // node reserves its name cluster-wide (else the leader reuses an
+            // ordinal already taken on a peer → two rk-web-4, a missing rk-web-1).
+            let mut all_names: Vec<String> = managed.iter()
                 .flat_map(|c| c.names.iter().map(|n| n.trim_start_matches('/').to_string()))
                 .collect();
+            for (_, pod) in crate::api::peer_pods() {
+                all_names.push(pod.trim_start_matches('/').to_string());
+            }
 
             // StatefulSet: ordered startup — at most one new ordinal per tick,
             // and always the lowest missing one (rk-db-1 is recreated before
@@ -2499,6 +2518,13 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                     idx += 1;
                 }
                 let pod_name = format!("rk-{name}-{idx}");
+                // Reserve it for the rest of THIS tick — the peer census only
+                // refreshes every few seconds, so within a burst the name isn't
+                // yet visible via peer_pods() and we'd otherwise reuse it.
+                all_names.push(pod_name.clone());
+                // And count it toward the cluster on the NEXT tick until the
+                // census confirms it (closes the async-create / sampler-lag race).
+                record_placement(&pod_name);
 
                 // Multi-node: pick best node for this pod
                 let target_node = if !desired.nodes.is_empty() {
@@ -2509,38 +2535,49 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                 log.push(format!("    [multi-node] {} node(s) known, pick_node({pod_name}) → {:?}",
                     desired.nodes.len(), target_node));
                 if let Some(ref node_name) = target_node {
-                    if let Some(node) = desired.nodes.get(node_name) {
-                        let is_local = node.address.starts_with("127.0.0.1")
+                    let me = local_node_name();
+                    // A node is "local" if it IS us. Matching only 127.0.0.1
+                    // broke once ROYAK_ADVERTISE_ADDR was set — our own entry then
+                    // carries our real IP, so we'd POST create-pod to ourselves.
+                    let is_local = desired.nodes.get(node_name).map(|node| {
+                        node_name == &me
+                            || node.address.starts_with("127.0.0.1")
                             || node.address.starts_with("localhost")
-                            || node.address.is_empty();
-                        if !is_local && !node.address.is_empty() {
-                            // Remote node: send create request via API
-                            let url = format!("http://{}/royak/v1/create-pod", node.address);
-                            let body = serde_json::json!({
-                                "pod": pod_name,
-                                "deployment": name,
-                                "image": dep.containers.first().map(|c| c.image.as_str()).unwrap_or(""),
-                                "replicas": 1
+                            || node.address.is_empty()
+                    }).unwrap_or(true);
+                    if !is_local {
+                        let addr = desired.nodes.get(node_name).map(|n| n.address.clone()).unwrap_or_default();
+                        // Remote node: send create request via API
+                        let url = format!("http://{addr}/royak/v1/create-pod");
+                        let body = serde_json::json!({
+                            "pod": pod_name,
+                            "deployment": name,
+                            "image": dep.containers.first().map(|c| c.image.as_str()).unwrap_or(""),
+                            "replicas": 1
+                        });
+                        log.push(format!("    [multi-node] routing {pod_name} → {node_name} ({url})"));
+                        // Fire-and-forget over the private subnet — but a PROPER
+                        // request. The old hand-rolled HTTP had no Host header,
+                        // which the peer's HTTP server rejects, so no pod was ever
+                        // actually created remotely.
+                        if let Ok(body_str) = serde_json::to_string(&body) {
+                            let (u, p, nn) = (url.clone(), pod_name.clone(), node_name.clone());
+                            std::thread::spawn(move || {
+                                if let Err(e) = http_post(&u, &body_str, &[("Content-Type", "application/json")]) {
+                                    eprintln!("  ⚠ [multi-node] {p} → {nn} create-pod failed: {e}");
+                                }
                             });
-                            log.push(format!("    [multi-node] routing {pod_name} → {node_name} ({url})"));
-                            // Fire-and-forget over the private subnet — but a
-                            // PROPER request. The old hand-rolled HTTP had no Host
-                            // header, which the peer's HTTP server rejects, so no
-                            // pod was ever actually created remotely.
-                            if let Ok(body_str) = serde_json::to_string(&body) {
-                                let (u, p, nn) = (url.clone(), pod_name.clone(), node_name.clone());
-                                std::thread::spawn(move || {
-                                    if let Err(e) = http_post(&u, &body_str, &[("Content-Type", "application/json")]) {
-                                        eprintln!("  ⚠ [multi-node] {p} → {nn} create-pod failed: {e}");
-                                    }
-                                });
-                            }
-                            // Update node pod count
-                            if let Some(n) = desired.nodes.get_mut(node_name) {
-                                n.pod_count += 1;
-                            }
-                            continue; // skip local creation
                         }
+                        // Bump the target's count so pick_node spreads the next pod.
+                        if let Some(n) = desired.nodes.get_mut(node_name) {
+                            n.pod_count += 1;
+                        }
+                        continue; // skip local creation
+                    }
+                    // Local placement: bump OUR count too, so within this tick
+                    // pick_node balances the remaining pods across the cluster.
+                    if let Some(n) = desired.nodes.get_mut(&me) {
+                        n.pod_count += 1;
                     }
                 }
                 let mut _main_container_id: Option<String> = None;
@@ -2792,11 +2829,19 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                     }
                 } // end container loop
             } // end pod loop
-        } else if current > desired_count {
-            // Scale DOWN
-            let excess = current - desired_count;
-            log.push(format!("  [scale] {name}: {current} → {desired_count} (-{excess})"));
-            pending_events.push(("Deployment".into(), name.clone(), "ScalingDown".into(), format!("{current} → {desired_count} (-{excess})"), "Normal".into()));
+        } else if may_schedule && cluster_current > desired_count {
+            // Scale DOWN — remove this node's excess pods. We only delete LOCAL
+            // containers, so a peer's excess (rare: only after a cross-node grow
+            // then a shrink) is reported, not reclaimed — there is no
+            // delete-pod-on-peer path yet (v0.5). We never delete more than our
+            // local share, so the deployment is never taken below target.
+            let cluster_excess = cluster_current - desired_count;
+            let excess = cluster_excess.min(current);
+            log.push(format!("  [scale] {name}: {cluster_current} → {desired_count} (-{cluster_excess})"));
+            pending_events.push(("Deployment".into(), name.clone(), "ScalingDown".into(), format!("{cluster_current} → {desired_count} (-{cluster_excess})"), "Normal".into()));
+            if cluster_excess > excess {
+                log.push(format!("  [scale] {name}: {} excess pod(s) live on peer node(s) — not reclaimed (cross-node scale-down is v0.5)", cluster_excess - excess));
+            }
 
             // StatefulSet scale-down removes the highest ordinal first
             // (K8s semantics); plain deployments keep Docker's order.
@@ -2817,6 +2862,10 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
             for container in victims {
                 let id = &container.id;
                 let cname = container.names.first().map(|s| s.as_str()).unwrap_or("?");
+                // Drop it from the optimistic set BEFORE deleting, or the next
+                // tick would still count the deleted pod (pending) and delete its
+                // replacement too — scaling down past target.
+                forget_placement(cname);
                 if let Err(e) = docker::stop_container(id) {
                     log.push(format!("    [warn] stop {cname}: {e}"));
                 }
@@ -2838,6 +2887,10 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
             let id = &container.id;
             let cname = container.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
             if container.state == "exited" || container.state == "dead" {
+                // We're removing the container — drop it from the optimistic set
+                // so the scale loop recreates it (if still desired) instead of the
+                // stale placement masking the gap for 30s.
+                forget_placement(cname);
                 // Track restart count
                 let count = desired.restart_count.entry(cname.to_string()).or_insert(0);
                 *count += 1;
@@ -5077,6 +5130,50 @@ mod cascade_delete_tests {
         merge_state(&mut local, &peer_export);
         assert_eq!(local.nodes.len(), 2, "re-federation stays at two nodes");
     }
+
+    // Single-node (the demo) must be completely unaffected: with CLUSTER_MODE
+    // off (its default) the reconcile loop always schedules, exactly as before
+    // Raft existed. If this ever flips, single-node deployments stop scaling.
+    #[test]
+    fn single_node_always_schedules() {
+        assert!(crate::raft_node::is_cluster_scheduler(),
+            "single-node must always be the scheduler (no Raft gate)");
+    }
+
+    // The leader counts a deployment's replicas across the whole cluster: local
+    // running + the peer census, matched by the rk-<name>- prefix, ignoring
+    // other deployments. Under-counting here re-introduces over-provisioning.
+    #[test]
+    fn cluster_pod_count_sums_local_and_peer_census() {
+        crate::api::set_peer_pods(vec![
+            ("10.0.0.2:6443".into(), "rk-web-3".into()),
+            ("10.0.0.2:6443".into(), "rk-web-4".into()),
+            ("10.0.0.2:6443".into(), "rk-api-1".into()), // different deployment
+        ]);
+        let local_web = vec!["rk-web-1".to_string(), "rk-web-2".to_string()];
+        assert_eq!(cluster_pod_count("web", &local_web), 4, "2 local + 2 peer web pods");
+        assert_eq!(cluster_pod_count("api", &[]), 1, "0 local + 1 peer api pod");
+        assert_eq!(cluster_pod_count("web", &[]), 2, "peer-only web pods still count");
+        // De-dup: a pod present both locally AND in the census counts once.
+        let dup = vec!["rk-web-3".to_string()];
+        assert_eq!(cluster_pod_count("web", &dup), 2, "rk-web-3 in both sources counts once");
+        crate::api::set_peer_pods(vec![]); // reset shared global for other tests
+    }
+
+    // Optimistic accounting must not linger past a delete: a placement that is
+    // forgotten (scale-down / crash cleanup) stops counting immediately, so the
+    // leader does not over-delete the replacement on the next tick.
+    #[test]
+    fn forgotten_placement_stops_counting() {
+        crate::api::set_peer_pods(vec![]);
+        record_placement("rk-cache-1");
+        record_placement("rk-cache-2");
+        assert_eq!(cluster_pod_count("cache", &[]), 2, "both pending pods counted");
+        forget_placement("rk-cache-2");
+        assert_eq!(cluster_pod_count("cache", &[]), 1, "forgotten pod drops out at once");
+        forget_placement("rk-cache-1");
+        assert_eq!(cluster_pod_count("cache", &[]), 0, "no phantom pods remain");
+    }
 }
 
 // ─── UDP Autodiscovery: nodes find each other on the network ───
@@ -5616,6 +5713,99 @@ pub fn federate_with_peers(
         eprintln!("  ⚠ [census] {} peer(s) never reachable for federation: {}",
             pending.len(), pending.join(", "));
     }
+}
+
+/// Background sampler (clustered Docker mode): every few seconds, ask each Ready
+/// peer for its running pods (`GET /royak/v1/pods`) and publish the census via
+/// [`crate::api::set_peer_pods`]. The reconcile loop then reads that snapshot
+/// (`api::peer_pods()`) for CLUSTER-WIDE replica counting without doing peer
+/// HTTP under the world write-lock — holding the lock across a slow peer stalls
+/// reconcile + ingress (the 502 we already fixed). Also feeds the ingress
+/// cross-node router and the cluster-aware CLI `get pods`.
+pub fn spawn_peer_pod_sampler(world: std::sync::Arc<std::sync::RwLock<DesiredWorld>>) {
+    std::thread::spawn(move || loop {
+        // Snapshot Ready peers under a brief read lock, then talk to them lock-free.
+        let peers: Vec<String> = {
+            let w = world.read().unwrap();
+            let me = local_node_name();
+            w.nodes.iter()
+                .filter(|(n, node)| **n != me
+                    && node.status == NodeStatus::Ready
+                    && !node.address.is_empty())
+                .map(|(_, node)| node.address.clone())
+                .collect()
+        };
+        let mut census: Vec<(String, String)> = Vec::new();
+        for addr in &peers {
+            if let Ok(body) = http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(arr) = v["pods"].as_array() {
+                        for p in arr.iter().filter_map(|p| p.as_str()) {
+                            census.push((addr.clone(), p.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        crate::api::set_peer_pods(census);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+}
+
+/// Pods the leader has dispatched this session but may not yet see in the census
+/// (async create-pod + the ~3s census sampler lag). pod_name → dispatch unix ts.
+fn pending_placements() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>>
+        = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a pod the scheduler just placed (local OR routed) so the NEXT tick
+/// counts it before the census catches up — otherwise the leader re-schedules
+/// the same replica and over-provisions (`rk-web-5` appears).
+pub fn record_placement(pod_name: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Ok(mut g) = pending_placements().lock() {
+        g.insert(pod_name.trim_start_matches('/').to_string(), now);
+    }
+}
+
+/// Drop a pod from the optimistic set when it is deleted, so a scaled-down or
+/// crashed pod isn't counted as still-present (which would make the leader
+/// over-delete its replacement or delay recreation).
+pub fn forget_placement(pod_name: &str) {
+    if let Ok(mut g) = pending_placements().lock() {
+        g.remove(pod_name.trim_start_matches('/'));
+    }
+}
+
+/// Count a deployment's DISTINCT pods across the WHOLE cluster: this node's local
+/// running pods, the peer census (`api::peer_pods()`), and recently-dispatched
+/// pods not yet visible — all matched by the `rk-<name>-` prefix and de-duped by
+/// name (a pod may appear in more than one source). Counting by a name-set is
+/// what keeps the leader from over-provisioning while placements settle.
+/// Pending entries expire after 30s so a failed placement never wedges the count.
+pub fn cluster_pod_count(name: &str, local_pod_names: &[String]) -> u32 {
+    let prefix = format!("rk-{name}-");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in local_pod_names {
+        let n = n.trim_start_matches('/');
+        if n.starts_with(&prefix) { names.insert(n.to_string()); }
+    }
+    for (_, pod) in crate::api::peer_pods() {
+        let pod = pod.trim_start_matches('/');
+        if pod.starts_with(&prefix) { names.insert(pod.to_string()); }
+    }
+    if let Ok(mut g) = pending_placements().lock() {
+        g.retain(|_, ts| now.saturating_sub(*ts) <= 30); // drop stale placements
+        for pod in g.keys() {
+            if pod.starts_with(&prefix) { names.insert(pod.clone()); }
+        }
+    }
+    names.len() as u32
 }
 
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).

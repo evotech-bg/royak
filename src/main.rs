@@ -896,6 +896,10 @@ fn main() {
             // The live write path proposes commands through the leader; the
             // file lease remains the single-node fallback when Raft is off.
             if let Some(nid) = node_id {
+                // Clustered: only the Raft leader schedules (see is_cluster_scheduler).
+                raft_node::CLUSTER_MODE.store(true, std::sync::atomic::Ordering::Release);
+                rt.spawn(raft_node::leadership_poller());
+
                 let peer_list: Vec<(u64, String)> = peers.split(',')
                     .filter(|s| !s.trim().is_empty())
                     .filter_map(|s| {
@@ -924,6 +928,9 @@ fn main() {
                     std::thread::spawn(move || {
                         reconcile::federate_with_peers(census_world, token_b64, peer_addrs);
                     });
+                    // Keep a cross-node pod census fresh so the leader counts
+                    // replicas cluster-wide (not just local) when scheduling.
+                    reconcile::spawn_peer_pod_sampler(Arc::clone(&world_arc));
                 }
             }
 
