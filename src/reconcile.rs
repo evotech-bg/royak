@@ -4764,12 +4764,29 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
         .map(|(_, node)| node.address.clone())
         .collect();
     for addr in &peer_addrs {
-        if let Ok(body) = http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(arr) = v["pods"].as_array() {
-                    for p in arr.iter().filter_map(|p| p.as_str()) {
-                        remote_pods.push(p.to_string());
-                        peer_pod_pairs.push((addr.clone(), p.to_string()));
+        match http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
+            Ok(body) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(arr) = v["pods"].as_array() {
+                        for p in arr.iter().filter_map(|p| p.as_str()) {
+                            remote_pods.push(p.to_string());
+                            peer_pod_pairs.push((addr.clone(), p.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Unreachable peer: demote to NotReady so we STOP probing it under
+                // the world write-lock every tick. `http_get` is now connect-bounded
+                // (2s), but even 2s/tick of a dead peer stalls the ingress — so we
+                // drop it from the Ready set after ONE failed probe. It re-counts the
+                // moment it heartbeats back (check_node_health / heartbeat → Ready).
+                if let Some((name, node)) = desired.nodes.iter_mut()
+                    .find(|(_, nd)| nd.address == *addr)
+                {
+                    if node.status == crate::reconcile::NodeStatus::Ready {
+                        node.status = crate::reconcile::NodeStatus::NotReady;
+                        log.push(format!("  ⚠ [census] peer {name} unreachable ({e}) — marked NotReady"));
                     }
                 }
             }
@@ -5022,11 +5039,28 @@ pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &
 
 // ─── HTTP Client (raw TCP, same philosophy as docker.rs) ───
 
+/// Connect with a bounded timeout. `std::net::TcpStream::connect` has NO connect
+/// timeout — a dead peer (silently-dropped SYNs, e.g. a powered-off cloud VM)
+/// blocks the caller for the OS SYN timeout (~10-20s). Every peer HTTP call here
+/// runs inside the reconcile tick, under the world write-lock, so an unbounded
+/// connect freezes the whole reconcile + ingress (the survivor node goes dark
+/// while its dead peer is probed). Bound it hard.
+fn connect_with_timeout(addr: &str, timeout: std::time::Duration) -> Result<std::net::TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    let mut last = format!("no address for {addr}");
+    for sa in addr.to_socket_addrs().map_err(|e| format!("resolve {addr}: {e}"))? {
+        match std::net::TcpStream::connect_timeout(&sa, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("connect {addr}: {e}"),
+        }
+    }
+    Err(last)
+}
+
 fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
     let (host, port, path) = parse_url(url)?;
     let addr = format!("{host}:{port}");
-    let mut stream = std::net::TcpStream::connect(&addr)
-        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let mut stream = connect_with_timeout(&addr, std::time::Duration::from_secs(2))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
 
@@ -5048,8 +5082,7 @@ fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
 fn http_post(url: &str, body: &str, headers: &[(&str, &str)]) -> Result<String, String> {
     let (host, port, path) = parse_url(url)?;
     let addr = format!("{host}:{port}");
-    let mut stream = std::net::TcpStream::connect(&addr)
-        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let mut stream = connect_with_timeout(&addr, std::time::Duration::from_secs(2))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
 
