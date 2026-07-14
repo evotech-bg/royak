@@ -2727,6 +2727,28 @@ fn resolve_service_to_all_pod_ips(world: &DesiredWorld, service: &str) -> Vec<St
     ips
 }
 
+/// Pure port-remap: given a Service's ports and the ingress rule's port, return
+/// the container-side port to connect to. K8s semantics: the ingress rule names
+/// the Service's published `port`; the pod actually listens on the matching
+/// `targetPort`. Fall back to `rule_port` when no ServicePort matches (the
+/// Service is unknown or exposes a single implicit port), which also mirrors K8s
+/// where an unset targetPort defaults to `port`.
+fn target_port_for(ports: &[crate::reconcile::ServicePort], rule_port: u16) -> u16 {
+    ports.iter()
+        .find(|p| p.port == rule_port)
+        .map(|p| p.target_port)
+        .unwrap_or(rule_port)
+}
+
+/// Resolve an ingress rule's port to the backing Service's targetPort so ingress
+/// traffic reaches pods on the port they actually listen on.
+fn resolve_target_port(world: &DesiredWorld, service: &str, rule_port: u16) -> u16 {
+    match world.services.values().find(|s| s.name == service) {
+        Some(svc) => target_port_for(&svc.ports, rule_port),
+        None => rule_port,
+    }
+}
+
 // ─── Lock-free ingress route snapshot ───
 // The reconcile loop holds the world WRITE lock for a whole tick (docker I/O),
 // which makes every ingress request block on `world.read()` and stalls the async
@@ -2778,9 +2800,13 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
         for rule in &ingress.rules {
             for ip_path in &rule.paths {
                 let mut backends: Vec<(String, u16, String)> = Vec::new();
+                // The ingress rule targets the Service's published `port` (e.g. 80),
+                // but the pods listen on the Service's `targetPort` (e.g. 8080). We
+                // connect straight to pod IPs, so resolve rule port → targetPort.
+                let pod_port = resolve_target_port(world, &ip_path.service, ip_path.port);
                 // Local pods → direct.
                 for ip in resolve_service_to_all_pod_ips(world, &ip_path.service) {
-                    backends.push((ip, ip_path.port, String::new()));
+                    backends.push((ip, pod_port, String::new()));
                 }
                 // Remote pods → via the owning peer's mesh proxy (:6550).
                 if let Some(dep) = service_deployment(world, &ip_path.service) {
@@ -3322,6 +3348,50 @@ fn b64_bytes(bytes: &[u8]) -> String {
         if chunk.len() > 2 { out.push(B64[(triple & 0x3F) as usize] as char); } else { out.push('='); }
     }
     out
+}
+
+#[cfg(test)]
+mod ingress_port_tests {
+    use super::*;
+    use crate::reconcile::ServicePort;
+
+    fn svc_port(port: u16, target_port: u16) -> ServicePort {
+        ServicePort { port, target_port, protocol: "TCP".to_string(), node_port: None }
+    }
+
+    #[test]
+    fn maps_rule_port_to_target_port() {
+        // Service exposes port 80 → pods listen on 8080.
+        let ports = vec![svc_port(80, 8080)];
+        assert_eq!(target_port_for(&ports, 80), 8080);
+    }
+
+    #[test]
+    fn target_port_unset_falls_back_to_port() {
+        // targetPort unset ⇒ StoredService stores target_port == port; the rule
+        // then resolves to the same port the Service publishes.
+        let ports = vec![svc_port(80, 80)];
+        assert_eq!(target_port_for(&ports, 80), 80);
+    }
+
+    #[test]
+    fn unknown_port_falls_back_to_rule_port() {
+        // Rule references a port the Service does not expose → keep the rule port.
+        let ports = vec![svc_port(80, 8080)];
+        assert_eq!(target_port_for(&ports, 443), 443);
+    }
+
+    #[test]
+    fn no_ports_falls_back_to_rule_port() {
+        assert_eq!(target_port_for(&[], 8000), 8000);
+    }
+
+    #[test]
+    fn picks_the_matching_port_among_several() {
+        let ports = vec![svc_port(80, 8080), svc_port(443, 8443)];
+        assert_eq!(target_port_for(&ports, 443), 8443);
+        assert_eq!(target_port_for(&ports, 80), 8080);
+    }
 }
 
 #[cfg(test)]
