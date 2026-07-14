@@ -2268,6 +2268,45 @@ impl DesiredWorld {
     }
 }
 
+/// Decide which StatefulSet ordinal (if any) may be created THIS tick, honoring
+/// the real Kubernetes guarantee: ordinal N+1 is not created until ordinal N is
+/// Ready. Also enforces the "at most one new ordinal per tick" throttle by
+/// returning at most one ordinal.
+///
+/// royak names StatefulSet pods `rk-<name>-1 … rk-<name>-N` (1-based), so the
+/// lowest ordinal is `1` and it has no predecessor — it is always eligible
+/// (this is royak's equivalent of K8s' 0-based "ordinal 0 starts first").
+///
+/// - `existing`: ordinals whose pod currently exists (any container state)
+/// - `ready`:    ordinals whose pod is Ready (see caller for the signal used)
+/// - `desired_count`: target replica count
+///
+/// Returns `Some(ordinal)` for the lowest missing ordinal in `1..=desired_count`
+/// when its predecessor is Ready (or it is the first ordinal), else `None`
+/// (nothing to create — either the set is complete, or the predecessor of the
+/// next-missing ordinal is not yet Ready, so we hold and retry next tick).
+pub(crate) fn next_statefulset_ordinal(
+    existing: &std::collections::HashSet<u32>,
+    ready: &std::collections::HashSet<u32>,
+    desired_count: u32,
+) -> Option<u32> {
+    if desired_count == 0 {
+        return None;
+    }
+    // Lowest missing ordinal — recreate a hole before extending the tail.
+    let next = (1..=desired_count).find(|n| !existing.contains(n))?;
+    // The first ordinal has no predecessor and is always eligible.
+    if next == 1 {
+        return Some(1);
+    }
+    // Gate: the immediately-preceding ordinal must be Ready.
+    if ready.contains(&(next - 1)) {
+        Some(next)
+    } else {
+        None
+    }
+}
+
 /// One reconcile cycle
 pub fn reconcile_once(desired: &mut DesiredWorld, brain: &mut OrinBrain) -> Vec<String> {
     reconcile_with_runtime(desired, brain, false)
@@ -2393,13 +2432,64 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
 
             // StatefulSet: ordered startup — at most one new ordinal per tick,
             // and always the lowest missing one (rk-db-1 is recreated before
-            // rk-db-3 is ever considered).
+            // rk-db-3 is ever considered). Crucially, honor the real K8s
+            // guarantee: ordinal N+1 is NOT created until ordinal N is Ready.
             let needed = if dep.stateful { needed.min(1) } else { needed };
+
+            // For a StatefulSet, precompute the single ordinal eligible this
+            // tick (or None → hold). We evaluate readiness of each existing
+            // ordinal from the live container list using the STRONGEST signal
+            // available:
+            //   * if the pod's main container defines a readiness probe, we
+            //     require a passing probe (and, if a startup probe exists, that
+            //     startup has completed);
+            //   * otherwise we treat running + started (startup probe passed,
+            //     or no startup probe) as Ready.
+            // NB: `pod_health.ready` is never persisted and the readiness result
+            // in the §2c health loop is only logged, so we evaluate the probe
+            // live here rather than relying on stored state.
+            // NOTE: stable per-ordinal headless DNS (serviceName-based
+            // rk-<name>-<ord>.<svc> records) is still NOT wired — that is a
+            // separate, larger networking change and out of scope here.
+            let sts_next: Option<u32> = if dep.stateful {
+                let sts_prefix = format!("rk-{name}-");
+                let readiness = dep.containers.first().and_then(|c| c.readiness_probe.as_ref());
+                let startup = dep.containers.first().and_then(|c| c.startup_probe.as_ref());
+                let mut existing_ord: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                let mut ready_ord: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                for c in &managed {
+                    let cname = c.names.iter()
+                        .map(|n| n.trim_start_matches('/'))
+                        .find(|n| n.starts_with(&sts_prefix));
+                    let Some(cname) = cname else { continue };
+                    let Some(ord) = cname.rsplit('-').next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+                    existing_ord.insert(ord);
+                    if c.state != "running" { continue; }
+                    let started = startup.is_none() || desired.startup_ok.contains(cname);
+                    let is_ready = match readiness {
+                        Some(probe) => started && check_probe(&c.id[..12.min(c.id.len())], probe),
+                        None => started,
+                    };
+                    if is_ready { ready_ord.insert(ord); }
+                }
+                let decision = next_statefulset_ordinal(&existing_ord, &ready_ord, desired_count);
+                if decision.is_none() && (existing_ord.len() as u32) < desired_count {
+                    log.push(format!("  [statefulset] {name}: holding — previous ordinal not Ready yet"));
+                }
+                decision
+            } else {
+                None
+            };
 
             for i in 0..needed {
                 // Find next available name
                 let mut idx = if dep.stateful {
-                    (1..).find(|n| !all_names.contains(&format!("rk-{name}-{n}"))).unwrap_or(1)
+                    match sts_next {
+                        Some(o) => o,
+                        // Predecessor not Ready (or set complete) → create
+                        // nothing this tick; retry on the next reconcile.
+                        None => break,
+                    }
                 } else {
                     current + i + 1
                 };
@@ -4590,6 +4680,77 @@ fn write_lease_atomic(lease_path: &str, our_id: &str, now: u64) -> bool {
         return false;
     }
     std::fs::rename(&tmp, lease_path).is_ok()
+}
+
+#[cfg(test)]
+mod statefulset_ordering_tests {
+    use super::next_statefulset_ordinal;
+    use std::collections::HashSet;
+
+    fn set(items: &[u32]) -> HashSet<u32> {
+        items.iter().copied().collect()
+    }
+
+    #[test]
+    fn first_ordinal_creates_immediately_even_with_nothing_ready() {
+        // No pods exist yet; ordinal 1 (the first, no predecessor) is eligible.
+        let existing = set(&[]);
+        let ready = set(&[]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 3), Some(1));
+    }
+
+    #[test]
+    fn next_ordinal_blocked_while_predecessor_not_ready() {
+        // Ordinal 1 exists but is NOT ready → ordinal 2 must NOT be created.
+        let existing = set(&[1]);
+        let ready = set(&[]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 3), None);
+    }
+
+    #[test]
+    fn next_ordinal_eligible_once_predecessor_ready() {
+        // Ordinal 1 exists AND is ready → ordinal 2 becomes eligible.
+        let existing = set(&[1]);
+        let ready = set(&[1]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 3), Some(2));
+    }
+
+    #[test]
+    fn only_one_ordinal_per_tick() {
+        // Ordinals 1 & 2 ready — only the single next ordinal (3) is returned,
+        // never a batch. The Option return type enforces one-per-tick.
+        let existing = set(&[1, 2]);
+        let ready = set(&[1, 2]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 5), Some(3));
+    }
+
+    #[test]
+    fn deep_gate_third_ordinal_waits_on_second() {
+        // 1 ready, 2 exists but not ready → 3 is blocked on 2, not on 1.
+        let existing = set(&[1, 2]);
+        let ready = set(&[1]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 5), None);
+    }
+
+    #[test]
+    fn complete_set_creates_nothing() {
+        let existing = set(&[1, 2, 3]);
+        let ready = set(&[1, 2, 3]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 3), None);
+    }
+
+    #[test]
+    fn heals_lowest_hole_first_when_predecessor_ready() {
+        // Ordinal 2 crashed/removed (hole). 1 is ready → recreate 2 before 3.
+        let existing = set(&[1, 3]);
+        let ready = set(&[1, 3]);
+        assert_eq!(next_statefulset_ordinal(&existing, &ready, 3), Some(2));
+    }
+
+    #[test]
+    fn zero_desired_creates_nothing() {
+        assert_eq!(next_statefulset_ordinal(&set(&[]), &set(&[]), 0), None);
+    }
 }
 
 #[cfg(test)]
