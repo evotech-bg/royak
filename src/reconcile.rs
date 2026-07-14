@@ -2448,6 +2448,12 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
             for (_, pod) in crate::api::peer_pods() {
                 all_names.push(pod.trim_start_matches('/').to_string());
             }
+            // Also reserve names of pods just dispatched to peers but not yet
+            // visible in the census (async create + ~3s sampler lag) — else the
+            // next tick reuses the ordinal and two nodes get the same pod name.
+            for pod in pending_placement_names() {
+                all_names.push(pod);
+            }
 
             // StatefulSet: ordered startup — at most one new ordinal per tick,
             // and always the lowest missing one (rk-db-1 is recreated before
@@ -2830,18 +2836,14 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                 } // end container loop
             } // end pod loop
         } else if may_schedule && cluster_current > desired_count {
-            // Scale DOWN — remove this node's excess pods. We only delete LOCAL
-            // containers, so a peer's excess (rare: only after a cross-node grow
-            // then a shrink) is reported, not reclaimed — there is no
-            // delete-pod-on-peer path yet (v0.5). We never delete more than our
-            // local share, so the deployment is never taken below target.
+            // Scale DOWN — remove this deployment's excess pods cluster-wide.
+            // Delete LOCAL containers first; if excess remains on peers, ask the
+            // owning node to remove them (leader-driven). We never delete below
+            // target: victims are capped at the computed excess.
             let cluster_excess = cluster_current - desired_count;
-            let excess = cluster_excess.min(current);
+            let excess = cluster_excess.min(current); // deletable locally this tick
             log.push(format!("  [scale] {name}: {cluster_current} → {desired_count} (-{cluster_excess})"));
             pending_events.push(("Deployment".into(), name.clone(), "ScalingDown".into(), format!("{cluster_current} → {desired_count} (-{cluster_excess})"), "Normal".into()));
-            if cluster_excess > excess {
-                log.push(format!("  [scale] {name}: {} excess pod(s) live on peer node(s) — not reclaimed (cross-node scale-down is v0.5)", cluster_excess - excess));
-            }
 
             // StatefulSet scale-down removes the highest ordinal first
             // (K8s semantics); plain deployments keep Docker's order.
@@ -2873,6 +2875,29 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
                     log.push(format!("    [warn] rm {cname}: {e}"));
                 } else {
                     log.push(format!("    [remove] {cname} ✓"));
+                }
+            }
+            // Cross-node scale-down: any excess beyond what we could delete
+            // locally lives on peers — ask each owner to remove it. Victims come
+            // from the peer census (highest ordinal first, K8s-like).
+            let mut remaining = cluster_excess.saturating_sub(excess);
+            if remaining > 0 {
+                let dprefix = format!("rk-{name}-");
+                let ordinal = |pod: &str| pod.rsplit('-').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                let mut peer_victims: Vec<(String, String)> = crate::api::peer_pods().into_iter()
+                    .filter(|(_, pod)| pod.trim_start_matches('/').starts_with(&dprefix))
+                    .collect();
+                peer_victims.sort_by_key(|(_, pod)| std::cmp::Reverse(ordinal(pod.trim_start_matches('/'))));
+                for (addr, pod) in peer_victims.into_iter().take(remaining as usize) {
+                    let pod = pod.trim_start_matches('/').to_string();
+                    forget_placement(&pod);
+                    match delete_remote_pod(&addr, &pod) {
+                        Ok(_) => { log.push(format!("    [remove] {pod} on {addr} ✓ (cross-node)")); remaining -= 1; }
+                        Err(e) => log.push(format!("    [warn] remote rm {pod} on {addr}: {e}")),
+                    }
+                }
+                if remaining > 0 {
+                    log.push(format!("  [scale] {name}: {remaining} excess pod(s) not yet reclaimed — retry next tick", ));
                 }
             }
         } else {
@@ -5760,6 +5785,12 @@ fn pending_placements() -> &'static std::sync::Mutex<std::collections::HashMap<S
     P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Names of pods dispatched this session but maybe not yet in the census — used
+/// to reserve those names during scheduling so no two nodes get the same pod.
+pub fn pending_placement_names() -> Vec<String> {
+    pending_placements().lock().map(|g| g.keys().cloned().collect()).unwrap_or_default()
+}
+
 /// Record a pod the scheduler just placed (local OR routed) so the NEXT tick
 /// counts it before the census catches up — otherwise the leader re-schedules
 /// the same replica and over-provisions (`rk-web-5` appears).
@@ -5859,6 +5890,15 @@ pub fn find_pod_node(world: &DesiredWorld, pod_name: &str) -> Option<(String, St
 /// CLI helper: fetch a pod's logs from the peer that runs it (`/pods/<name>/log`).
 pub fn fetch_remote_logs(peer_addr: &str, pod_name: &str) -> Result<String, String> {
     http_get(&format!("http://{peer_addr}/api/v1/namespaces/default/pods/{pod_name}/log"), &[])
+}
+
+/// Ask a peer to remove one of its pods (leader-driven cross-node scale-down).
+pub fn delete_remote_pod(peer_addr: &str, pod_name: &str) -> Result<(), String> {
+    http_post(
+        &format!("http://{peer_addr}/royak/v1/delete-pod"),
+        &serde_json::json!({"pod": pod_name}).to_string(),
+        &[("Content-Type", "application/json")],
+    ).map(|_| ())
 }
 
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).

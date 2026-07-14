@@ -585,6 +585,36 @@ fn route_request(
             }
         }
 
+        // ─── Multi-node: remove a pod running on THIS node ───
+        // The leader POSTs here to scale down a deployment whose excess replica
+        // lives on a peer (its reconcile only deletes local containers).
+        ("POST", "/royak/v1/delete-pod") => {
+            let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            let pod = v["pod"].as_str().unwrap_or("").trim_start_matches('/').to_string();
+            if pod.is_empty() {
+                return (400, r#"{"kind":"Status","status":"Failure","message":"pod required","code":400}"#.to_string());
+            }
+            match docker::list_containers(true) {
+                Ok(containers) => {
+                    match containers.iter().find(|c| c.names.iter().any(|n| n.trim_start_matches('/') == pod)) {
+                        Some(c) => {
+                            let id = &c.id;
+                            docker::stop_container(id).ok();
+                            match docker::remove_container(id, true) {
+                                Ok(_) => {
+                                    eprintln!("  ✓ [multi-node] removed {pod} here (scale-down from leader)");
+                                    (200, serde_json::json!({"status":"ok","pod":pod}).to_string())
+                                }
+                                Err(e) => (500, serde_json::json!({"status":"error","pod":pod,"message":e}).to_string()),
+                            }
+                        }
+                        None => (404, serde_json::json!({"status":"ok","pod":pod,"message":"not here (already gone)"}).to_string()),
+                    }
+                }
+                Err(e) => (500, serde_json::json!({"status":"error","message":e}).to_string()),
+            }
+        }
+
         // ─── Multi-node: this node's running managed pods ───
         // Peers query this to count a deployment's replicas across the whole
         // cluster (so we don't over-provision or collide on pod names).

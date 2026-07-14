@@ -88,8 +88,8 @@ enum Commands {
     },
     /// Show logs for a pod (or --all for all pods, --deployment for deployment)
     Logs {
-        /// Pod name, "all", or deployment name
-        pod: String,
+        /// Pod name, "all", or deployment name (omit to list pods)
+        pod: Option<String>,
         #[arg(long, default_value = "20")]
         tail: u32,
         /// Show stderr only
@@ -1349,6 +1349,26 @@ fn main() {
         }
 
         Commands::Logs { pod, tail, stderr } => {
+            // No pod given — list what's available instead of erroring out.
+            let pod = match pod {
+                Some(p) => p,
+                None => {
+                    println!("  Usage: royak logs <pod|deployment|all> [--tail N] [--stderr]");
+                    let local = docker::list_containers(true).unwrap_or_default();
+                    let names: Vec<String> = local.iter()
+                        .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
+                        .filter_map(|c| c.names.first().map(|s| s.trim_start_matches('/').to_string()))
+                        .collect();
+                    if names.is_empty() {
+                        println!("  No pods on this node. Try 'royak get pods'.");
+                    } else {
+                        println!("\n  Pods on this node:");
+                        for n in &names { println!("    {n}"); }
+                        println!("\n  ('royak get pods' shows pods on peer nodes too.)");
+                    }
+                    return;
+                }
+            };
             let fetch_logs = |id: &str, tail: u32| -> Result<String, String> {
                 if stderr {
                     docker::get_stderr_logs(id, tail)
