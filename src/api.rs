@@ -1341,6 +1341,22 @@ async fn handle_request(
         });
     }
 
+    // ─── Raft leader gate: refuse mutations on a clustered follower ───
+    // Single-node / consensus-off ⇒ is_leader_or_off() == true ⇒ every write
+    // proceeds exactly as today (the live demo runs single-node → zero change).
+    // Only a clustered FOLLOWER is rejected, so followers can't diverge from the
+    // leader. Node-sync/heartbeat/demo/reads are excluded by is_gated_write.
+    // (This stops divergence; it does NOT yet replicate the leader's writes
+    // through the Raft log — that is the larger follow-up.)
+    if is_gated_write(method.as_str(), &path)
+        && !should_accept_write(crate::raft_node::is_leader_or_off().await)
+    {
+        let (leader, _me) = crate::raft_node::raft_status().await;
+        eprintln!("  ⛔ [raft] follower refused {} {} → not leader (leader: {:?})",
+            method.as_str(), mask_log_path(&path), leader);
+        return Ok(not_leader_response(leader));
+    }
+
     // ─── Admission webhooks: validate writes before they hit apply ───
     // (async because we POST an AdmissionReview to the webhook; route_request
     // is sync so this gate lives here.)
@@ -1693,6 +1709,88 @@ fn not_found_status(path: &str) -> String {
         "message": format!("resource not found: {path}"), "code": 404}).to_string()
 }
 
+// ─── Raft leader gate (clustered write path) ───────────────────────────────
+//
+// In a clustered deployment (`royak watch --node-id …`), followers must NOT
+// independently mutate their local `DesiredWorld` — two nodes accepting writes
+// concurrently diverge. Every mutating client request is gated on
+// `raft_node::is_leader_or_off()`: a clustered follower returns "not leader"
+// and the caller can retry against the named leader; the leader (and any
+// single-node / consensus-off process) proceeds exactly as before.
+//
+// SCOPE: this only STOPS followers from diverging. It does NOT yet replicate
+// the leader's accepted writes back through the Raft log — that log-replication
+// of the live write path is the larger follow-up. Followers still converge to
+// the leader's state via the existing `/royak/v1/state` sync, which is why the
+// sync + heartbeat + demo paths below are deliberately never gated.
+
+/// Pure gate DECISION: may this process accept a mutating write right now?
+/// `is_leader_or_off` is `raft_node::is_leader_or_off()` — TRUE when consensus
+/// is off (single-node) or when this node is the current Raft leader; FALSE
+/// only on a clustered follower. Kept as a trivial pure fn so the decision is
+/// unit-testable without a running Raft.
+pub(crate) fn should_accept_write(is_leader_or_off: bool) -> bool {
+    is_leader_or_off
+}
+
+/// Path classifier: is this request one of the clustered-gated K8s write paths?
+///
+/// Returns true ONLY for the mutating Kubernetes-API paths (create/apply,
+/// scale subresource, strategic-merge patch, delete). Deliberately excludes,
+/// so they keep working on a follower:
+///   • `/royak/v1/*` — node-sync (`/state`), heartbeat, cross-node scheduling
+///     (`/create-pod`) and the Raft consensus transport (`/raft/*`). State sync
+///     is HOW a follower receives the leader's writes — gating it would break
+///     convergence.
+///   • `/demo/*` — the sandboxed public demo controls.
+/// Reads (GET), watch and log streams never reach here (wrong method / handled
+/// earlier), so they are unaffected.
+pub(crate) fn is_gated_write(method: &str, path: &str) -> bool {
+    if path.starts_with("/royak/v1/") || path.starts_with("/demo/") {
+        return false;
+    }
+    // Matches the mutating arms of `route_request`.
+    let k8s_resource_target = path.contains("/namespaces/")
+        || path.ends_with("/pods")
+        || path.ends_with("/deployments")
+        || path.ends_with("/configmaps")
+        || path.ends_with("/secrets");
+    match method {
+        "POST" | "PUT" => {
+            k8s_resource_target
+                || (path.ends_with("/scale") && path.contains("/deployments/"))
+        }
+        "PATCH" => {
+            k8s_resource_target
+                || path.contains("/deployments/") // scale + strategic-merge patch
+                || path.starts_with("/api/v1/")
+                || path.starts_with("/apis/apps/v1/")
+        }
+        "DELETE" => path.starts_with("/api/v1/") || path.starts_with("/apis/apps/v1/"),
+        _ => false,
+    }
+}
+
+/// HTTP response returned to a client that hit a clustered FOLLOWER with a
+/// write. 421 Misdirected Request names the current leader (when known) so a
+/// client/peer can retry against it. Read paths are never sent here.
+fn not_leader_response(leader: Option<crate::raft_node::NeuroNodeId>) -> hyper::Response<BoxedBody> {
+    let leader_str = leader.map(|l| l.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let body = serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "reason": "NotLeader",
+        "message": format!(
+            "this node is a Raft follower; writes must be sent to the leader (node {leader_str})"
+        ),
+        "leader": leader,
+        "code": 421,
+    })
+    .to_string();
+    json_response(421, &body)
+}
+
 /// Minimal Swagger 2.0 / OpenAPI 2 spec. Retained for the day we decide
 /// to serve v2 (as JSON with a non-strict Accept negotiator, or as
 /// encoded Protobuf). Currently /openapi/v2 returns 404; kubectl uses v3.
@@ -1785,6 +1883,78 @@ fn openapi_v3_root() -> String {
             "apis/apps/v1": {"serverRelativeURL": "/openapi/v3/apis/apps/v1"},
         }
     }).to_string()
+}
+
+#[cfg(test)]
+mod leader_gate_tests {
+    use super::*;
+
+    // ─── Gate DECISION (pure) ───
+    // The whole point of the change: single-node / leader accept, follower reject.
+
+    #[test]
+    fn consensus_off_accepts_writes() {
+        // No Raft running ⇒ is_leader_or_off() == true ⇒ single-node unchanged.
+        assert!(should_accept_write(true));
+    }
+
+    #[test]
+    fn clustered_leader_accepts_writes() {
+        // On the leader is_leader_or_off() == true.
+        assert!(should_accept_write(true));
+    }
+
+    #[test]
+    fn clustered_follower_rejects_writes() {
+        // Only a clustered follower yields false — this is the divergence guard.
+        assert!(!should_accept_write(false));
+    }
+
+    // ─── Path classifier: which requests the gate applies to ───
+
+    #[test]
+    fn gates_mutating_k8s_writes() {
+        assert!(is_gated_write("POST", "/api/v1/namespaces/default/configmaps"));
+        assert!(is_gated_write("POST", "/apis/apps/v1/namespaces/default/deployments"));
+        assert!(is_gated_write("PUT", "/api/v1/namespaces/default/secrets/foo"));
+        // scale subresource
+        assert!(is_gated_write("PATCH", "/apis/apps/v1/namespaces/default/deployments/web/scale"));
+        assert!(is_gated_write("PUT", "/apis/apps/v1/namespaces/default/deployments/web/scale"));
+        // strategic-merge patch on a deployment
+        assert!(is_gated_write("PATCH", "/apis/apps/v1/namespaces/default/deployments/web"));
+        // deletes
+        assert!(is_gated_write("DELETE", "/api/v1/namespaces/default/pods/web-1"));
+        assert!(is_gated_write("DELETE", "/apis/apps/v1/namespaces/default/deployments/web"));
+    }
+
+    #[test]
+    fn never_gates_reads() {
+        assert!(!is_gated_write("GET", "/api/v1/namespaces/default/pods"));
+        assert!(!is_gated_write("GET", "/apis/apps/v1/namespaces/default/deployments/web/scale"));
+        assert!(!is_gated_write("HEAD", "/api/v1/namespaces"));
+    }
+
+    #[test]
+    fn never_gates_node_sync_heartbeat_or_consensus() {
+        // These are HOW a follower receives the leader's writes / stays live.
+        assert!(!is_gated_write("POST", "/royak/v1/state"));
+        assert!(!is_gated_write("POST", "/royak/v1/heartbeat"));
+        assert!(!is_gated_write("POST", "/royak/v1/create-pod"));
+        assert!(!is_gated_write("POST", "/royak/v1/raft/scale"));
+        assert!(!is_gated_write("POST", "/royak/v1/raft/append-entries"));
+    }
+
+    #[test]
+    fn never_gates_demo_sandbox() {
+        assert!(!is_gated_write("POST", "/demo/scale"));
+        assert!(!is_gated_write("POST", "/demo/kill"));
+    }
+
+    #[test]
+    fn not_leader_response_names_leader() {
+        let resp = not_leader_response(Some(2));
+        assert_eq!(resp.status(), 421);
+    }
 }
 
 #[cfg(test)]
