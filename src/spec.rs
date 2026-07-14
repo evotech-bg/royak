@@ -15,6 +15,11 @@ pub struct Resource {
     pub kind: String,
     pub metadata: Metadata,
     pub spec: Option<serde_yaml::Value>,
+    // ConfigMap/Secret carry their key/value map at the TOP level (data: /
+    // stringData:), not under .spec — which is where real kubectl manifests put it.
+    pub data: Option<serde_yaml::Value>,
+    #[serde(rename = "stringData")]
+    pub string_data: Option<serde_yaml::Value>,
     // K8s RBAC kinds carry these at the TOP level, not under .spec
     pub rules: Option<serde_yaml::Value>,
     pub subjects: Option<serde_yaml::Value>,
