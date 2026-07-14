@@ -581,6 +581,7 @@ mod tests {
             paused: false,
             idle_since: None,
             stateful: false,
+            owner_ref: None,
         });
     }
 
