@@ -903,6 +903,12 @@ fn main() {
                         Some((id.trim().parse::<u64>().ok()?, addr.trim().to_string()))
                     })
                     .collect();
+                // Federate the reconcile census with the same peers. Raft (below)
+                // only agrees on writes; the scheduler needs the peers in
+                // world.nodes to place pods cross-node. Runs in a background
+                // thread — it retries booting peers with lock-free HTTP.
+                let peer_addrs: Vec<String> = peer_list.iter().map(|(_, addr)| addr.clone()).collect();
+
                 let raft_world = Arc::clone(&world_arc);
                 let do_bootstrap = bootstrap;
                 rt.spawn(async move {
@@ -911,6 +917,14 @@ fn main() {
                         Err(e) => eprintln!("  [raft] failed to start node {nid}: {e}"),
                     }
                 });
+
+                if !peer_addrs.is_empty() {
+                    let census_world = Arc::clone(&world_arc);
+                    let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&reconcile::local_node_name()));
+                    std::thread::spawn(move || {
+                        reconcile::federate_with_peers(census_world, token_b64, peer_addrs);
+                    });
+                }
             }
 
             // Start autodiscovery if enabled

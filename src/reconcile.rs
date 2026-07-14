@@ -5042,6 +5042,41 @@ mod cascade_delete_tests {
         // The CR never existed, so no cascade runs — the orphan stays put.
         assert!(world.deployments.contains_key("web"));
     }
+
+    fn node(name: &str, addr: &str) -> ClusterNode {
+        ClusterNode {
+            name: name.into(), address: addr.into(),
+            cpu_capacity: 100.0, mem_capacity: 8.0, cpu_used: 0.0, mem_used: 0.0,
+            pod_count: 0, status: NodeStatus::Ready, last_heartbeat: 0,
+            neural_token: vec![], joined_at: 0,
+        }
+    }
+
+    // The primitive federate_with_peers relies on: pulling a peer's exported
+    // state and merging it must add the peer to our census WITH its advertised
+    // address (the scheduler POSTs cross-node pods to that address). Without the
+    // address landing, cross-node scheduling silently no-ops.
+    #[test]
+    fn merging_peer_state_federates_census_with_address() {
+        // Peer node2 exports its world (it knows only itself).
+        let mut peer = DesiredWorld::new();
+        peer.nodes.insert("node2".into(), node("node2", "192.168.5.3:6443"));
+        let peer_export = export_state(&peer);
+
+        // Our node1 census starts with only itself.
+        let mut local = DesiredWorld::new();
+        local.nodes.insert("node1".into(), node("node1", "192.168.5.1:6443"));
+
+        let log = merge_state(&mut local, &peer_export);
+
+        assert!(log.iter().any(|l| l.contains("node/node2")), "merge should report node2 added: {log:?}");
+        assert_eq!(local.nodes.len(), 2, "census federated to both nodes");
+        let n2 = local.nodes.get("node2").expect("node2 present after federation");
+        assert_eq!(n2.address, "192.168.5.3:6443", "peer's advertised address must survive the merge");
+        // Idempotent: merging the same export again must not duplicate or wipe.
+        merge_state(&mut local, &peer_export);
+        assert_eq!(local.nodes.len(), 2, "re-federation stays at two nodes");
+    }
 }
 
 // ─── UDP Autodiscovery: nodes find each other on the network ───
@@ -5526,6 +5561,61 @@ pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &
     }
 
     Ok(format!("{hostname} joined cluster via {peer_address} ({} nodes)", world.nodes.len()))
+}
+
+/// One-time startup federation for a clustered `watch` (`--node-id` + `--peers`).
+///
+/// `--peers` wires Raft consensus, but the reconcile **census** (`world.nodes`)
+/// is seeded only with the LOCAL node ([`register_local_node`]). Without this,
+/// each node's reconcile loop sees only itself, so cross-node scheduling never
+/// fires and `get nodes` shows one node per island — even though Raft agrees.
+///
+/// Here we handshake every peer's `/royak/v1/state`: pull it (learn the peer's
+/// real node name + advertised address via [`merge_state`]) and push ours back
+/// (so the peer's census learns us too). Once a peer lands in `world.nodes`, the
+/// per-tick heartbeat loop keeps it fresh. Peers may still be booting, so we
+/// retry the ones we can't reach yet. HTTP runs lock-free — we take the world
+/// lock only to snapshot our state and to merge a reply, never across a request
+/// (holding `world.write()` across a slow peer once stalled the whole node).
+pub fn federate_with_peers(
+    world: std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
+    token_b64: String,
+    peer_addrs: Vec<String>,
+) {
+    let auth = [("X-Royak-Token", token_b64.as_str())];
+    let push_hdrs = [("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")];
+    let mut pending = peer_addrs;
+    for _ in 0..30 {
+        if pending.is_empty() { break; }
+        // Snapshot our state under a brief read lock, then talk to peers lock-free.
+        let our_state = { export_state(&world.read().unwrap()).to_string() };
+        let mut still_pending = Vec::new();
+        for addr in pending {
+            match http_get(&format!("http://{addr}/royak/v1/state"), &auth) {
+                Ok(body) => {
+                    if let Ok(remote) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let merged = {
+                            let mut w = world.write().unwrap();
+                            merge_state(&mut w, &remote)
+                        };
+                        if !merged.is_empty() {
+                            println!("  ✓ [census] federated with peer {addr} ({} item(s))", merged.len());
+                        }
+                    }
+                    // Push ours so the peer's census learns us too (best-effort).
+                    let _ = http_post(&format!("http://{addr}/royak/v1/state"), &our_state, &push_hdrs);
+                }
+                Err(_) => still_pending.push(addr), // not up yet — retry
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() { break; }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    if !pending.is_empty() {
+        eprintln!("  ⚠ [census] {} peer(s) never reachable for federation: {}",
+            pending.len(), pending.join(", "));
+    }
 }
 
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).
