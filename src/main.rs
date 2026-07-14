@@ -949,6 +949,10 @@ fn main() {
             // ServiceLB — NodePort listeners (userspace, klipper-lb-style)
             rt.spawn(servicelb::run(Arc::clone(&world_arc)));
 
+            // Keep the container-stats cache warm off the reconcile thread, so a
+            // tick only peeks (never blocks on Docker's ~1-2s/container sampling).
+            docker::spawn_stats_sampler();
+
             // Server-side chaos monkey — when ROYAK_DEMO is on, reliably kill a
             // random pod of the chaos app (default demosite) every ~20s so the
             // self-heal is ALWAYS visible without a browser, clicks, or luck.
@@ -1189,6 +1193,8 @@ fn main() {
                 .expect("failed to create tokio runtime");
             // ServiceLB — NodePort listeners (userspace, klipper-lb-style)
             rt.spawn(servicelb::run(Arc::clone(&world_arc)));
+            // Keep the container-stats cache warm off the reconcile thread.
+            docker::spawn_stats_sampler();
             rt.block_on(api::serve(port, world_arc));
         }
 
