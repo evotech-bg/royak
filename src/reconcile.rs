@@ -3007,7 +3007,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
         })
         .collect();
     let stat_handles: Vec<_> = stat_targets.into_iter()
-        .map(|(name, short)| std::thread::spawn(move || (name, docker::container_stats(&short))))
+        .map(|(name, short)| std::thread::spawn(move || (name, docker::container_stats_peek(&short))))
         .collect();
     for h in stat_handles {
         // Skip on failure — don't poison baselines with 0.0.
@@ -3110,7 +3110,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
         // Check if all pods are idle (CPU < 1%)
         let all_idle = !running_pods.is_empty() && running_pods.iter().all(|c| {
             let short_id = &c.id[..12.min(c.id.len())];
-            docker::container_stats(short_id)
+            docker::container_stats_peek(short_id)
                 .map(|(cpu, _)| cpu < 1.0)
                 .unwrap_or(false)
         });
@@ -3211,7 +3211,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
             let avg_cpu = if running_count > 0 {
                 let total: f32 = managed.iter()
                     .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-                    .filter_map(|c| docker::container_stats(&c.id[..12.min(c.id.len())]).ok())
+                    .filter_map(|c| docker::container_stats_peek(&c.id[..12.min(c.id.len())]).ok())
                     .map(|(cpu, _)| cpu)
                     .sum();
                 total / running_count as f32
@@ -3740,7 +3740,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
             .map(|c| {
                 let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
                 let short_id = &c.id[..12.min(c.id.len())];
-                let (cpu, mem) = docker::container_stats(short_id).unwrap_or((0.0, 0.0));
+                let (cpu, mem) = docker::container_stats_peek(short_id).unwrap_or((0.0, 0.0));
                 crate::brain::PodState {
                     id: short_id.to_string(), name: name.to_string(),
                     node: "local".to_string(), status: crate::brain::PodStatus::Running,
@@ -4745,17 +4745,6 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
     let managed: Vec<&runtime::Container> = actual.iter()
         .filter(|c| c.name.contains("rk-"))
         .collect();
-
-    // Warm the per-container stats cache in ONE parallel pass up front. Several
-    // call-sites below (HPA average CPU, the demo snapshot, brain observation)
-    // read container_stats(); without this the first of them samples every
-    // container serially at Docker's ~1-2s/call, stretching the tick to ~N*2s
-    // and causing intermittent 502s. Parallel warm ≈ one sample's wall time.
-    let stat_ids: Vec<String> = managed.iter()
-        .filter(|c| c.state == ContainerState::Running)
-        .map(|c| c.id[..12.min(c.id.len())].to_string())
-        .collect();
-    crate::docker::prewarm_stats(&stat_ids);
 
     // Reflect THIS node's real pod count so pick_node penalises us correctly.
     // Without it our pod_count stays 0, we always win our own scheduling, and

@@ -608,42 +608,77 @@ pub fn get_stderr_logs(id: &str, tail: u32) -> Result<String, String> {
     docker_request("GET", &format!("/containers/{id}/logs?stdout=false&stderr=true&tail={tail}"), None)
 }
 
-/// Get real CPU and memory stats from a running container
+/// Module-level cache for container CPU/mem, shared by the fetching path
+/// (`container_stats`), the cache-only `container_stats_peek` used on the
+/// reconcile hot path, and the background sampler.
+fn stats_cache() -> &'static std::sync::Mutex<HashMap<String, ((f32, f32), std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ((f32, f32), std::time::Instant)>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+/// How long a sampled value stays valid. Generously larger than the sampler
+/// interval so a peek during a slow sampler pass still returns fresh-enough data.
+const STATS_TTL: Duration = Duration::from_secs(15);
+
+/// Get real CPU and memory stats for a container. Returns a cached value when
+/// fresh, otherwise makes Docker's ~1-2s `/stats` call and caches it. Used by
+/// the background sampler, one-shot CLI (`royak top`), and per-request API
+/// handlers. NOT for the reconcile tick — use `container_stats_peek` there so a
+/// slow sample can never stretch the tick.
 pub fn container_stats(id: &str) -> Result<(f32, f32), String> {
-    // Docker's /stats endpoint samples CPU for ~1-2s per call, and the reconcile
-    // loop asks for the same container's stats from several places each tick.
-    // Cache results briefly so one tick does at most one real fetch per
-    // container instead of 3-4 serial ones (which otherwise stall the API that
-    // shares the world lock). Freshness within a few seconds is plenty for
-    // display / HPA / the neural brain.
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-    static CACHE: OnceLock<Mutex<HashMap<String, ((f32, f32), Instant)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some((val, at)) = cache.lock().unwrap().get(id) {
-        if at.elapsed() < Duration::from_secs(8) {
+    if let Some((val, at)) = stats_cache().lock().unwrap().get(id) {
+        if at.elapsed() < STATS_TTL {
             return Ok(*val);
         }
     }
     let out = container_stats_uncached(id);
     if let Ok(v) = out {
-        cache.lock().unwrap().insert(id.to_string(), (v, Instant::now()));
+        stats_cache().lock().unwrap().insert(id.to_string(), (v, std::time::Instant::now()));
     }
     out
 }
 
-/// Warm the stats cache for many containers CONCURRENTLY. Docker samples each
-/// container's CPU for ~1-2s per `/stats` call; the reconcile tick has several
-/// call-sites that read stats, and the first one otherwise pays N*~1.8s walking
-/// containers one at a time (~11s for 6 pods) — stretching the whole tick and
-/// causing intermittent 502s. One parallel warm up front costs ~a single
-/// sample's wall time and turns every later container_stats() call into a cache
-/// hit for the next 8s.
-pub fn prewarm_stats(ids: &[String]) {
+/// Cache-only read — NEVER makes a Docker call, so it cannot stretch the
+/// reconcile tick. Returns the last sampled value if fresh, else Err ("no sample
+/// yet") which callers treat as "skip". The background sampler keeps it warm.
+pub fn container_stats_peek(id: &str) -> Result<(f32, f32), String> {
+    if let Some((val, at)) = stats_cache().lock().unwrap().get(id) {
+        if at.elapsed() < STATS_TTL {
+            return Ok(*val);
+        }
+    }
+    Err("stats not sampled yet".to_string())
+}
+
+/// Force-refresh stats for many containers CONCURRENTLY (always samples, updates
+/// the cache). One parallel pass instead of N serial ~1.8s samples. Used by the
+/// background sampler.
+pub fn refresh_stats(ids: &[String]) {
     let handles: Vec<_> = ids.iter().cloned()
-        .map(|id| std::thread::spawn(move || { let _ = container_stats(&id); }))
+        .map(|id| std::thread::spawn(move || {
+            if let Ok(v) = container_stats_uncached(&id) {
+                stats_cache().lock().unwrap().insert(id.clone(), (v, std::time::Instant::now()));
+            }
+        }))
         .collect();
     for h in handles { let _ = h.join(); }
+}
+
+/// Background thread that keeps the container-stats cache warm so the reconcile
+/// tick (which only peeks) never blocks on Docker's slow `/stats` sampling.
+/// Samples every ~4s; STATS_TTL (15s) comfortably covers the gap. Docker's
+/// per-container sampling was the last thing stretching the tick (and causing
+/// intermittent 502s under load) — moving it off the reconcile thread fixes it.
+pub fn spawn_stats_sampler() {
+    std::thread::spawn(|| loop {
+        let ids: Vec<String> = list_containers(false)
+            .map(|cs| cs.into_iter()
+                .filter(|c| c.state == "running" && c.names.iter().any(|n| n.contains("rk-")))
+                .map(|c| c.id[..12.min(c.id.len())].to_string())
+                .collect())
+            .unwrap_or_default();
+        if !ids.is_empty() { refresh_stats(&ids); }
+        std::thread::sleep(Duration::from_secs(4));
+    });
 }
 
 fn container_stats_uncached(id: &str) -> Result<(f32, f32), String> {

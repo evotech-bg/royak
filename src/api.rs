@@ -2884,7 +2884,7 @@ pub fn publish_demo_state(world: &DesiredWorld) {
         {
             let short = &c.id[..12.min(c.id.len())];
             let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-            let (cpu, mem) = docker::container_stats(short).unwrap_or((0.0, 0.0));
+            let (cpu, mem) = docker::container_stats_peek(short).unwrap_or((0.0, 0.0));
             pods.push(serde_json::json!({
                 "name": name, "cpu_raw": cpu, "memory_raw_mb": mem,
                 "cpu": format!("{:.1}%", cpu), "memory": format!("{:.0}Mi", mem),
