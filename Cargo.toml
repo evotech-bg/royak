@@ -39,3 +39,5 @@ anyerror = "0.1"
 opt-level = 3
 lto = true
 codegen-units = 1
+# Ship without symbol tables (panic messages keep file:line; backtraces lose names).
+strip = true

@@ -79,6 +79,90 @@ fn docker_request(method: &str, path: &str, body: Option<&str>) -> Result<String
     }
 }
 
+/// Read one HTTP/1.1 response, stopping when the message is complete
+/// (Content-Length reached, or the chunked terminator seen) instead of waiting
+/// for the peer to close the connection — dockerd does not always close
+/// promptly, and waiting for EOF stalled a reconcile tick for the whole read
+/// timeout (60s).
+fn read_http_response(stream: &mut UnixStream) -> Result<(u16, String), String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16384];
+    let complete = |buf: &[u8]| -> bool {
+        let Some(hpos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+        let head = String::from_utf8_lossy(&buf[..hpos]).to_ascii_lowercase();
+        let body = &buf[hpos + 4..];
+        if let Some(len) = head.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())) {
+            return body.len() >= len;
+        }
+        if head.contains("transfer-encoding: chunked") {
+            return body.ends_with(b"0\r\n\r\n");
+        }
+        // 204/304 or a status line only: no body follows.
+        head.starts_with("http/1.1 204") || head.starts_with("http/1.1 304")
+    };
+    loop {
+        if complete(&buf) { break; }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(format!("read failed: {e}")),
+        }
+    }
+    let resp_str = String::from_utf8_lossy(&buf).to_string();
+    let status: u16 = resp_str.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = match resp_str.find("\r\n\r\n") {
+        Some(pos) => {
+            let raw = &resp_str[pos + 4..];
+            if resp_str[..pos].to_ascii_lowercase().contains("transfer-encoding: chunked") { parse_chunked(raw) } else { raw.to_string() }
+        }
+        None => String::new(),
+    };
+    Ok((status, body))
+}
+
+/// Like `docker_request`, but fails on an HTTP error status (>= 400) instead
+/// of returning the error body as if it were a success.
+fn docker_request_checked(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    let mut stream = UnixStream::connect(docker_sock())
+        .map_err(|e| format!("Cannot connect to Docker: {e}. Is Docker running?"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let b = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+        b.len());
+    stream.write_all(request.as_bytes()).map_err(|e| format!("Write failed: {e}"))?;
+    let (status, body) = read_http_response(&mut stream).map_err(|e| format!("docker {method} {path}: {e}"))?;
+    if status >= 400 || status == 0 {
+        let msg = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| body.trim().to_string());
+        return Err(format!("docker {method} {path}: HTTP {status}: {msg}"));
+    }
+    Ok(body)
+}
+
+/// Start a container, failing on any Docker error.
+pub fn start_container_checked(id: &str) -> Result<(), String> {
+    docker_request_checked("POST", &format!("/containers/{id}/start"), None).map(|_| ())
+}
+
+/// Connect a container to a network with DNS aliases, failing on any error.
+pub fn connect_to_network_checked(container_id: &str, network: &str, aliases: &[&str]) -> Result<(), String> {
+    let body = serde_json::json!({
+        "Container": container_id,
+        "EndpointConfig": {"Aliases": aliases}
+    }).to_string();
+    docker_request_checked("POST", &format!("/networks/{network}/connect"), Some(&body)).map(|_| ())
+}
+
+/// Exit code of a stopped container (None if it is still running or unknown).
+pub fn container_exit_code(id: &str) -> Option<i64> {
+    let body = docker_request_checked("GET", &format!("/containers/{id}/json"), None).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    if v["State"]["Running"].as_bool() == Some(true) { return None; }
+    v["State"]["ExitCode"].as_i64()
+}
+
 fn parse_chunked(data: &str) -> String {
     let mut result = String::new();
     let mut remaining = data;
@@ -265,59 +349,119 @@ pub fn pull_image(image: &str) -> Result<(), String> {
     if image_exists_locally(image) {
         return Ok(());
     }
-    let (repo, tag) = if let Some(pos) = image.rfind(':') {
-        (&image[..pos], &image[pos+1..])
-    } else {
-        (image, "latest")
-    };
+    let (repo, tag) = split_image(image);
     println!("    pulling {repo}:{tag}...");
     let path = format!("/images/create?fromImage={}&tag={}", repo, tag);
 
     let mut stream = std::os::unix::net::UnixStream::connect(docker_sock())
         .map_err(|e| format!("Docker connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
-
-    let request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    let request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     stream.write_all(request.as_bytes()).map_err(|e| format!("Write: {e}"))?;
+    // The progress stream is chunked and ends when Docker is done — with
+    // success or with an `error` line; reading the framed response never
+    // waits for a timeout.
+    let (status, body) = read_http_response(&mut stream).map_err(|e| format!("Pull {repo}:{tag}: {e}"))?;
+    if status >= 400 {
+        return Err(format!("Pull {repo}:{tag}: HTTP {status}: {}", body.trim()));
+    }
+    if let Some(err) = pull_stream_error(&body) {
+        return Err(format!("Pull {repo}:{tag}: {err}"));
+    }
+    if image_exists_locally(image) {
+        println!("    pulled {repo}:{tag} ✓");
+        Ok(())
+    } else {
+        Err(format!("Pull {repo}:{tag}: image not available after pull"))
+    }
+}
 
-    let mut buf = [0u8; 4096];
-    let mut response = String::new();
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                // Check for errors first
-                if response.contains("no space left") || response.contains("No space left") {
-                    return Err(format!("Pull {repo}:{tag}: no disk space left"));
-                }
-                if response.contains("not found") || response.contains("manifest unknown") {
-                    return Err(format!("Pull {repo}:{tag}: image not found"));
-                }
-                if response.contains("unauthorized") || response.contains("denied") {
-                    return Err(format!("Pull {repo}:{tag}: access denied"));
-                }
-                // Check for success
-                if response.contains("Downloaded") || response.contains("Already exists")
-                    || response.contains("up to date") || response.contains("Pulled") {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(format!("Pull: {e}")),
+fn split_image(image: &str) -> (&str, &str) {
+    // A ':' after the last '/' is a tag; one before it is a registry port.
+    match image.rfind(':') {
+        Some(pos) if !image[pos..].contains('/') => (&image[..pos], &image[pos + 1..]),
+        _ => (image, "latest"),
+    }
+}
+
+/// The first `error` reported in Docker's JSON-lines pull progress stream.
+fn pull_stream_error(body: &str) -> Option<String> {
+    body.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find_map(|v| v.get("error").and_then(|e| e.as_str()).map(|e| e.to_string()))
+}
+
+/// Outcome of a non-blocking image check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageState {
+    Present,
+    /// A background pull is running.
+    Pulling,
+    /// The last pull failed; no new attempt before the backoff ends.
+    Failed(String),
+}
+
+static BACKGROUND_PULLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The long-running server pulls missing images in the background. One-shot
+/// CLI commands keep the blocking (bounded) pull: a background thread would
+/// die with the process and the image would never arrive.
+pub fn set_background_pulls(on: bool) {
+    BACKGROUND_PULLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Non-blocking IfNotPresent: callers that hold the desired-state lock (the
+/// reconcile tick) must never wait for a registry. A missing image is pulled
+/// on a background thread (one per image); a failed pull is retried with a
+/// growing backoff (10 s, doubling, max 5 min). Outside the server (see
+/// `set_background_pulls`) the pull runs inline instead.
+pub fn ensure_image_nonblocking(image: &str) -> ImageState {
+    use std::collections::HashMap;
+    if !BACKGROUND_PULLS.load(std::sync::atomic::Ordering::Relaxed) {
+        if image_exists_locally(image) {
+            return ImageState::Present;
+        }
+        return match pull_image(image) {
+            Ok(()) => ImageState::Present,
+            Err(msg) => ImageState::Failed(msg),
+        };
+    }
+    use std::time::Instant;
+    struct Entry { running: bool, failed: Option<(String, Instant, Duration)> }
+    static P: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Entry>>> = std::sync::OnceLock::new();
+    let pulls = P.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if image_exists_locally(image) {
+        if let Ok(mut p) = pulls.lock() { p.remove(image); }
+        return ImageState::Present;
+    }
+    let mut p = match pulls.lock() { Ok(p) => p, Err(e) => e.into_inner() };
+    let e = p.entry(image.to_string()).or_insert(Entry { running: false, failed: None });
+    if e.running {
+        return ImageState::Pulling;
+    }
+    if let Some((msg, at, backoff)) = &e.failed {
+        if at.elapsed() < *backoff {
+            return ImageState::Failed(msg.clone());
         }
     }
-
-    // Verify image actually exists after pull
-    let check = docker_request("GET", &format!("/images/{repo}:{tag}/json"), None);
-    match check {
-        Ok(body) if body.contains("Id") => {
-            println!("    pulled {repo}:{tag} ✓");
-            Ok(())
+    e.running = true;
+    let prev = e.failed.as_ref().map(|(_, _, b)| *b);
+    let img = image.to_string();
+    std::thread::spawn(move || {
+        let res = pull_image(&img);
+        let mut p = match pulls.lock() { Ok(p) => p, Err(e) => e.into_inner() };
+        if let Some(e) = p.get_mut(&img) {
+            e.running = false;
+            e.failed = match res {
+                Ok(()) => None,
+                Err(msg) => {
+                    eprintln!("  ✗ [image] {msg}");
+                    let next = prev.map(|b| (b * 2).min(Duration::from_secs(300))).unwrap_or(Duration::from_secs(10));
+                    Some((msg, Instant::now(), next))
+                }
+            };
         }
-        _ => Err(format!("Pull {repo}:{tag}: image not available after pull (disk full?)")),
-    }
+    });
+    ImageState::Pulling
 }
 
 /// Get container logs
@@ -358,11 +502,10 @@ pub fn ensure_network() -> Result<(), String> {
 
 /// Create a named Docker network (idempotent)
 pub fn ensure_named_network(name: &str) -> Result<(), String> {
-    let resp = docker_request("GET", &format!("/networks/{name}"), None);
-    if let Ok(r) = &resp {
-        if r.contains(name) && !r.contains("not found") {
-            return Ok(());
-        }
+    match docker_request_checked("GET", &format!("/networks/{name}"), None) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.contains("HTTP 404") => {}
+        Err(e) => return Err(e),
     }
     let body = serde_json::json!({
         "Name": name,
@@ -375,8 +518,14 @@ pub fn ensure_named_network(name: &str) -> Result<(), String> {
             "com.docker.network.bridge.enable_ip_masquerade": "true"
         }
     }).to_string();
-    docker_request("POST", "/networks/create", Some(&body))?;
-    Ok(())
+    // Checked: a failed create (e.g. Docker's address pools are exhausted)
+    // must surface here, not later as "network not found" at container start.
+    match docker_request_checked("POST", "/networks/create", Some(&body)) {
+        Ok(_) => Ok(()),
+        // Created concurrently by another caller.
+        Err(e) if e.contains("HTTP 409") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Create a per-namespace network: rk-{namespace}
@@ -1103,4 +1252,25 @@ pub fn poll_build(job: &str) -> BuildPoll {
 /// Forget a finished build job (call once its result has been consumed).
 pub fn clear_build(job: &str) {
     build_jobs().lock().unwrap().remove(job);
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use super::*;
+
+    #[test]
+    fn image_refs_split_tag_not_registry_port() {
+        assert_eq!(split_image("alpine:3.22"), ("alpine", "3.22"));
+        assert_eq!(split_image("alpine"), ("alpine", "latest"));
+        assert_eq!(split_image("reg.local:5000/team/app"), ("reg.local:5000/team/app", "latest"));
+        assert_eq!(split_image("reg.local:5000/team/app:v2"), ("reg.local:5000/team/app", "v2"));
+    }
+
+    #[test]
+    fn pull_progress_error_lines_are_failures() {
+        let ok = "{\"status\":\"Pulling from library/alpine\"}\r\n{\"status\":\"Digest: sha256:x\"}\r\n";
+        assert_eq!(pull_stream_error(ok), None);
+        let bad = "{\"status\":\"Pulling\"}\r\n{\"errorDetail\":{\"message\":\"no such host\"},\"error\":\"dial tcp: lookup zr.invalid: no such host\"}\r\n";
+        assert_eq!(pull_stream_error(bad).as_deref(), Some("dial tcp: lookup zr.invalid: no such host"));
+    }
 }
