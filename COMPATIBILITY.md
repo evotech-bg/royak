@@ -1,8 +1,10 @@
 # Royak ↔ Kubernetes: the honest compatibility ledger
 
 Every row below was **verified live** against `royak v0.4.0-beta.1` (2026-07-06) — by the CI
-suites (85 unit + 72 integration + multi-node + HA + mesh + ingress + load) or by hand with the
-commands shown. Nothing here is copied from wishes.
+suites or by hand with the commands shown. Rows on namespaces, auth/RBAC, durability, multi-node
+placement and Raft were re-verified on 2026-10-25 after the auth/persistence/consensus rework
+(`test-demo.sh`, `test-multinode.sh`, `test-raft-cluster.sh`, `test-ha-lease.sh`, run against
+real Docker). Nothing here is copied from wishes.
 
 Legend: ✅ works · 🟡 partial · ❌ not yet (→ [ROADMAP.md](ROADMAP.md))
 
@@ -27,6 +29,8 @@ Legend: ✅ works · 🟡 partial · ❌ not yet (→ [ROADMAP.md](ROADMAP.md))
 | Kubernetes native | Status | Verified behaviour |
 |---|---|---|
 | ConfigMap + `envFrom` | ✅ | Injected per-container; hot-reload triggers rolling restart |
+| `env[].valueFrom` (`configMapKeyRef` / `secretKeyRef`) | ✅ | Resolved at pod creation on whichever node runs the pod; a missing required key fails the pod create, `optional: true` skips it. Verified on pods placed by other nodes |
+| Container `command` + `args` | ✅ | `args` alone become the Docker `Cmd`; `command` maps to `Cmd` too (the image `ENTRYPOINT` is kept — differs from Kubernetes) |
 | Secret (encrypted at rest) | ✅ | AES-256-GCM on disk, `envFrom` injection |
 | PersistentVolume / PVC / StorageClass | ✅ | Provision → bind → real Docker bind-mounts, verified in-container |
 | `emptyDir` volumes | ✅ | Writable scratch mount, verified live |
@@ -52,14 +56,17 @@ Legend: ✅ works · 🟡 partial · ❌ not yet (→ [ROADMAP.md](ROADMAP.md))
 
 | Kubernetes native | Status | Verified behaviour |
 |---|---|---|
-| Namespaces | ✅ | Isolation via per-namespace Docker networks |
-| RBAC enforcement | 🟡 | Native `Role`/`ClusterRole`/`RoleBinding` accepted; the verb+resource+namespace check runs on API writes (subject GET 200 / POST 403 verified), plus Royak's own `RbacRole`. But the caller's role is **self-asserted** via the `x-royak-role` header (defaults to `admin`) and is **open-by-default** — it authorizes a stated role, it does not authenticate the caller |
+| Namespaces | ✅ | Every object is identified by namespace + name: the same name coexists in two namespaces, and scale/PATCH/delete in one never touch the other (verified with real traffic, across restart). A body namespace that differs from the URL's is rejected (400). Pods get per-namespace Docker networks |
+| Authentication | ✅ | Bearer tokens only (`ROYAK_TOKEN`, a `ROYAK_TOKEN_FILE` table of token/user/groups, or a generated `~/.royak/admin.token`). Anonymous calls get 401; `x-royak-role` grants nothing. Health endpoints and the opt-in demo sandbox stay public. `ROYAK_AUTH=insecure-dev` disables auth explicitly (with a warning). Tokens are never logged. No client-certificate or OIDC auth |
+| RBAC enforcement | ✅ | Deny-by-default, one central check for reads, list/watch, writes, scale, PATCH, delete, exec, logs and port-forward requests. Native `Role`/`ClusterRole`/`RoleBinding`/`ClusterRoleBinding` (users and groups) + built-in `view`/`edit`/`admin`/`cluster-admin`, plus Royak `RbacRole`. Verified via HTTP and kubectl: viewer reads 200 / writes 403; a namespace-bound deployer writes only in its namespace; multi-document bodies are authorized per document |
+| Node-to-node authentication | ✅ | Every inter-node request **and** response is HMAC-SHA256-signed with the shared `ROYAK_CLUSTER_SECRET` (method, path, timestamp ±30 s, nonce with replay cache, node name, body hash). Unsigned, forged, stale, replayed or re-targeted requests get 401; an admin bearer token is not a node identity. Request and response bodies are AES-256-GCM-sealed with a key derived from the same secret (unsealed bodies are refused). Peer mesh connections must be sealed |
 | ServiceAccount | 🟡 | Accepted as a manifest and usable as an RBAC subject via RoleBinding; no auto-mounted tokens (Royak pods get their own CA-signed identity cert + token injected as env, though these identities are not yet verified on the live path) |
 | Admission webhooks (validating) | ✅ | `ValidatingWebhookConfiguration` with `clientConfig.url` — Royak POSTs an AdmissionReview and honours allow/deny + failurePolicy. Verified live (allowed 201 / denied 403). No CA-bundle/mutating webhooks yet |
 
 ## kubectl
 
-Tested with kubectl **v1.36** against `royak api`:
+Tested with kubectl **v1.36** (v1.33 in the integration-suite sandbox) against `royak watch --tls` with a bearer token —
+kubectl does not send a token over plain HTTP:
 
 | Command | Status | Notes |
 |---|---|---|
@@ -72,7 +79,7 @@ Tested with kubectl **v1.36** against `royak api`:
 | `kubectl apply` (client-side) — update existing | ✅ | Full strategic-merge path: rich field schemas served, last-applied annotation stored and surfaced, partial patches merged server-side. `created` → `configured` verified live |
 | `kubectl scale` | ✅ | `/scale` subresource GET+PATCH; persisted before the ack |
 | `kubectl logs` | ✅ | Log subresource served from Docker logs |
-| `kubectl get events` | ✅ | Cluster events listed (timestamps are coarse) |
+| `kubectl get events` | 🟡 | Events (pod created, rollout, probe failures, back-off…) with RFC 3339 timestamps. Kept in the memory of the server that observed them — not persisted or replicated, gone after a restart. No server-side table, so the default view shows only NAME/AGE; use `-o custom-columns=…` or `-o json` |
 | `kubectl exec` (non-interactive) | ✅ | WebSocket channel protocol (v4/v5): stdout, stderr and exit status verified live with kubectl v1.36 |
 | `kubectl exec -i` / `-it` (interactive + TTY) | ✅ | Full duplex WebSocket bridge: stdin, TTY (verified `/dev/pts/0`), window resize. Verified live with kubectl v1.36 |
 | `kubectl port-forward` | 🟡 | kubectl 1.36 tunnels SPDY-over-WebSocket, which we don't decode; the clean `channel.k8s.io` WS path is served. Guaranteed path: **`royak port-forward <pod> <local>:<remote>`**, verified live (HTTP 200 through the tunnel). macOS reaches the pod via its published host port |
@@ -86,9 +93,11 @@ Tested with kubectl **v1.36** against `royak api`:
 | Startup probes | ✅ | Gate liveness until the pod reports started (K8s semantics), verified live |
 | CrashLoopBackOff | ✅ | Stops after 5 rapid failures, resets when healthy |
 | HPA | ✅ | Scales on real Docker CPU stats |
-| Graceful shutdown | ✅ | SIGTERM saves state atomically, containers preserved |
-| API write durability | ✅ | Mutations persisted to disk **before** the 201 ack (write-through); verified with kill -9 immediately after ack |
-| HA control plane (Raft) | 🟡 | openraft is integrated and exercised: real 3-node consensus over HTTP — election, replication through the leader, and leader failover verified live (`test-raft-cluster.sh`). In-process chaos test proves the invariant: partition to a minority → no quorum → writes do NOT commit; heal → commit resumes; no committed op lost across a leader kill. Enable with `--node-id`/`--peers`/`--bootstrap`. **Not yet the live write path:** normal `apply`/`scale`/reconcile writes still go through the single-writer file lease — only the dedicated `/royak/v1/raft/scale` endpoint currently proposes a command through consensus. Routing the reconcile write path through Raft is the v0.4 milestone |
+| Graceful shutdown | ✅ | SIGTERM/SIGINT stop the server within ~0.1 s (state is already durable); containers preserved |
+| API write durability | ✅ | One commit path for apply, PATCH, scale, delete and reconcile changes: atomic write + fsync **before** the ack; a failed write is an error (503 "change NOT applied"), never a silent success. Verified with SIGKILL right after the ack. Corrupt or unreadable state stops the server instead of starting an empty cluster; old state files are migrated with a `.v1.bak` backup |
+| Single writer per state file | ✅ | An exclusive lock held for the process life: a second server on the same file is a read-only standby (writes get 421, not applied) and takes over the moment the owner dies; offline CLI writes are refused while a server owns the state |
+| HA control plane (Raft) | 🟡 | openraft **is the live write path** in cluster mode (`--node-id`/`--peers`/`--bootstrap`): every desired-state change commits on a quorum before it is acknowledged; durable log and vote; snapshots with install on lagging nodes and restore from disk. Only a quorum-confirmed leader schedules. Verified through the public API (`test-raft-cluster.sh`): leader SIGKILL → new leader, writes and scale continue, restarted node catches up; a minority node answers 504 "outcome unknown" and schedules nothing; after heal all nodes agree and a retry succeeds; delete propagates (404 on every node); 200 writes while a follower is down → snapshot install → restart restores from disk. 🟡 because it is verified with three processes on **one host**, not across machines |
+| Multi-node placement + self-healing | 🟡 | One scheduler (the confirmed leader) places pods on any Ready node through signed RPC; the full workload contract travels (command/args, env + key refs, limits, ports, probes, namespace). Remote nodes refuse host-local volumes (409) and unavailable images (503). Killed pods and lost nodes are replaced without over-provisioning. Same one-host caveat; host-local volumes are not replicated |
 | Prometheus `/metrics` | ✅ | |
 | Dashboard | ✅ | Built-in web UI |
 | Traffic observability | ✅ | Flow tap on ServiceLB/ingress/mesh: source→service, bytes ↑↓, duration, top-talkers. `royak flows` / `GET /royak/v1/flows`. Metadata only (no payload capture). Verified live |

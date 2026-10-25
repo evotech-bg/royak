@@ -99,6 +99,8 @@ echo "────────────────────────�
 RO=$($BIN apply "$WORK/repo.yaml" 2>&1);      check "repository applies" "echo \"\$RO\" | grep -qi 'repository/bt'"
 PO=$($BIN apply "$WORK/pipeline.yaml" 2>&1);  check "pipeline applies"   "echo \"\$PO\" | grep -qi 'btpipe'"
 
+# Webhooks are API calls: they need a bearer token with pipelines/trigger.
+export ROYAK_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 $BIN watch --interval 2 --ingress-port 0 > /tmp/rk-buildtest.log 2>&1 &
 WPID=$!
 # Wait for the API server to be ready before firing the webhook (avoids a
@@ -111,7 +113,9 @@ done
 echo ""
 echo "2. Trigger build → deploy via webhook (single process)"
 echo "──────────────────────────────────────────────────────"
-WH=$(curl -s -X POST http://127.0.0.1:6443/hooks/repo/bt)
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:6443/hooks/repo/bt)
+check "webhook without a token is refused (401)" "[ '$C' = 401 ]"
+WH=$(curl -s -X POST -H "Authorization: Bearer $ROYAK_TOKEN" http://127.0.0.1:6443/hooks/repo/bt)
 check "webhook accepts trigger" "echo \"\$WH\" | grep -q '\"status\":\"ok\"'"
 
 # Poll for the true end state — the deployed container is up and serving — so the

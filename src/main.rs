@@ -24,6 +24,12 @@ mod consensus;
 mod raft_node;
 mod servicelb;
 mod flows;
+mod store;
+mod placement;
+mod workload;
+mod auth;
+mod persist;
+mod node_rpc;
 
 use brain::OrinBrain;
 use reconcile::DesiredWorld;
@@ -235,6 +241,10 @@ enum PipelineAction {
 
 fn main() {
     env_logger::init();
+    // Two rustls crypto backends end up in the dependency graph (ring, and
+    // aws-lc-rs via tokio-rustls defaults); without an explicit choice the
+    // first TLS handshake panics. Royak uses ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Optional: redirect output to log file (set ROYAK_LOG=/var/log/royak.log)
     if let Ok(log_path) = std::env::var("ROYAK_LOG") {
@@ -316,7 +326,7 @@ fn main() {
 
             // Reconcile immediately
             println!("\n  Reconciling...");
-            let log = reconcile::reconcile_once(&mut world, &mut brain);
+            let log = cli_reconcile(&state_path, &mut world, &mut brain);
             for line in &log {
                 println!("{line}");
             }
@@ -328,7 +338,7 @@ fn main() {
                 for tick in 0..max_ticks {
                     std::thread::sleep(std::time::Duration::from_secs(2));
 
-                    let log = reconcile::reconcile_once(&mut world, &mut brain);
+                    let log = cli_reconcile(&state_path, &mut world, &mut brain);
                     let relevant: Vec<&String> = log.iter()
                         .filter(|l| l.contains("[rollout]") || l.contains("[ready]") || l.contains("[scale]") || l.contains("[error]"))
                         .collect();
@@ -356,26 +366,31 @@ fn main() {
                     }
                     world.pending_rollouts.clear();
                     // Reconcile to fix state
-                    let log = reconcile::reconcile_once(&mut world, &mut brain);
+                    let log = cli_reconcile(&state_path, &mut world, &mut brain);
                     for line in &log { println!("{line}"); }
                 }
             }
 
-            save_state(&state_path, &world);
+            save_state(&state_path, &mut world);
         }
 
         Commands::Get { resource, output } => {
             // Single resource export: get deployment/web -o yaml
             if resource.contains('/') {
+                // kind/name (namespace default) or kind/namespace/name
                 let parts: Vec<&str> = resource.split('/').collect();
-                let (kind, name) = (parts[0], parts[1]);
+                let (kind, ns, name) = match parts.as_slice() {
+                    [k, n] => (*k, store::DEFAULT_NS, *n),
+                    [k, ns, n] => (*k, *ns, *n),
+                    _ => { eprintln!("  usage: royak get <kind>/<name> | <kind>/<namespace>/<name>"); std::process::exit(2); }
+                };
+                let key = store::obj_key(ns, name);
                 let world = load_state(&state_path);
 
                 let yaml_val: Option<serde_json::Value> = match kind {
-                    "deployment" | "deploy" => world.deployments.get(name).map(|d| {
-                        let containers = docker::list_containers(true).unwrap_or_default();
-                        let prefix = format!("rk-{name}-");
-                        let ready = containers.iter().filter(|c| c.names.iter().any(|n| n.contains(&prefix)) && c.state == "running").count();
+                    "deployment" | "deploy" => world.deployments.get(&key).map(|d| {
+                        let ready = cli_local_pods(&world).iter()
+                            .filter(|v| v.kind == "deployment" && v.namespace == ns && v.owner == name && v.ready).count();
                         serde_json::json!({
                             "apiVersion": "apps/v1", "kind": "Deployment",
                             "metadata": {"name": d.name, "namespace": d.namespace},
@@ -418,7 +433,7 @@ fn main() {
                             "status": {"replicas": d.replicas, "readyReplicas": ready}
                         })
                     }),
-                    "service" | "svc" => world.services.get(name).map(|s| serde_json::json!({
+                    "service" | "svc" => world.services.get(&key).map(|s| serde_json::json!({
                         "apiVersion": "v1", "kind": "Service",
                         "metadata": {"name": s.name, "namespace": s.namespace},
                         "spec": {
@@ -426,12 +441,12 @@ fn main() {
                             "ports": s.ports.iter().map(|p| serde_json::json!({"port": p.port, "targetPort": p.target_port, "protocol": p.protocol})).collect::<Vec<_>>()
                         }
                     })),
-                    "configmap" | "cm" => world.configmaps.get(name).map(|cm| serde_json::json!({
+                    "configmap" | "cm" => world.configmaps.get(&key).map(|cm| serde_json::json!({
                         "apiVersion": "v1", "kind": "ConfigMap",
                         "metadata": {"name": cm.name, "namespace": cm.namespace},
                         "data": cm.data
                     })),
-                    "secret" => world.secrets.get(name).map(|s| serde_json::json!({
+                    "secret" => world.secrets.get(&key).map(|s| serde_json::json!({
                         "apiVersion": "v1", "kind": "Secret",
                         "metadata": {"name": s.name, "namespace": s.namespace},
                         "data": s.data
@@ -456,7 +471,7 @@ fn main() {
                         }
                     }
                     None => {
-                        eprintln!("  {kind}/{name} not found");
+                        eprintln!("  {kind}/{name} not found in namespace {ns}");
                         std::process::exit(1);
                     }
                 }
@@ -465,8 +480,10 @@ fn main() {
                 "pods" | "pod" | "po" => {
                     match docker::list_containers(true) {
                         Ok(containers) => {
-                            let managed: Vec<&docker::DockerContainer> = containers.iter()
-                                .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
+                            let file_world = load_state(&state_path);
+                            let managed: Vec<&docker::DockerContainer> = reconcile::our_containers(&file_world, &containers)
+                                .into_iter()
+                                .filter(|c| c.labels.contains_key(store::LABEL_POD))
                                 .collect();
 
                             // Cluster-aware: also list pods running on peer nodes,
@@ -491,7 +508,10 @@ fn main() {
                                     println!("  {}", "─".repeat(70));
                                 }
                                 for c in &managed {
-                                    let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
+                                    let docker_name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
+                                    let ns = c.labels.get(store::LABEL_NAMESPACE).map(|s| s.as_str()).unwrap_or(store::DEFAULT_NS);
+                                    let name = if ns == store::DEFAULT_NS { docker_name.to_string() } else { format!("{ns}/{docker_name}") };
+                                    let name = name.as_str();
                                     if clustered {
                                         println!("  {:<20} {:<14} {:<22} {:<11} {}", name, me, c.image, c.state, c.status);
                                     } else {
@@ -516,13 +536,15 @@ fn main() {
                     } else {
                         println!("  {:<20} {:<25} {:<10} {:<10}", "NAME", "IMAGE", "READY", "REPLICAS");
                         println!("  {}", "─".repeat(70));
-                        // Query Docker for real running counts
-                        let containers = docker::list_containers(true).unwrap_or_default();
-                        for (name, dep) in &world.deployments {
-                            let prefix = format!("rk-{name}-");
-                            let ready = containers.iter()
-                                .filter(|c| c.names.iter().any(|n| n.contains(&prefix)) && c.state == "running")
+                        // Ready pods on this node, by namespace + owner label
+                        let local = cli_local_pods(&world);
+                        let mut deps: Vec<&reconcile::StoredDeployment> = world.deployments.values().collect();
+                        deps.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+                        for dep in deps {
+                            let ready = local.iter()
+                                .filter(|v| v.kind == "deployment" && v.namespace == dep.namespace && v.owner == dep.name && v.ready)
                                 .count();
+                            let name = if dep.namespace == store::DEFAULT_NS { dep.name.clone() } else { format!("{}/{}", dep.namespace, dep.name) };
                             println!("  {:<20} {:<25} {}/{:<7} {}", name, dep.image, ready, dep.replicas, dep.replicas);
                         }
                     }
@@ -659,10 +681,8 @@ fn main() {
                     println!("  Pipelines: {}", world.pipelines.len());
                     println!("  Repositories: {}", world.repositories.len());
                     println!("  Nodes: {}", world.nodes.len());
-                    if let Ok(containers) = docker::list_containers(false) {
-                        let managed = containers.iter().filter(|c| c.names.iter().any(|n| n.contains("rk-"))).count();
-                        println!("  Pods: {managed} running");
-                    }
+                    let running = cli_local_pods(&world).iter().filter(|v| v.running).count();
+                    println!("  Pods: {running} running on this node");
                 }
                 _ => {
                     println!("  Unknown resource: {resource}");
@@ -677,7 +697,8 @@ fn main() {
             let mut world = load_state(&state_path);
             let mut brain = OrinBrain::new(32, 4);
 
-            // Delete by YAML file: royak delete -f file.yaml
+            // Targets as (resource type, namespace, name).
+            let mut targets: Vec<(String, String, String)> = Vec::new();
             if resource == "-f" || resource.ends_with(".yaml") || resource.ends_with(".yml") {
                 let file = if resource == "-f" {
                     std::env::args().nth(3).unwrap_or_default()
@@ -687,101 +708,46 @@ fn main() {
                 match spec::parse_file(&file) {
                     Ok(resources) => {
                         for r in &resources {
-                            let name = &r.metadata.name;
-                            match r.kind.as_str() {
-                                "Deployment" => {
-                                    if let Some(dep) = world.deployments.get_mut(name.as_str()) {
-                                        dep.replicas = 0;
-                                    }
-                                    let log = reconcile::reconcile_once(&mut world, &mut brain);
-                                    for line in &log { println!("{line}"); }
-                                    world.delete(name);
-                                    println!("  ✓ deployment/{name} deleted");
-                                }
-                                "ConfigMap" => {
-                                    world.configmaps.remove(name.as_str());
-                                    println!("  ✓ configmap/{name} deleted");
-                                }
-                                "Secret" => {
-                                    world.secrets.remove(name.as_str());
-                                    println!("  ✓ secret/{name} deleted");
-                                }
-                                "Namespace" => {
-                                    delete_namespace(&mut world, name, &mut brain);
-                                }
-                                k => println!("  skip {k}/{name}"),
-                            }
-                        }
-                        save_state(&state_path, &world);
-                    }
-                    Err(e) => eprintln!("  Error: {e}"),
-                }
-                return;
-            }
-
-            // Delete by resource path: deployment/web, namespace/prod, etc.
-            let parts: Vec<&str> = resource.split('/').collect();
-            if parts.len() != 2 {
-                eprintln!("  Usage:");
-                eprintln!("    royak delete deployment/<name>");
-                eprintln!("    royak delete namespace/<name>");
-                eprintln!("    royak delete configmap/<name>");
-                eprintln!("    royak delete secret/<name>");
-                eprintln!("    royak delete <file.yaml>");
-                std::process::exit(1);
-            }
-
-            let (kind, name) = (parts[0], parts[1]);
-
-            match kind {
-                "deployment" | "deploy" => {
-                    if let Some(dep) = world.deployments.get_mut(name) {
-                        dep.replicas = 0;
-                    }
-                    println!("  Scaling down {name}...");
-                    let log = reconcile::reconcile_once(&mut world, &mut brain);
-                    for line in &log { println!("{line}"); }
-                    let removed_from_state = world.delete(name);
-                    // Also clean up any orphan Docker containers with this name
-                    let prefix = format!("rk-{name}-");
-                    let mut docker_cleaned = 0u32;
-                    if let Ok(containers) = docker::list_containers(true) {
-                        for c in containers.iter().filter(|c| c.names.iter().any(|n| n.contains(&prefix))) {
-                            docker::stop_container(&c.id).ok();
-                            docker::remove_container(&c.id, true).ok();
-                            docker_cleaned += 1;
+                            targets.push((r.kind.to_lowercase(), store::ns_of(r), r.metadata.name.clone()));
                         }
                     }
-                    if removed_from_state || docker_cleaned > 0 {
-                        println!("  ✓ deployment/{name} deleted ({docker_cleaned} containers removed)");
-                    } else {
-                        println!("  ✗ deployment/{name} not found");
+                    Err(e) => { eprintln!("  Error: {e}"); std::process::exit(1); }
+                }
+            } else {
+                // kind/name or kind/namespace/name
+                let parts: Vec<&str> = resource.split('/').collect();
+                match parts.as_slice() {
+                    [kind, name] => targets.push((kind.to_string(), store::DEFAULT_NS.to_string(), name.to_string())),
+                    [kind, ns, name] => targets.push((kind.to_string(), ns.to_string(), name.to_string())),
+                    _ => {
+                        eprintln!("  Usage:");
+                        eprintln!("    royak delete <kind>/<name>              (namespace default)");
+                        eprintln!("    royak delete <kind>/<namespace>/<name>");
+                        eprintln!("    royak delete -f <file.yaml>");
+                        std::process::exit(1);
                     }
                 }
-                "configmap" | "cm" => {
-                    if world.configmaps.remove(name).is_some() {
-                        println!("  ✓ configmap/{name} deleted");
-                    } else {
-                        println!("  ✗ configmap/{name} not found");
-                    }
-                }
-                "secret" => {
-                    if world.secrets.remove(name).is_some() {
-                        println!("  ✓ secret/{name} deleted");
-                    } else {
-                        println!("  ✗ secret/{name} not found");
-                    }
-                }
-                "namespace" | "ns" => {
-                    if name == "default" {
-                        eprintln!("  ✗ Cannot delete default namespace");
-                    } else {
-                        delete_namespace(&mut world, name, &mut brain);
-                    }
-                }
-                _ => eprintln!("  Unknown: {kind}. Use: deployment, configmap, secret, namespace"),
             }
-            save_state(&state_path, &world);
+            let mut failed = false;
+            let mut cleanup: Vec<String> = Vec::new();
+            for (kind, ns, name) in &targets {
+                let kind = match kind.as_str() { "deploy" => "deployment", "ns" => "namespace", k => k };
+                if kind == "namespace" && name == store::DEFAULT_NS {
+                    eprintln!("  ✗ Cannot delete default namespace");
+                    failed = true;
+                    continue;
+                }
+                match world.delete_resource(kind, ns, name) {
+                    Some(paths) => { cleanup.extend(paths); println!("  ✓ {kind}/{name} deleted (namespace {ns})"); }
+                    None => { eprintln!("  ✗ {kind}/{name} not found in namespace {ns}"); failed = true; }
+                }
+            }
+            save_state(&state_path, &mut world);
+            reconcile::cleanup_paths(&cleanup);
+            // Containers of deleted owners are garbage-collected by reconcile.
+            let log = cli_reconcile(&state_path, &mut world, &mut brain);
+            for line in &log { println!("{line}"); }
+            if failed { std::process::exit(1); }
         }
 
         Commands::Brain => {
@@ -858,6 +824,9 @@ fn main() {
         }
 
         Commands::Watch { interval, discover, tls, runtime, port, ingress_port, node_id, peers, bootstrap } => {
+            // Peers serve their API with the same --tls setting; node RPC follows it.
+            node_rpc::set_tls(tls);
+            docker::set_background_pulls(true);
             let use_neuropod = runtime == "neuropod";
             if use_neuropod {
                 println!("  ⚡ NeuroPod runtime [EXPERIMENTAL] — no Docker needed");
@@ -875,30 +844,51 @@ fn main() {
                 println!("  ✓ Brain loaded: {} train steps, loss={:.4}", brain.train_steps, brain.last_loss);
             }
 
-            // Single shared world for API + reconcile loop
-            let world_arc = Arc::new(RwLock::new(load_state(&state_path)));
+            // ── Identity, credentials and durability are fixed BEFORE anything
+            //    listens: no window where the API runs unauthenticated or a
+            //    write is acknowledged without a durable commit path.
+            let clustered = node_id.is_some();
+            let data_dir = reconcile::royak_data_dir();
+            let admin_token = match auth::init_user_auth(&data_dir) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("  ✗ [auth] {e}"); std::process::exit(2); }
+            };
+            if clustered {
+                if let Err(e) = auth::require_cluster_secret() {
+                    eprintln!("  ✗ [cluster] {e}");
+                    std::process::exit(2);
+                }
+            }
 
-            // Register local node (CLI --port overrides cluster config)
+            // Single shared world for API + reconcile loop. A corrupt or
+            // unsupported state file stops the process (load_state exits).
+            let world_arc = Arc::new(RwLock::new(load_state(&state_path)));
+            let api_port = port.unwrap_or_else(|| world_arc.read().unwrap().config.api_port);
             {
                 let mut w = world_arc.write().unwrap();
-                if let Some(p) = port {
-                    w.config.api_port = p;
-                }
-                let api_port = w.config.api_port;
+                w.nodes.clear(); // the node census is runtime-only; peers re-announce
                 reconcile::register_local_node(&mut w, &brain, api_port);
             }
 
-            let api_port = {
-                let w = world_arc.read().unwrap();
-                w.config.api_port
-            };
+            if clustered {
+                // Cluster: a quorum-committed Raft entry is the commit point.
+                // The local JSON file is only read once, as the bootstrap seed.
+                store::set_durability(store::Durability::Raft);
+                raft_node::CLUSTER_MODE.store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                store::set_durability(store::Durability::File { path: state_path.clone() });
+                match reconcile::try_take_ownership(&world_arc, &state_path) {
+                    Ok(true) => println!("  ✓ state owner: {state_path}"),
+                    Ok(false) => println!("  ⊘ {state_path} is owned by another Royak process — starting in standby (reads only; writes return 421, not applied)"),
+                    Err(e) => { eprintln!("  ✗ cannot own {state_path}: {e}"); std::process::exit(2); }
+                }
+            }
 
-            // Generate kubeconfig for kubectl
-            let hostname = std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("HOST"))
-                .unwrap_or_else(|_| "localhost".to_string());
-            let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&hostname));
-            generate_kubeconfig(api_port, &token_b64, tls);
+            // kubeconfig for kubectl, carrying the admin bearer token.
+            match &admin_token {
+                Some(t) => generate_kubeconfig(api_port, t, tls),
+                None => generate_kubeconfig(api_port, "insecure-dev", tls),
+            }
 
             // Tokio runtime for async API server + ingress
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -906,23 +896,9 @@ fn main() {
                 .build()
                 .expect("failed to create tokio runtime");
 
-            // Start async API server
-            let api_world = Arc::clone(&world_arc);
-            if tls {
-                rt.spawn(api::serve_https(api_port, api_world));
-            } else {
-                rt.spawn(api::serve(api_port, api_world));
-            }
-
-            // ── Raft consensus mode (opt-in) ──
-            // With --node-id + --peers, this node joins an openraft cluster.
-            // The live write path proposes commands through the leader; the
-            // file lease remains the single-node fallback when Raft is off.
+            // ── Raft consensus (--node-id + --peers) ──
             if let Some(nid) = node_id {
-                // Clustered: only the Raft leader schedules (see is_cluster_scheduler).
-                raft_node::CLUSTER_MODE.store(true, std::sync::atomic::Ordering::Release);
                 rt.spawn(raft_node::leadership_poller());
-
                 let peer_list: Vec<(u64, String)> = peers.split(',')
                     .filter(|s| !s.trim().is_empty())
                     .filter_map(|s| {
@@ -930,39 +906,47 @@ fn main() {
                         Some((id.trim().parse::<u64>().ok()?, addr.trim().to_string()))
                     })
                     .collect();
-                // Federate the reconcile census with the same peers. Raft (below)
-                // only agrees on writes; the scheduler needs the peers in
-                // world.nodes to place pods cross-node. Runs in a background
-                // thread — it retries booting peers with lock-free HTTP.
                 let peer_addrs: Vec<String> = peer_list.iter().map(|(_, addr)| addr.clone()).collect();
-
+                let raft_dir = std::path::PathBuf::from(format!("{state_path}.raft"));
+                // Only the bootstrap node offers its file state as the seed, and
+                // only into a brand-new cluster (generation 0).
+                // Every other node starts EMPTY and receives state only from
+                // the Raft log/snapshot — a stale local file is never served.
+                let seed = {
+                    let mut w = world_arc.write().unwrap();
+                    let file_state = w.to_state();
+                    let mut empty = DesiredWorld::new().to_state();
+                    empty.cluster_id = auth::derived_cluster_id().unwrap_or_else(|| file_state.cluster_id.clone());
+                    w.install_state(empty);
+                    if bootstrap { Some(file_state) } else { None }
+                };
                 let raft_world = Arc::clone(&world_arc);
                 let do_bootstrap = bootstrap;
-                rt.spawn(async move {
-                    match raft_node::build_http_node(nid, raft_world, &peer_list, do_bootstrap).await {
-                        Ok(()) => println!("  [raft] node {nid} joined (peers: {}, bootstrap: {do_bootstrap})", peer_list.len()),
-                        Err(e) => eprintln!("  [raft] failed to start node {nid}: {e}"),
+                let started = rt.block_on(raft_node::build_http_node(nid, raft_world, &peer_list, do_bootstrap, raft_dir.clone(), seed));
+                match started {
+                    Ok(()) => {
+                        raft_node::RAFT_READY.store(true, std::sync::atomic::Ordering::Release);
+                        println!("  [raft] node {nid} up (log: {}, peers: {}, bootstrap: {do_bootstrap})", raft_dir.display(), peer_list.len());
                     }
-                });
-
-                if !peer_addrs.is_empty() {
-                    let census_world = Arc::clone(&world_arc);
-                    let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&reconcile::local_node_name()));
-                    std::thread::spawn(move || {
-                        reconcile::federate_with_peers(census_world, token_b64, peer_addrs);
-                    });
-                    // Keep a cross-node pod census fresh so the leader counts
-                    // replicas cluster-wide (not just local) when scheduling.
-                    reconcile::spawn_peer_pod_sampler(Arc::clone(&world_arc));
+                    Err(e) => { eprintln!("  ✗ [raft] failed to start node {nid}: {e}"); std::process::exit(2); }
                 }
+                // Signed node census (heartbeats + pod inventory).
+                reconcile::spawn_cluster_census(Arc::clone(&world_arc), peer_addrs);
+            }
+
+            // Start async API server (after auth + durability are in place)
+            let api_world = Arc::clone(&world_arc);
+            if tls {
+                rt.spawn(api::serve_https(api_port, api_world));
+            } else {
+                rt.spawn(api::serve(api_port, api_world));
             }
 
             // Start autodiscovery if enabled
             if discover {
                 let disc_world = Arc::clone(&world_arc);
-                let disc_brain = OrinBrain::new(32, 4);
                 std::thread::spawn(move || {
-                    reconcile::autodiscovery(disc_world, &disc_brain, api_port);
+                    reconcile::autodiscovery(disc_world, api_port);
                 });
             }
 
@@ -987,7 +971,7 @@ fn main() {
             if node_id.is_some() {
                 let mesh_world = Arc::clone(&world_arc);
                 let mesh_node = reconcile::local_node_name();
-                rt.spawn(cluster_mesh::run_proxy(cluster_mesh::DEFAULT_MESH_PORT, mesh_node, mesh_world));
+                rt.spawn(cluster_mesh::run_proxy(cluster_mesh::DEFAULT_MESH_PORT, mesh_node, mesh_world, true));
             }
 
             // ServiceLB — NodePort listeners (userspace, klipper-lb-style)
@@ -1001,18 +985,26 @@ fn main() {
             // random pod of the chaos app (default demosite) every ~20s so the
             // self-heal is ALWAYS visible without a browser, clicks, or luck.
             if std::env::var("ROYAK_DEMO").map(|v| v == "1" || v == "true").unwrap_or(false) {
-                std::thread::spawn(|| {
+                let chaos_world = Arc::clone(&world_arc);
+                std::thread::spawn(move || {
                     let app = std::env::var("ROYAK_CHAOS_APP").unwrap_or_else(|_| "demosite".to_string());
-                    let prefix = format!("rk-{app}-");
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(20));
-                        let running: Vec<(String, String)> = docker::list_containers(false)
-                            .unwrap_or_default().into_iter()
-                            .filter(|c| c.state == "running"
-                                && c.names.iter().any(|n| n.trim_start_matches('/').starts_with(&prefix)))
-                            .filter_map(|c| c.names.first()
-                                .map(|n| (c.id.clone(), n.trim_start_matches('/').to_string())))
-                            .collect();
+                        // Only main containers of this cluster's own pods of the
+                        // chaos deployment (default namespace) — never anything
+                        // else on the host.
+                        let all = docker::list_containers(false).unwrap_or_default();
+                        let running: Vec<(String, String)> = {
+                            let w = chaos_world.read().unwrap_or_else(|e| e.into_inner());
+                            reconcile::our_containers(&w, &all).into_iter()
+                                .filter(|c| c.state == "running"
+                                    && c.labels.get(store::LABEL_DEPLOYMENT) == Some(&app)
+                                    && c.labels.get(store::LABEL_NAMESPACE).map(|s| s.as_str()).unwrap_or(store::DEFAULT_NS) == store::DEFAULT_NS
+                                    && c.labels.get(store::LABEL_ROLE).map(|r| r == "main").unwrap_or(true))
+                                .filter_map(|c| c.names.first()
+                                    .map(|n| (c.id.clone(), n.trim_start_matches('/').to_string())))
+                                .collect()
+                        };
                         if running.len() <= 1 { continue; } // always leave one serving
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -1044,15 +1036,9 @@ fn main() {
             let model = if model == "qwen2.5:32b" { world.config.llm_model.clone() } else { model };
 
             // Gather cluster state for context
-            let pods = docker::list_containers(false)
-                .map(|cs| cs.iter()
-                    .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
-                    .map(|c| {
-                        let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-                        format!("  {} ({}) [{}]", name, c.image, c.state)
-                    })
-                    .collect::<Vec<_>>().join("\n"))
-                .unwrap_or_default();
+            let pods = cli_local_pods(&world).iter()
+                .map(|v| format!("  {}/{} ({}) [{}]", v.namespace, v.pod, v.image, if v.running { "running" } else { "not running" }))
+                .collect::<Vec<_>>().join("\n");
 
             let deployments: Vec<String> = world.deployments.values()
                 .map(|d| format!("  {} ({}x {}, ns={})", d.name, d.replicas, d.image, d.namespace))
@@ -1129,7 +1115,7 @@ fn main() {
             match reconcile::invoke_function(&mut world, &name) {
                 Ok(result) => {
                     println!("  {result}");
-                    save_state(&state_path, &world);
+                    save_state(&state_path, &mut world);
                 }
                 Err(e) => eprintln!("  {e}"),
             }
@@ -1164,21 +1150,19 @@ fn main() {
 
             match action {
                 NodeAction::Join { peer, port } => {
-                    match reconcile::join_cluster(&mut world, &brain, &peer, port) {
-                        Ok(msg) => {
-                            println!("  ✓ {msg}");
-                            println!("  FP-TLS identity generated ✓");
-                            println!("  Brain weights synced ✓");
-                            save_state(&state_path, &world);
-                        }
-                        Err(e) => eprintln!("  ✗ {e}"),
-                    }
+                    // Membership is static and authenticated: start this node
+                    // with `watch --node-id <id> --peers <id@addr,...>` and the
+                    // shared ROYAK_CLUSTER_SECRET. State is never merged from a
+                    // peer outside Raft.
+                    let _ = (&mut world, &brain, port);
+                    eprintln!("  ✗ `node join` is removed: start the node with `royak watch --node-id <id> --peers <id@{peer},...>` and ROYAK_CLUSTER_SECRET set");
+                    std::process::exit(2);
                 }
                 NodeAction::List => {
                     if world.nodes.is_empty() {
                         // Auto-register local node
                         reconcile::register_local_node(&mut world, &brain, 6443);
-                        save_state(&state_path, &world);
+                        save_state(&state_path, &mut world);
                     }
                     println!("  {:<20} {:<22} {:<8} {:<8} {:<6} {}", "NAME", "ADDRESS", "CPU", "MEM", "PODS", "STATUS");
                     println!("  {}", "─".repeat(75));
@@ -1195,49 +1179,56 @@ fn main() {
                     println!("\n  {} node(s), FP-TLS secured", world.nodes.len());
                 }
                 NodeAction::Drain { name } => {
-                    if let Some(node) = world.nodes.get_mut(&name) {
-                        node.status = reconcile::NodeStatus::Draining;
-                        println!("  ✓ node/{name} draining (pods will be rescheduled)");
-                        save_state(&state_path, &world);
-                    } else {
-                        eprintln!("  ✗ node/{name} not found");
-                    }
+                    // Node status is runtime-only (rebuilt from signed
+                    // heartbeats), so editing it in a state file never reached
+                    // a running scheduler — refuse instead of pretending.
+                    eprintln!("  ✗ `node drain {name}` is not supported: cordon/drain is not implemented for a running cluster. Stop the node's royak process; its pods are rescheduled once its census report expires.");
+                    std::process::exit(2);
                 }
             }
         }
 
         Commands::Api { port } => {
-            let world = load_state(&state_path);
-            let world_arc = Arc::new(RwLock::new(world));
-            println!("  Starting K8s-compatible API server (async)...");
-            println!("  Try: kubectl --server=http://localhost:{port} get pods");
-            println!("  Try: kubectl --server=http://localhost:{port} get deployments");
-            println!("  Try: kubectl --server=http://localhost:{port} get namespaces\n");
+            // Single-node API server + reconcile loop: the same auth, ownership
+            // and commit contract as `watch`, without ingress/cluster extras.
+            docker::set_background_pulls(true);
+            let admin_token = match auth::init_user_auth(&reconcile::royak_data_dir()) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("  ✗ [auth] {e}"); std::process::exit(2); }
+            };
+            let world_arc = Arc::new(RwLock::new(load_state(&state_path)));
+            store::set_durability(store::Durability::File { path: state_path.clone() });
+            match reconcile::try_take_ownership(&world_arc, &state_path) {
+                Ok(true) => {}
+                Ok(false) => { eprintln!("  ✗ {state_path} is owned by another Royak process"); std::process::exit(3); }
+                Err(e) => { eprintln!("  ✗ {e}"); std::process::exit(2); }
+            }
+            {
+                let mut w = world_arc.write().unwrap();
+                w.nodes.clear();
+                reconcile::register_local_node(&mut w, &OrinBrain::new(32, 4), port);
+            }
+            match &admin_token {
+                Some(t) => generate_kubeconfig(port, t, false),
+                None => generate_kubeconfig(port, "insecure-dev", false),
+            }
+            println!("  Starting K8s-compatible API server on :{port} (kubeconfig: ~/.kube/royak.yaml)");
 
-            // Background reconcile loop — applies changes made via API
             let reconcile_world = world_arc.clone();
             let reconcile_state_path = state_path.clone();
             std::thread::spawn(move || {
                 let mut brain = OrinBrain::new(32, 4);
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    let mut w = reconcile_world.write().unwrap();
-                    let log = reconcile::reconcile_once(&mut w, &mut brain);
-                    for line in &log {
-                        if !line.contains("[ok]") { eprintln!("{line}"); }
-                    }
-                    save_state(&reconcile_state_path, &w);
-                }
+                reconcile::run_loop_shared_with_runtime(reconcile_world, &mut brain, 5, &reconcile_state_path, false);
+                // The loop returns only on SIGTERM/SIGINT (its handler replaced
+                // the default "terminate"); the API server must stop with it.
+                std::process::exit(0);
             });
 
-            // Async API server — blocks main thread
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime");
-            // ServiceLB — NodePort listeners (userspace, klipper-lb-style)
             rt.spawn(servicelb::run(Arc::clone(&world_arc)));
-            // Keep the container-stats cache warm off the reconcile thread.
             docker::spawn_stats_sampler();
             rt.block_on(api::serve(port, world_arc));
         }
@@ -1261,8 +1252,13 @@ fn main() {
                 Ok(c) => c,
                 Err(e) => { eprintln!("  ✗ docker: {e}"); return; }
             };
-            let Some(c) = containers.iter().find(|c| c.names.iter().any(|n| n.trim_start_matches('/') == pod)) else {
-                eprintln!("  ✗ pod {pod} not found");
+            let (pf_ns, pf_pod) = cli_pod_ref(&pod);
+            let pf_world = load_state(&state_path);
+            let Some(c) = reconcile::our_containers(&pf_world, &containers).into_iter().find(|c|
+                c.labels.get(store::LABEL_POD) == Some(&pf_pod)
+                && c.labels.get(store::LABEL_NAMESPACE).map(|s| s.as_str()).unwrap_or(store::DEFAULT_NS) == pf_ns
+                && c.labels.get(store::LABEL_ROLE).map(|r| r == "main").unwrap_or(true)) else {
+                eprintln!("  ✗ pod {pf_ns}/{pf_pod} not found on this node");
                 return;
             };
             let cid = c.id[..12.min(c.id.len())].to_string();
@@ -1312,7 +1308,8 @@ fn main() {
             let body = (|| -> Result<String, String> {
                 use std::io::{Read, Write};
                 let mut s = std::net::TcpStream::connect(&host_port).map_err(|e| format!("connect {host_port}: {e}"))?;
-                write!(s, "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+                let auth = cli_bearer().map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+                write!(s, "GET {path} HTTP/1.1\r\nHost: {host_port}\r\n{auth}Connection: close\r\n\r\n").map_err(|e| e.to_string())?;
                 let mut raw = String::new(); s.read_to_string(&mut raw).map_err(|e| e.to_string())?;
                 Ok(raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
             })();
@@ -1354,10 +1351,8 @@ fn main() {
                 Some(p) => p,
                 None => {
                     println!("  Usage: royak logs <pod|deployment|all> [--tail N] [--stderr]");
-                    let local = docker::list_containers(true).unwrap_or_default();
-                    let names: Vec<String> = local.iter()
-                        .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
-                        .filter_map(|c| c.names.first().map(|s| s.trim_start_matches('/').to_string()))
+                    let names: Vec<String> = cli_local_pods(&load_state(&state_path)).iter()
+                        .map(|v| if v.namespace == store::DEFAULT_NS { v.pod.clone() } else { format!("{}/{}", v.namespace, v.pod) })
                         .collect();
                     if names.is_empty() {
                         println!("  No pods on this node. Try 'royak get pods'.");
@@ -1378,118 +1373,97 @@ fn main() {
             };
             let stream_label = if stderr { " (stderr)" } else { "" };
 
-            if pod == "all" {
-                // Aggregate logs from ALL managed pods — no sidecar needed!
-                match docker::list_containers(false) {
-                    Ok(containers) => {
-                        let managed: Vec<&docker::DockerContainer> = containers.iter()
-                            .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
-                            .collect();
-                        for c in &managed {
-                            let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-                            if let Ok(logs) = fetch_logs(&c.id[..12], tail) {
-                                let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
-                                if !clean.trim().is_empty() {
-                                    println!("  ── {name}{stream_label} ──");
-                                    println!("{clean}");
-                                }
-                            }
-                        }
+            let world = load_state(&state_path);
+            let all_containers = match docker::list_containers(true) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("  Error: {e}"); return; }
+            };
+            let ours = reconcile::our_containers(&world, &all_containers);
+            let mains = |pred: &dyn Fn(&docker::DockerContainer) -> bool| -> Vec<&docker::DockerContainer> {
+                ours.iter().copied()
+                    .filter(|c| c.labels.contains_key(store::LABEL_POD)
+                        && c.labels.get(store::LABEL_ROLE).map(|r| r == "main").unwrap_or(true)
+                        && pred(c))
+                    .collect()
+            };
+            let ns_of = |c: &docker::DockerContainer| c.labels.get(store::LABEL_NAMESPACE).cloned().unwrap_or_else(|| store::DEFAULT_NS.to_string());
+            let print = |c: &docker::DockerContainer| {
+                let name = c.labels.get(store::LABEL_POD).cloned().unwrap_or_default();
+                if let Ok(logs) = fetch_logs(&c.id[..12.min(c.id.len())], tail) {
+                    let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
+                    if !clean.trim().is_empty() {
+                        println!("  ── {}/{name}{stream_label} ──", ns_of(c));
+                        println!("{clean}");
                     }
-                    Err(e) => eprintln!("  Error: {e}"),
                 }
+            };
+            if pod == "all" {
+                for c in mains(&|_| true) { print(c); }
             } else {
-                // Single pod logs
-                let full_name = if pod.starts_with("rk-") { pod.clone() } else { format!("rk-{pod}") };
-                // Check if it's a deployment name — show all pods
-                match docker::list_containers(true) {
-                    Ok(containers) => {
-                        let matching: Vec<&docker::DockerContainer> = containers.iter()
-                            .filter(|c| c.names.iter().any(|n| {
-                                let n = n.trim_start_matches('/');
-                                n == full_name || n.starts_with(&format!("{full_name}-"))
-                            }))
-                            .collect();
-                        if matching.len() > 1 {
-                            // Multiple pods — aggregate
-                            for c in &matching {
-                                let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-                                if let Ok(logs) = fetch_logs(&c.id[..12], tail) {
-                                    let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
-                                    if !clean.trim().is_empty() {
-                                        println!("  ── {name}{stream_label} ──");
-                                        println!("{clean}");
-                                    }
-                                }
+                // `ns/pod`, a pod name, or a deployment name (→ all its pods here).
+                let (ns, name) = cli_pod_ref(&pod);
+                let full_name = if name.starts_with("rk-") { name.clone() } else { format!("{}", store::pod_stem(&ns, &name)) };
+                let exact = mains(&|c| ns_of(c) == ns && c.labels.get(store::LABEL_POD) == Some(&full_name));
+                let by_owner = mains(&|c| ns_of(c) == ns && c.labels.get(store::LABEL_DEPLOYMENT) == Some(&name));
+                if !exact.is_empty() {
+                    for c in exact { print(c); }
+                } else if !by_owner.is_empty() {
+                    for c in by_owner { print(c); }
+                } else {
+                    // Not on this node — in a cluster the pod may live on a
+                    // peer. Find its owner and fetch the logs from there.
+                    match reconcile::find_pod_node(&world, &full_name).filter(|(_, _, pns)| *pns == ns) {
+                        Some((node, addr, pns)) => match reconcile::fetch_remote_logs(&addr, &pns, &full_name) {
+                            Ok(logs) => {
+                                let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
+                                println!("  ── {pns}/{full_name} (on {node}){stream_label} ──");
+                                println!("{clean}");
                             }
-                        } else if matching.len() == 1 {
-                            // Exactly one LOCAL pod — use its container id (get_logs
-                            // returns a 404 body as Ok, so decide by locality, not
-                            // by whether the fetch "errored").
-                            match fetch_logs(&matching[0].id[..12], tail) {
-                                Ok(logs) => {
-                                    let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
-                                    println!("{clean}");
-                                }
-                                Err(e) => eprintln!("  Error: {e}"),
-                            }
-                        } else {
-                            // Not on this node — in a cluster the pod may live on a
-                            // peer. Find its owner and fetch the logs from there.
-                            let world = load_state(&state_path);
-                            match reconcile::find_pod_node(&world, &full_name) {
-                                Some((node, addr)) => match reconcile::fetch_remote_logs(&addr, &full_name) {
-                                    Ok(logs) => {
-                                        let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
-                                        println!("  ── {full_name} (on {node}){stream_label} ──");
-                                        println!("{clean}");
-                                    }
-                                    Err(e) => eprintln!("  Pod '{full_name}' is on {node} but log fetch failed: {e}"),
-                                },
-                                None => eprintln!("  Pod '{full_name}' not found"),
-                            }
-                        }
+                            Err(e) => eprintln!("  Pod '{ns}/{full_name}' is on {node} but log fetch failed: {e}"),
+                        },
+                        None => eprintln!("  Pod '{ns}/{full_name}' not found"),
                     }
-                    Err(e) => eprintln!("  Error: {e}"),
                 }
             }
         }
 
         Commands::Wake { deployment } => {
-            let name = deployment.trim_start_matches("deployment/").trim_start_matches("deploy/");
+            let (ns, name) = cli_deployment_ref(&deployment);
             let mut world = load_state(&state_path);
             let mut brain = OrinBrain::new(32, 4);
 
-            if let Some(dep) = world.deployments.get_mut(name) {
+            if let Some(dep) = world.deployments.get_mut(&store::obj_key(&ns, &name)) {
                 if dep.paused {
                     dep.paused = false;
                     dep.idle_since = None;
                     println!("  ☀ Waking {name} ({} replicas)...", dep.replicas);
-                    let log = reconcile::reconcile_once(&mut world, &mut brain);
+                    let log = cli_reconcile(&state_path, &mut world, &mut brain);
                     for line in &log { println!("{line}"); }
-                    save_state(&state_path, &world);
+                    save_state(&state_path, &mut world);
                 } else {
                     println!("  {name} is not paused");
                 }
             } else {
-                eprintln!("  ✗ deployment '{name}' not found");
+                eprintln!("  ✗ deployment '{name}' not found in namespace {ns}");
+                std::process::exit(1);
             }
         }
 
         Commands::Scale { deployment, replicas } => {
-            let name = deployment.trim_start_matches("deployment/").trim_start_matches("deploy/");
+            let (ns, name) = cli_deployment_ref(&deployment);
             let mut world = load_state(&state_path);
             let mut brain = OrinBrain::new(32, 4);
 
-            if let Some(dep) = world.deployments.get_mut(name) {
+            if let Some(dep) = world.deployments.get_mut(&store::obj_key(&ns, &name)) {
                 let old = dep.replicas;
                 dep.replicas = replicas;
                 println!("  Scaling {name}: {old} → {replicas}");
-                let log = reconcile::reconcile_once(&mut world, &mut brain);
+                let log = cli_reconcile(&state_path, &mut world, &mut brain);
                 for line in &log { println!("{line}"); }
-                save_state(&state_path, &world);
+                save_state(&state_path, &mut world);
             } else {
-                eprintln!("  Deployment '{name}' not found");
+                eprintln!("  Deployment '{name}' not found in namespace {ns}");
+                std::process::exit(1);
             }
         }
 
@@ -1517,7 +1491,7 @@ fn main() {
 
                     let trigger = if has_pipeline { " (auto-trigger enabled)" } else { "" };
                     println!("  ✓ repository/{name} registered ({source}:{branch}){trigger}");
-                    save_state(&state_path, &world);
+                    save_state(&state_path, &mut world);
                 }
                 RepoAction::List => {
                     if world.repositories.is_empty() {
@@ -1540,7 +1514,7 @@ fn main() {
                 RepoAction::Remove { name } => {
                     if world.repositories.remove(&name).is_some() {
                         println!("  ✓ repository/{name} removed");
-                        save_state(&state_path, &world);
+                        save_state(&state_path, &mut world);
                     } else {
                         eprintln!("  ✗ repository/{name} not found");
                     }
@@ -1560,7 +1534,7 @@ fn main() {
                             // Execute stages immediately in a reconcile loop
                             let max_ticks = 60; // max 60 ticks (5 min with 5s interval)
                             for tick in 0..max_ticks {
-                                let log = reconcile::reconcile_once(&mut world, &mut brain);
+                                let log = cli_reconcile(&state_path, &mut world, &mut brain);
                                 let pipeline_lines: Vec<&String> = log.iter()
                                     .filter(|l| l.contains("[pipeline]") || l.contains("[start]") || l.contains("✓") || l.contains("✗"))
                                     .collect();
@@ -1577,7 +1551,7 @@ fn main() {
                                 }
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                             }
-                            save_state(&state_path, &world);
+                            save_state(&state_path, &mut world);
                         }
                         Err(e) => eprintln!("  ✗ {e}"),
                     }
@@ -1620,81 +1594,65 @@ fn main() {
         }
 
         Commands::Rollback { deployment } => {
-            let name = deployment.trim_start_matches("deployment/").trim_start_matches("deploy/");
+            let (ns, name) = cli_deployment_ref(&deployment);
+            let key = store::obj_key(&ns, &name);
             let mut world = load_state(&state_path);
             let mut brain = OrinBrain::new(32, 4);
-
-            // Try pending rollout first, then previous_image history
-            let rollback_image = if let Some(rollout) = world.pending_rollouts.get(name) {
-                Some(rollout.old_image.clone())
-            } else if let Some(dep) = world.deployments.get(name) {
-                dep.previous_image.clone()
-            } else {
-                None
+            let Some(dep) = world.deployments.get_mut(&key) else {
+                eprintln!("  ✗ deployment {ns}/{name} not found");
+                std::process::exit(1);
             };
-
-            if let Some(old_image) = rollback_image {
-                println!("  Rolling back {name} to {old_image}...");
-                let current_image;
-                let replicas;
-                if let Some(dep) = world.deployments.get_mut(name) {
-                    current_image = dep.image.clone();
-                    replicas = dep.replicas;
-                    dep.previous_image = Some(dep.image.clone());
-                    dep.image = old_image.clone();
-                    for c in &mut dep.containers { c.image = old_image.clone(); }
-                } else {
-                    eprintln!("  ✗ deployment {name} not found");
-                    std::process::exit(1);
-                }
-                // Create a rolling update to actually replace running containers
-                world.pending_rollouts.remove(name); // clear any existing
-                world.pending_rollouts.insert(name.to_string(), reconcile::RolloutState {
-                    old_image: current_image.clone(),
-                    new_image: old_image.clone(),
-                    total_replicas: replicas,
-                    old_pods: std::collections::VecDeque::new(),
-                    new_pods_created: 0,
-                });
-                // Drive the rollout to completion
-                for tick in 0..30 {
-                    let log = reconcile::reconcile_once(&mut world, &mut brain);
-                    for line in &log { println!("{line}"); }
-                    if world.pending_rollouts.is_empty() { break; }
-                    if tick < 29 { std::thread::sleep(std::time::Duration::from_secs(2)); }
-                }
-                world.record_event("Deployment", name, "RolledBack", &format!("Rolled back to {old_image}"), "Normal");
-                save_state(&state_path, &world);
-            } else {
-                eprintln!("  ✗ no rollback available for {name} (no previous image)");
+            let Some(old_image) = dep.previous_image.clone() else {
+                eprintln!("  ✗ no rollback available for {ns}/{name} (no previous image)");
+                std::process::exit(1);
+            };
+            // Changing the image changes the pod template hash, so the normal
+            // rolling update replaces the pods.
+            println!("  Rolling back {ns}/{name} to {old_image}...");
+            dep.previous_image = Some(dep.image.clone());
+            dep.image = old_image.clone();
+            if let Some(c) = dep.containers.first_mut() { c.image = old_image.clone(); }
+            world.record_event("Deployment", &key, "RolledBack", &format!("Rolled back to {old_image}"), "Normal");
+            // Drive the rollout to completion, like `apply` does.
+            for tick in 0..30 {
+                let log = cli_reconcile(&state_path, &mut world, &mut brain);
+                for line in &log { println!("{line}"); }
+                if world.pending_rollouts.is_empty() { break; }
+                if tick < 29 { std::thread::sleep(std::time::Duration::from_secs(2)); }
+            }
+            if !world.pending_rollouts.is_empty() {
+                eprintln!("  ✗ rollback of {ns}/{name} did not complete within 60s; the rollout continues on the next reconcile");
+                std::process::exit(1);
             }
         }
 
         Commands::Backup { file } => {
+            // A backup is the complete state in the same v2 format the server
+            // loads (secrets sealed with this node's secret key).
             let world = load_state(&state_path);
-            let state = reconcile::export_state(&world);
-            match std::fs::write(&file, serde_json::to_string_pretty(&state).unwrap_or_default()) {
-                Ok(_) => println!("  ✓ cluster state backed up to {file}"),
-                Err(e) => eprintln!("  ✗ backup failed: {e}"),
+            match persist::encode(&world.to_state(), &[]).and_then(|b| persist::atomic_write(&file, &b)) {
+                Ok(()) => println!("  ✓ cluster state backed up to {file}"),
+                Err(e) => { eprintln!("  ✗ backup failed: {e}"); std::process::exit(3); }
             }
         }
 
         Commands::Restore { file } => {
-            match std::fs::read_to_string(&file) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(remote) => {
-                            let mut world = load_state(&state_path);
-                            let log = reconcile::merge_state(&mut world, &remote);
-                            save_state(&state_path, &world);
-                            println!("  ✓ restored from {file}:");
-                            for line in &log { println!("    {line}"); }
-                        }
-                        Err(e) => eprintln!("  ✗ parse error: {e}"),
-                    }
-                }
-                Err(e) => eprintln!("  ✗ read error: {e}"),
-            }
+            // Restore REPLACES desired state with the backup (no merge), through
+            // the offline owner-locked save: refused while a server owns it.
+            let content = match std::fs::read_to_string(&file) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("  ✗ read error: {e}"); std::process::exit(3); }
+            };
+            let (state, _, _) = match persist::decode(&content) {
+                Ok(d) => d,
+                Err(e) => { eprintln!("  ✗ {file}: {e}"); std::process::exit(3); }
+            };
+            let mut world = load_state(&state_path);
+            let gen = world.generation;
+            world.install_state(state);
+            world.generation = gen;
+            save_state(&state_path, &mut world);
+            println!("  ✓ restored from {file} ({} deployments, {} namespaces)", world.deployments.len(), world.namespaces.len());
         }
 
         Commands::Demo => {
@@ -1722,65 +1680,13 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime");
-            rt.block_on(cluster_mesh::run_proxy(port, local_node, world_arc));
+            rt.block_on(cluster_mesh::run_proxy(port, local_node, world_arc, false));
         }
     }
 }
 
 // ─── Cascade delete ───
 
-fn delete_namespace(world: &mut DesiredWorld, ns: &str, brain: &mut OrinBrain) {
-    println!("  Deleting namespace/{ns} (cascade)...");
-
-    // Scale down all deployments in this namespace
-    let dep_names: Vec<String> = world.deployments.iter()
-        .filter(|(_, d)| d.namespace == ns)
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    for name in &dep_names {
-        if let Some(dep) = world.deployments.get_mut(name.as_str()) {
-            dep.replicas = 0;
-        }
-    }
-
-    // Reconcile to actually remove containers
-    if !dep_names.is_empty() {
-        let log = reconcile::reconcile_once(world, brain);
-        for line in &log { println!("{line}"); }
-    }
-
-    // Remove all resources in this namespace
-    let mut removed = 0;
-    for name in &dep_names {
-        world.deployments.remove(name.as_str());
-        removed += 1;
-        println!("    ✓ deployment/{name}");
-    }
-
-    let cm_names: Vec<String> = world.configmaps.iter()
-        .filter(|(_, c)| c.namespace == ns)
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in &cm_names {
-        world.configmaps.remove(name.as_str());
-        removed += 1;
-        println!("    ✓ configmap/{name}");
-    }
-
-    let secret_names: Vec<String> = world.secrets.iter()
-        .filter(|(_, s)| s.namespace == ns)
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in &secret_names {
-        world.secrets.remove(name.as_str());
-        removed += 1;
-        println!("    ✓ secret/{name}");
-    }
-
-    world.namespaces.retain(|n| n != ns);
-    println!("  ✓ namespace/{ns} deleted ({removed} resources removed)");
-}
 
 // ─── Kubeconfig generation ───
 
@@ -1815,7 +1721,8 @@ users:
     let kube_dir = format!("{home}/.kube");
     std::fs::create_dir_all(&kube_dir).ok();
     let path = format!("{kube_dir}/royak.yaml");
-    if std::fs::write(&path, &kubeconfig).is_ok() {
+    // The kubeconfig carries the admin bearer token: owner-only permissions.
+    if persist::atomic_write(&path, kubeconfig.as_bytes()).is_ok() {
         println!("  ✓ kubeconfig written to {path}");
         println!("    export KUBECONFIG={path}");
         println!("    kubectl get nodes");
@@ -1873,52 +1780,40 @@ fn get_secret_key() -> [u8; 32] {
     key
 }
 
-/// Encrypt a secret value for at-rest storage (AES-256-GCM, random nonce)
-fn encrypt_secret_value(plaintext: &str) -> String {
+/// Encrypt a secret value for at-rest storage (AES-256-GCM, random nonce).
+pub fn encrypt_secret_value(plaintext: &str) -> Result<String, String> {
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
     let key = get_secret_key();
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-    // Random nonce for each encryption (cryptographically secure)
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let mut nonce_bytes = [0u8; 12];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    match cipher.encrypt(nonce, plaintext.as_bytes()) {
-        Ok(ct) => {
-            let mut out = String::from("enc:");
-            for b in &nonce_bytes { out.push_str(&format!("{b:02x}")); }
-            for b in &ct { out.push_str(&format!("{b:02x}")); }
-            out
-        }
-        Err(_) => plaintext.to_string(),
-    }
+    let ct = cipher.encrypt(nonce, plaintext.as_bytes()).map_err(|_| "secret encryption failed".to_string())?;
+    let mut out = String::from("enc:");
+    for b in &nonce_bytes { out.push_str(&format!("{b:02x}")); }
+    for b in &ct { out.push_str(&format!("{b:02x}")); }
+    Ok(out)
 }
 
-/// Decrypt a secret value from at-rest storage
-fn decrypt_secret_value(stored: &str) -> String {
-    if !stored.starts_with("enc:") { return stored.to_string(); }
+/// Decrypt an at-rest secret value. Unlike the old reader this never hands
+/// the ciphertext back as if it were the value: a wrong key or tampered data
+/// is an error.
+pub fn decrypt_secret_value_strict(stored: &str) -> Result<String, String> {
+    let Some(hex) = stored.strip_prefix("enc:") else { return Ok(stored.to_string()) };
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
-    let hex = &stored[4..];
-    if hex.len() < 24 { return stored.to_string(); }
-    let key = get_secret_key();
+    if hex.len() < 24 + 32 || hex.len() % 2 != 0 { return Err("sealed value too short".into()); }
     let bytes: Vec<u8> = (0..hex.len()).step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i+2], 16).ok())
-        .collect();
-    if bytes.len() < 12 { return stored.to_string(); }
-    let nonce = Nonce::from_slice(&bytes[..12]);
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-    match cipher.decrypt(nonce, &bytes[12..]) {
-        Ok(pt) => String::from_utf8(pt).unwrap_or_else(|_| stored.to_string()),
-        Err(_) => stored.to_string(),
-    }
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "sealed value is not hex".to_string()))
+        .collect::<Result<_, _>>()?;
+    let key = get_secret_key();
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let pt = cipher.decrypt(Nonce::from_slice(&bytes[..12]), &bytes[12..])
+        .map_err(|_| "cannot decrypt (wrong secret key or tampered data)".to_string())?;
+    String::from_utf8(pt).map_err(|_| "decrypted value is not UTF-8".to_string())
 }
-
-/// Current on-disk state schema version. Increment when the JSON shape changes
-/// in a way older readers cannot handle. load_state warns on older versions
-/// (migration path) and aborts on newer (refuses downgrade).
-pub const STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Resolved state path for this process — set once at startup so the API
 /// layer can persist mutations write-through without threading the path
@@ -1930,287 +1825,14 @@ pub fn state_path() -> &'static str {
     STATE_PATH.get().map(|s| s.as_str()).unwrap_or(".royak-state.json")
 }
 
-pub fn save_state(path: &str, world: &DesiredWorld) {
-    let state = serde_json::json!({
-        "schemaVersion": STATE_SCHEMA_VERSION,
-        "manifests": world.manifests,
-        "namespaces": world.namespaces,
-        "deployments": world.deployments.values().map(|d| serde_json::json!({
-            "name": d.name, "namespace": d.namespace, "replicas": d.replicas,
-            "image": d.image, "previousImage": d.previous_image, "command": d.command, "env": d.env,
-            "paused": d.paused, "pauseAfterIdle": d.pause_after_idle, "stateful": d.stateful,
-            "ownerRef": d.owner_ref,
-            "containers": d.containers.iter().map(|c| {
-                let mut cj = serde_json::json!({
-                    "name": c.name, "image": c.image, "command": c.command, "env": c.env,
-                    "volumes": c.volumes.iter().map(|(h, p)| serde_json::json!({"host": h, "container": p})).collect::<Vec<_>>(),
-                });
-                if let Some(ref lp) = c.liveness_probe {
-                    cj["livenessProbe"] = serde_json::json!({"httpGet": lp.http_get, "exec": lp.exec, "initialDelay": lp.initial_delay_seconds, "period": lp.period_seconds, "failureThreshold": lp.failure_threshold});
-                }
-                if let Some(ref rp) = c.readiness_probe {
-                    cj["readinessProbe"] = serde_json::json!({"httpGet": rp.http_get, "exec": rp.exec, "initialDelay": rp.initial_delay_seconds, "period": rp.period_seconds, "failureThreshold": rp.failure_threshold});
-                }
-                if let Some(ref sp) = c.startup_probe {
-                    cj["startupProbe"] = serde_json::json!({"httpGet": sp.http_get, "exec": sp.exec, "initialDelay": sp.initial_delay_seconds, "period": sp.period_seconds, "failureThreshold": sp.failure_threshold});
-                }
-                cj
-            }).collect::<Vec<_>>(),
-            "initContainers": d.init_containers.iter().map(|c| serde_json::json!({
-                "name": c.name, "image": c.image, "command": c.command, "env": c.env,
-            })).collect::<Vec<_>>(),
-            "resourceLimits": d.resource_limits.as_ref().map(|r| serde_json::json!({
-                "cpuRequest": r.cpu_request, "cpuLimit": r.cpu_limit,
-                "memRequest": r.mem_request, "memLimit": r.mem_limit,
-            })),
-            "strategy": d.strategy.as_ref().map(|s| match s {
-                reconcile::DeployStrategy::RollingUpdate { max_surge, max_unavailable } =>
-                    serde_json::json!({"type": "RollingUpdate", "maxSurge": max_surge, "maxUnavailable": max_unavailable}),
-                reconcile::DeployStrategy::Canary { weight, .. } =>
-                    serde_json::json!({"type": "Canary", "weight": weight}),
-                reconcile::DeployStrategy::BlueGreen { active } =>
-                    serde_json::json!({"type": "BlueGreen", "active": active}),
-            }),
-        })).collect::<Vec<_>>(),
-        "daemonsets": world.daemonsets.values().map(|d| serde_json::json!({
-            "name": d.name, "namespace": d.namespace,
-            "container": {"name": d.container.name, "image": d.container.image, "command": d.container.command, "env": d.container.env},
-        })).collect::<Vec<_>>(),
-        "jobs": world.jobs.values().map(|j| serde_json::json!({
-            "name": j.name, "namespace": j.namespace, "completions": j.completions,
-            "container": {"name": j.container.name, "image": j.container.image, "command": j.container.command, "env": j.container.env},
-        })).collect::<Vec<_>>(),
-        "cronjobs": world.cronjobs.values().map(|c| serde_json::json!({
-            "name": c.name, "namespace": c.namespace, "schedule": c.schedule,
-            "lastRun": c.last_run,
-            "container": {"name": c.container.name, "image": c.container.image, "command": c.container.command, "env": c.container.env},
-        })).collect::<Vec<_>>(),
-        "hpas": world.hpas.values().map(|h| serde_json::json!({
-            "name": h.name, "deployment": h.deployment, "min": h.min_replicas, "max": h.max_replicas, "cpu": h.target_cpu,
-        })).collect::<Vec<_>>(),
-        "services": world.services.values().map(|s| serde_json::json!({
-            "name": s.name, "namespace": s.namespace, "type": s.service_type,
-            "selector": s.selector,
-            "ports": s.ports.iter().map(|p| serde_json::json!({"port": p.port, "targetPort": p.target_port, "protocol": p.protocol, "nodePort": p.node_port})).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "ingresses": world.ingresses.values().map(|i| serde_json::json!({
-            "name": i.name, "namespace": i.namespace, "ingressClassName": i.ingress_class,
-            "rules": i.rules.iter().map(|r| serde_json::json!({
-                "host": r.host, "paths": r.paths.iter().map(|p| serde_json::json!({"path": p.path, "service": p.service, "port": p.port})).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "network_policies": world.network_policies.values().map(|n| serde_json::json!({
-            "name": n.name, "namespace": n.namespace, "selector": n.pod_selector,
-            "ingress_allow": n.ingress_allow, "egress_allow": n.egress_allow,
-            "ingress_ports": n.ingress_ports, "egress_ports": n.egress_ports,
-            "internal": n.internal, "mtls": n.mtls_required, "denyAll": n.deny_all,
-        })).collect::<Vec<_>>(),
-        "resource_quotas": world.resource_quotas.values().map(|q| serde_json::json!({
-            "name": q.name, "namespace": q.namespace,
-            "cpu": q.hard_cpu, "memory": q.hard_memory,
-            "pods": q.hard_pods, "services": q.hard_services,
-            "configmaps": q.hard_configmaps, "secrets": q.hard_secrets,
-        })).collect::<Vec<_>>(),
-        "configmaps": world.configmaps.values().map(|c| serde_json::json!({
-            "name": c.name, "namespace": c.namespace, "data": c.data,
-        })).collect::<Vec<_>>(),
-        "secrets": world.secrets.values().map(|s| {
-            // Encrypt secret values at rest with AES-256-GCM
-            let encrypted_data: std::collections::HashMap<String, String> = s.data.iter()
-                .map(|(k, v)| (k.clone(), encrypt_secret_value(v)))
-                .collect();
-            serde_json::json!({
-                "name": s.name, "namespace": s.namespace,
-                "data": encrypted_data, "encrypted": true,
-            })
-        }).collect::<Vec<_>>(),
-        "pvs": world.pvs.values().map(|p| {
-            let status = match p.status { reconcile::PVStatus::Available => "Available", reconcile::PVStatus::Bound => "Bound", reconcile::PVStatus::Released => "Released" };
-            serde_json::json!({
-                "name": p.name, "capacity": p.capacity, "class": p.storage_class,
-                "path": p.host_path, "access": p.access_mode,
-                "status": status, "boundTo": p.bound_to,
-            })
-        }).collect::<Vec<_>>(),
-        "pvcs": world.pvcs.values().map(|p| serde_json::json!({
-            "name": p.name, "namespace": p.namespace, "class": p.storage_class,
-            "requested": p.requested, "access": p.access_mode, "bound": p.bound_pv,
-        })).collect::<Vec<_>>(),
-        "pipelines": world.pipelines.values().map(|p| serde_json::json!({
-            "name": p.name,
-            "triggers": p.triggers.iter().map(|t| serde_json::json!({"type": t.trigger_type, "path": t.path})).collect::<Vec<_>>(),
-            "stages": p.stages.iter().map(|s| serde_json::json!({
-                "name": s.name, "image": s.image, "command": s.command,
-                "action": s.action, "file": s.file, "artifacts": s.artifacts,
-                "context": s.context, "dockerfile": s.dockerfile, "tag": s.tag,
-                "args": s.build_args.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v})).collect::<Vec<_>>(),
-                "dependsOn": s.depends_on, "env": s.env,
-                "if": s.if_condition, "matrixImages": s.matrix_images,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "config": serde_json::json!({
-            "llm": {"host": world.config.llm_host, "model": world.config.llm_model, "temperature": world.config.llm_temperature},
-            "alerts": {"webhook": world.config.alert_webhook, "onAnomaly": world.config.alert_on_anomaly, "onRestart": world.config.alert_on_restart},
-            "runtime": world.config.runtime,
-            "pause": {"defaultIdle": world.config.pause_default_idle, "enabled": world.config.pause_enabled},
-            "api": {"port": world.config.api_port},
-        }),
-        "functions": world.functions.values().map(|f| serde_json::json!({
-            "name": f.name, "image": f.image, "command": f.command,
-            "httpTriggers": f.http_triggers, "webhookTriggers": f.webhook_triggers,
-            "scheduleTriggers": f.schedule_triggers,
-            "timeout": f.timeout_secs, "memory": f.memory_mb,
-            "invocations": f.invocations, "code": f.code,
-        })).collect::<Vec<_>>(),
-        "repositories": world.repositories.values().map(|r| serde_json::json!({
-            "name": r.name, "url": r.url, "path": r.path, "branch": r.branch,
-            "secretRef": r.secret_ref, "pipeline": r.pipeline, "lastCommit": r.last_commit,
-        })).collect::<Vec<_>>(),
-        "nodes": world.nodes.values().map(|n| {
-            let status = match n.status { reconcile::NodeStatus::Ready => "Ready", reconcile::NodeStatus::NotReady => "NotReady", reconcile::NodeStatus::Draining => "Draining" };
-            serde_json::json!({
-                "name": n.name, "address": n.address, "status": status,
-                "cpuCapacity": n.cpu_capacity, "memCapacity": n.mem_capacity,
-                "cpuUsed": n.cpu_used, "memUsed": n.mem_used,
-                "podCount": n.pod_count, "joinedAt": n.joined_at,
-            })
-        }).collect::<Vec<_>>(),
-        "rbac_roles": world.rbac_roles.values().map(|r| serde_json::json!({
-            "name": r.name,
-            "rules": r.rules.iter().map(|rule| serde_json::json!({
-                "resources": rule.resources, "verbs": rule.verbs, "namespaces": rule.namespaces,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "guards": world.guards.values().map(|g| serde_json::json!({
-            "name": g.name,
-            "rules": g.rules.iter().map(|r| serde_json::json!({
-                "when": r.when, "action": r.action, "params": r.params,
-            })).collect::<Vec<_>>(),
-            "hooks": g.hooks,
-        })).collect::<Vec<_>>(),
-        "operators": world.operators.values().map(|o| serde_json::json!({
-            "name": o.name, "customKind": o.custom_kind,
-            "provision": o.provision.iter().map(|c| serde_json::json!({
-                "role": c.role, "image": c.image, "replicas": c.replicas, "env": c.env,
-            })).collect::<Vec<_>>(),
-            "hooks": o.hooks,
-        })).collect::<Vec<_>>(),
-        "custom_resources": world.custom_resources.values().map(|cr| serde_json::json!({
-            "name": cr.name, "kind": cr.kind, "namespace": cr.namespace,
-            "spec": cr.spec,
-            "status": match cr.status { reconcile::CRStatus::Pending => "Pending", reconcile::CRStatus::Provisioning => "Provisioning", reconcile::CRStatus::Running => "Running", reconcile::CRStatus::Failed => "Failed" },
-        })).collect::<Vec<_>>(),
-        "admission_webhooks": world.admission_webhooks.values().map(|h| serde_json::json!({
-            "name": h.name, "url": h.url, "kinds": h.kinds, "failurePolicy": h.failure_policy,
-        })).collect::<Vec<_>>(),
-    });
-    let json = serde_json::to_string_pretty(&state).unwrap_or_default();
-
-    // ── Neural state: save as binary weight matrix ──
-    let neural_path = format!("{path}.nrns");
-    let mut ns = neural_state::NeuralState::new();
-    // Full state for fast reconstruction
-    ns.set("_full".to_string(), json.as_bytes().to_vec());
-    // Individual resources for neural search (brain can query via matmul)
-    if let Some(obj) = state.as_object() {
-        for (section, val) in obj {
-            if let Some(arr) = val.as_array() {
-                for item in arr {
-                    if let Some(name) = item["name"].as_str() {
-                        let ns_str = item["namespace"].as_str().unwrap_or("default");
-                        let key = format!("{section}/{ns_str}/{name}");
-                        ns.set(key, serde_json::to_vec(item).unwrap_or_default());
-                    }
-                }
-            }
-        }
-    }
-    if ns.save(&neural_path).is_ok() {
-        eprintln!("  [neural] state saved: {}", ns.stats());
-    }
-
-    // ── JSON backup (human-readable) ──
-    let lock_path = format!("{path}.lock");
-    let lock_file = std::fs::OpenOptions::new().create(true).write(true).open(&lock_path);
-    if let Ok(ref lock) = lock_file {
-        #[cfg(unix)]
-        unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(lock), libc::LOCK_EX); }
-    }
-    // State may reference secrets/tokens — keep it owner-only (0600).
-    let tmp_path = format!("{path}.tmp");
-    let tmp_written = {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true).create(true).truncate(true).mode(0o600)
-                .open(&tmp_path)
-                .and_then(|mut f| f.write_all(json.as_bytes()))
-                .is_ok()
-        }
-        #[cfg(not(unix))]
-        { std::fs::write(&tmp_path, &json).is_ok() }
-    };
-    if tmp_written {
-        if std::fs::rename(&tmp_path, path).is_err() {
-            std::fs::write(path, &json).ok();
-        }
-    } else {
-        std::fs::write(path, &json).ok();
-    }
-    if let Ok(ref lock) = lock_file {
-        #[cfg(unix)]
-        unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(lock), libc::LOCK_UN); }
-    }
-}
-
-fn load_state(path: &str) -> DesiredWorld {
+/// Read a v0/v1 state document (the pre-namespacing format) into a world
+/// whose maps are still keyed by bare name. Only used for migration
+/// (`persist::decode`), which re-keys everything to `namespace/name`.
+pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> {
     let mut world = DesiredWorld::new();
-
-    // ── Try neural state first (binary, fast) ──
-    let neural_path = format!("{path}.nrns");
-    let content = if let Ok(ns) = neural_state::NeuralState::load(&neural_path) {
-        eprintln!("  [neural] loaded state: {}", ns.stats());
-        ns.get("_full").and_then(|d| String::from_utf8(d.to_vec()).ok())
-    } else {
-        None
-    };
-
-    // ── Fall back to JSON file ──
-    let content = content.or_else(|| {
-        let lock_path = format!("{path}.lock");
-        let lock_file = std::fs::OpenOptions::new().create(true).write(true).open(&lock_path);
-        if let Ok(ref lock) = lock_file {
-            #[cfg(unix)]
-            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(lock), libc::LOCK_SH); }
-        }
-        let result = std::fs::read_to_string(path).ok();
-        if let Ok(ref lock) = lock_file {
-            #[cfg(unix)]
-            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(lock), libc::LOCK_UN); }
-        }
-        result
-    });
-
-    if let Some(content) = content {
-        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
-            // ── Schema version check ──
-            let found_version = state["schemaVersion"].as_u64().map(|v| v as u32);
-            match found_version {
-                None => {
-                    eprintln!("  [migrate] state file has no schemaVersion — treating as v0, upgrading on next save.");
-                }
-                Some(v) if v == STATE_SCHEMA_VERSION => {}
-                Some(v) if v < STATE_SCHEMA_VERSION => {
-                    eprintln!("  [migrate] state schema v{v} → v{STATE_SCHEMA_VERSION} (upgrading on next save)");
-                }
-                Some(v) => {
-                    eprintln!("  [error] state schema v{v} newer than supported v{STATE_SCHEMA_VERSION}. Refusing to downgrade. Upgrade the binary or delete the state files.");
-                    return world;
-                }
-            }
-
+    let mut secret_err: Option<String> = None;
+    {
+        {
             // Stored manifests (client-side apply source of truth)
             if let Some(mans) = state["manifests"].as_object() {
                 for (k, v) in mans {
@@ -2235,7 +1857,7 @@ fn load_state(path: &str) -> DesiredWorld {
                             command: c["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
                             env: c["env"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
                             env_from_configmaps: c["envFromConfigmaps"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
-                            env_from_secrets: c["envFromSecrets"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
+                            env_from_secrets: c["envFromSecrets"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(), env_refs: vec![],
                             volumes,
                             liveness_probe: c.get("livenessProbe").and_then(|p| {
                                 if p.is_null() { return None; }
@@ -2295,6 +1917,7 @@ fn load_state(path: &str) -> DesiredWorld {
                             .unwrap_or_default(),
                         init_containers,
                         resource_limits,
+                        restart_nonce: 0,
                         strategy: item.get("strategy").and_then(|s| {
                             if s.is_null() { return None; }
                             Some(match s["type"].as_str().unwrap_or("") {
@@ -2355,7 +1978,12 @@ fn load_state(path: &str) -> DesiredWorld {
                     if let Some(d) = item["data"].as_object() {
                         for (k, v) in d {
                             if let Some(val) = v.as_str() {
-                                let decrypted = if is_encrypted { decrypt_secret_value(val) } else { val.to_string() };
+                                let decrypted = if is_encrypted || val.starts_with("enc:") {
+                                    match decrypt_secret_value_strict(val) {
+                                        Ok(v) => v,
+                                        Err(e) => { secret_err = Some(format!("secret {}: {e}", item["name"].as_str().unwrap_or("?"))); val.to_string() }
+                                    }
+                                } else { val.to_string() };
                                 data.insert(k.clone(), decrypted);
                             }
                         }
@@ -2383,7 +2011,7 @@ fn load_state(path: &str) -> DesiredWorld {
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
                             env: item["container"]["env"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
-                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![],
+                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![], env_refs: vec![],
                             liveness_probe: None, readiness_probe: None, startup_probe: None,
                         },
                     };
@@ -2403,7 +2031,7 @@ fn load_state(path: &str) -> DesiredWorld {
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
                             env: item["container"]["env"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
-                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![],
+                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![], env_refs: vec![],
                             liveness_probe: None, readiness_probe: None, startup_probe: None,
                         },
                     };
@@ -2423,7 +2051,7 @@ fn load_state(path: &str) -> DesiredWorld {
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
                             env: item["container"]["env"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
-                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![],
+                            volumes: vec![], env_from_configmaps: vec![], env_from_secrets: vec![], env_refs: vec![],
                             liveness_probe: None, readiness_probe: None, startup_probe: None,
                         },
                     };
@@ -2435,6 +2063,7 @@ fn load_state(path: &str) -> DesiredWorld {
                 for item in hpas {
                     let h = reconcile::StoredHPA {
                         name: item["name"].as_str().unwrap_or("").to_string(),
+                        namespace: item["namespace"].as_str().unwrap_or("default").to_string(),
                         deployment: item["deployment"].as_str().unwrap_or("").to_string(),
                         min_replicas: item["min"].as_u64().unwrap_or(1) as u32,
                         max_replicas: item["max"].as_u64().unwrap_or(10) as u32,
@@ -2679,11 +2308,11 @@ fn load_state(path: &str) -> DesiredWorld {
                             let get_strs = |key: &str| -> Vec<String> {
                                 r[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_else(|| vec!["*".to_string()])
                             };
-                            reconcile::RbacRule { resources: get_strs("resources"), verbs: get_strs("verbs"), namespaces: get_strs("namespaces") }
+                            reconcile::RbacRule { resources: get_strs("resources"), verbs: get_strs("verbs"), namespaces: get_strs("namespaces"), resource_names: vec![] }
                         }).collect())
                         .unwrap_or_default();
                     let name = item["name"].as_str().unwrap_or("").to_string();
-                    world.rbac_roles.insert(name.clone(), reconcile::RbacRole { name, rules });
+                    world.rbac_roles.insert(name.clone(), reconcile::RbacRole { name, rules, namespace: None, kind: "RbacRole".to_string() });
                 }
             }
             // Guards
@@ -2780,7 +2409,111 @@ fn load_state(path: &str) -> DesiredWorld {
             }
         }
     }
-    world
+    if let Some(e) = secret_err { return Err(e); }
+    Ok(world)
+}
+
+/// Load desired state for this process, or exit: an unreadable or corrupt
+/// state file must never turn into an empty cluster that reconcile would act on.
+/// Token for CLI commands that call a running server's API: ROYAK_TOKEN, else
+/// the admin token a local server generated in the data dir.
+fn cli_bearer() -> Option<String> {
+    std::env::var("ROYAK_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+        .or_else(|| std::fs::read_to_string(format!("{}/admin.token", reconcile::royak_data_dir()))
+            .ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()))
+}
+
+fn load_state(path: &str) -> DesiredWorld {
+    match persist::load(path) {
+        Ok(l) => {
+            if let Some(v) = l.migrated_from {
+                eprintln!("  [migrate] {path}: state schema v{v} → v{} (in memory; written on first save, original kept as {path}.v1.bak)", persist::SCHEMA_VERSION);
+            }
+            let mut w = DesiredWorld::new();
+            w.install_state(l.state);
+            for n in l.nodes { w.nodes.insert(n.name.clone(), n); }
+            w
+        }
+        Err(e) => {
+            eprintln!("  ✗ cannot load state: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The CLI's owner lock, taken by the first offline write and held until the
+/// command exits, so no server can start acting on the state in between.
+static CLI_OWNER: std::sync::Mutex<Option<persist::OwnerLock>> = std::sync::Mutex::new(None);
+
+/// Offline (no server) state write used by CLI commands. Refuses while a
+/// server owns the state file — the server's API is the only writer then.
+/// Exits non-zero on any failure: a CLI change is reported only once durable.
+pub fn save_state(path: &str, world: &mut DesiredWorld) {
+    let mut held = CLI_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none() {
+        match persist::try_own(path) {
+            Ok(Some(l)) => *held = Some(l),
+            Ok(None) => {
+                eprintln!("  ✗ a running Royak server owns {path}; send the change through its API (kubectl) instead");
+                std::process::exit(3);
+            }
+            Err(e) => { eprintln!("  ✗ {e}"); std::process::exit(3); }
+        }
+    }
+    let on_disk = persist::load(path).map(|l| (l.state, l.migrated_from));
+    let mut next = world.to_state();
+    match on_disk {
+        Ok((cur, migrated)) => {
+            if cur.generation > world.generation {
+                eprintln!("  ✗ {path} changed since it was read (generation {} > {}); not overwriting", cur.generation, world.generation);
+                std::process::exit(3);
+            }
+            if migrated.is_some() {
+                if let Err(e) = persist::backup_before_migration(path) { eprintln!("  ✗ {e}"); std::process::exit(3); }
+            }
+            if next.same_content(&cur) && migrated.is_none() { world.generation = cur.generation; return; }
+            next.generation = cur.generation + 1;
+        }
+        Err(e) => { eprintln!("  ✗ {e}"); std::process::exit(3); }
+    }
+    if let Err(e) = persist::save(path, &next, &world.nodes_for_save()) {
+        eprintln!("  ✗ state NOT saved: {e}");
+        std::process::exit(3);
+    }
+    // Later saves in the same command build on what was just written.
+    world.generation = next.generation;
+}
+
+/// This node's pods (this cluster's own containers, by label) as census
+/// entries — what file-mode CLI commands show and count.
+fn cli_local_pods(world: &DesiredWorld) -> Vec<placement::PodView> {
+    let all = docker::list_containers(true).unwrap_or_default();
+    let ours = reconcile::our_containers(world, &all);
+    reconcile::local_views(world, &ours)
+}
+
+/// `pod` or `namespace/pod` → (namespace, pod).
+fn cli_pod_ref(arg: &str) -> (String, String) {
+    match arg.split_once('/') {
+        Some((ns, pod)) => (ns.to_string(), pod.to_string()),
+        None => (store::DEFAULT_NS.to_string(), arg.to_string()),
+    }
+}
+
+/// `name`, `deployment/name`, `namespace/name` or `deployment/namespace/name`
+/// → (namespace, name).
+fn cli_deployment_ref(arg: &str) -> (String, String) {
+    let rest = arg.strip_prefix("deployment/").or_else(|| arg.strip_prefix("deploy/")).unwrap_or(arg);
+    cli_pod_ref(rest)
+}
+
+/// Offline CLI reconcile: the desired change is made durable FIRST, then one
+/// reconcile pass acts on it, then any bookkeeping that pass produced is saved.
+fn cli_reconcile(path: &str, world: &mut DesiredWorld, brain: &mut OrinBrain) -> Vec<String> {
+    save_state(path, world);
+    let log = reconcile::reconcile_once(world, brain);
+    save_state(path, world);
+    log
 }
 
 fn run_demo() {
@@ -2846,39 +2579,37 @@ mod state_tests {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        // Use a path whose `.nrns` companion does not exist → load_state falls through to JSON.
-        format!("/tmp/rk-state-{pid}-{nanos}-{tag}.json")
+        format!("{}/rk-state-{pid}-{nanos}-{tag}.json", std::env::temp_dir().display())
     }
 
     fn cleanup(path: &str) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(format!("{path}.nrns"));
-        let _ = std::fs::remove_file(format!("{path}.lock"));
-        let _ = std::fs::remove_file(format!("{path}.nrns.tmp"));
+        for suffix in ["", ".nrns", ".lock", ".v1.bak"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
     }
 
     #[test]
     fn secret_encrypt_decrypt_roundtrip() {
         let plain = "plaintext-sentinel-42";
-        let encrypted = encrypt_secret_value(plain);
+        let encrypted = encrypt_secret_value(plain).unwrap();
         assert_ne!(encrypted, plain, "encrypted form must differ from plaintext");
         assert!(encrypted.starts_with("enc:"));
-        let decrypted = decrypt_secret_value(&encrypted);
-        assert_eq!(decrypted, plain);
+        assert_eq!(decrypt_secret_value_strict(&encrypted).unwrap(), plain);
+        let mut tampered = encrypted.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        assert!(decrypt_secret_value_strict(&tampered).is_err(), "tampered ciphertext must not decrypt to itself");
     }
 
     #[test]
     fn save_load_roundtrip_writes_schema_version() {
         let path = tmp_path("roundtrip");
         cleanup(&path);
-
-        let world = DesiredWorld::new();
-        save_state(&path, &world);
-
+        let mut world = DesiredWorld::new();
+        save_state(&path, &mut world);
         let content = std::fs::read_to_string(&path).expect("state file written");
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["schemaVersion"].as_u64(), Some(STATE_SCHEMA_VERSION as u64));
-
+        assert_eq!(v["schemaVersion"].as_u64(), Some(persist::SCHEMA_VERSION as u64));
         cleanup(&path);
     }
 
@@ -2904,101 +2635,73 @@ mod state_tests {
             idle_since: None,
             stateful: false,
             owner_ref: owner.map(|s| s.to_string()),
+            restart_nonce: 0,
         };
 
         let mut world = DesiredWorld::new();
-        world.deployments.insert("db-primary".to_string(), mk("db-primary", Some("db")));
-        // A second, user-owned deployment with no owner ref.
-        world.deployments.insert("web".to_string(), mk("web", None));
+        world.deployments.insert("default/db-primary".to_string(), mk("db-primary", Some("db")));
+        world.deployments.insert("default/web".to_string(), mk("web", None));
 
-        save_state(&path, &world);
+        save_state(&path, &mut world);
         let loaded = load_state(&path);
 
-        assert_eq!(loaded.deployments["db-primary"].owner_ref.as_deref(), Some("db"),
+        assert_eq!(loaded.deployments["default/db-primary"].owner_ref.as_deref(), Some("db"),
             "owner ref must survive the save/load JSON round-trip");
-        assert_eq!(loaded.deployments["web"].owner_ref, None,
+        assert_eq!(loaded.deployments["default/web"].owner_ref, None,
             "absent owner ref must load back as None");
         cleanup(&path);
     }
 
     #[test]
-    fn load_state_without_schema_version_proceeds() {
-        // Simulates loading a pre-schema-version state file (v0).
+    fn legacy_state_without_schema_version_migrates() {
         let path = tmp_path("legacy");
         cleanup(&path);
-        std::fs::write(&path, r#"{"deployments":[],"services":[]}"#).unwrap();
-
-        let world = load_state(&path);
-        assert_eq!(world.deployments.len(), 0);
+        std::fs::write(&path, r#"{"deployments":[{"name":"web","namespace":"default","replicas":2,"image":"nginx"}],"services":[]}"#).unwrap();
+        let l = persist::load(&path).unwrap();
+        assert_eq!(l.migrated_from, Some(0));
+        assert_eq!(l.state.deployments["default/web"].replicas, 2);
         cleanup(&path);
     }
 
     #[test]
-    fn load_state_with_future_version_refuses() {
-        // Newer schema than we support → we must not silently ignore it.
+    fn future_schema_refuses_to_load() {
         let path = tmp_path("future");
         cleanup(&path);
-        let body = format!(r#"{{"schemaVersion": {}, "deployments": []}}"#, STATE_SCHEMA_VERSION + 99);
-        std::fs::write(&path, body).unwrap();
-
-        let world = load_state(&path);
-        // Refused load → empty world.
-        assert_eq!(world.deployments.len(), 0);
-        assert!(world.services.is_empty());
+        std::fs::write(&path, r#"{"schemaVersion": 99, "deployments": []}"#).unwrap();
+        assert!(persist::load(&path).is_err(), "a newer schema must not load as an empty cluster");
         cleanup(&path);
     }
 
+    /// A crash mid-save leaves a stray temp file; the committed file is intact.
     #[test]
-    fn load_state_with_current_version_ok() {
-        let path = tmp_path("current");
-        cleanup(&path);
-        let body = format!(r#"{{"schemaVersion": {}, "deployments": []}}"#, STATE_SCHEMA_VERSION);
-        std::fs::write(&path, body).unwrap();
-
-        let world = load_state(&path);
-        assert_eq!(world.deployments.len(), 0);
-        cleanup(&path);
-    }
-
-    /// If the orchestrator crashes mid-save, a stray `.tmp` file may linger
-    /// next to the completed state. load_state must still load the last-good
-    /// state and ignore the partial tmp.
-    #[test]
-    fn load_state_ignores_partial_tmp_file() {
+    fn stray_tmp_file_is_ignored() {
         let path = tmp_path("partial");
         cleanup(&path);
-
-        // Write a complete, valid state.
-        let good = format!(r#"{{"schemaVersion": {}, "deployments": []}}"#, STATE_SCHEMA_VERSION);
-        std::fs::write(&path, &good).unwrap();
-        // Simulate a crash mid-save: garbage in the .tmp companion.
-        std::fs::write(format!("{path}.tmp"), b"partial garbage, not valid json").unwrap();
-
-        let world = load_state(&path);
-        // The main file is still intact, so load must succeed.
-        assert_eq!(world.deployments.len(), 0);
-
-        // Also: the stray tmp file should not prevent a subsequent save.
-        save_state(&path, &world);
-        let after = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(v["schemaVersion"].as_u64(), Some(STATE_SCHEMA_VERSION as u64));
-
+        let mut world = DesiredWorld::new();
+        world.namespaces.push("kept".into());
+        save_state(&path, &mut world);
+        std::fs::write(format!("{path}.tmp.12345"), b"partial garbage, not valid json").unwrap();
+        let l = persist::load(&path).unwrap();
+        assert!(l.state.namespaces.iter().any(|n| n == "kept"));
+        let _ = std::fs::remove_file(format!("{path}.tmp.12345"));
         cleanup(&path);
     }
 
-    /// A corrupted (malformed JSON) main state file should degrade safely
-    /// to an empty world, not panic or crash the orchestrator.
     #[test]
-    fn load_state_corrupted_json_degrades_safely() {
+    fn corrupted_state_refuses_instead_of_emptying() {
         let path = tmp_path("corrupt");
         cleanup(&path);
         std::fs::write(&path, b"{{ not valid json at all").unwrap();
+        assert!(persist::load(&path).is_err());
+        cleanup(&path);
+    }
 
-        let world = load_state(&path);
-        assert_eq!(world.deployments.len(), 0);
-        assert!(world.services.is_empty());
-
+    #[test]
+    fn offline_save_is_refused_while_a_server_owns_the_state() {
+        let path = tmp_path("owned");
+        cleanup(&path);
+        let _owner = persist::try_own(&path).unwrap().expect("first owner");
+        assert!(persist::try_own(&path).unwrap().is_none());
         cleanup(&path);
     }
 }

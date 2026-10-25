@@ -11,6 +11,15 @@ FAIL=0
 TOTAL=0
 
 SKIP=0
+# The API needs credentials (no anonymous access, no role headers). This run
+# uses its own admin token and a viewer token; servers started below read them.
+rand_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+export ROYAK_TOKEN="$(rand_hex 24)"
+VIEW_TOKEN="$(rand_hex 24)"
+TOKDIR=$(mktemp -d)
+printf '%s,vera,u2,"viewers"\n' "$VIEW_TOKEN" > "$TOKDIR/tokens.csv"
+export ROYAK_TOKEN_FILE="$TOKDIR/tokens.csv"
+AUTH="Authorization: Bearer $ROYAK_TOKEN"
 pass() { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  ✗ $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  ⊘ $1"; }
@@ -133,7 +142,7 @@ echo "3. RBAC"
 echo "───────"
 OUT=$($BIN apply /tmp/royak-test/rbac.yaml 2>&1)
 check "RBAC role applied" "echo '$OUT' | grep -q 'rbac/admin configured'"
-check "Existing pods not recreated" "echo '$OUT' | grep -q '\[ok\] web: 2/2'"
+check "Existing pods not recreated" "echo '$OUT' | grep -q '\[ok\] default/web: 2/2 ready'"
 
 # ═══════════════════════════════════════════
 echo ""
@@ -248,9 +257,9 @@ YAML
 )
 check "ConfigMap applied" "echo '$OUT' | grep -q 'configmap/app-cm'"
 check "Secret applied" "echo '$OUT' | grep -q 'secret/db-creds'"
-check "State marks secret encrypted" "grep -Eq '\"encrypted\"[[:space:]]*:[[:space:]]*true' $STATE"
+check "State holds every secret value sealed" "python3 -c \"import json; d=json.load(open('$STATE')); v=[x for s in d['state']['secrets'].values() for x in s['data'].values()]; assert v and all(x.startswith('enc:') for x in v)\""
 check "Plaintext NOT on disk" "! grep -q 'plaintext-sentinel-42' $STATE"
-check "Ciphertext is enc: hex" "python3 -c \"import json,re; d=json.load(open('$STATE')); s=next(x for x in d['secrets'] if x['name']=='db-creds'); v=s['data']['DB_PASSWORD']; assert re.fullmatch(r'enc:[0-9a-f]+', v) and len(v)>=28\""
+check "Ciphertext is enc: hex" "python3 -c \"import json,re; d=json.load(open('$STATE')); s=d['state']['secrets']['default/db-creds']; v=s['data']['DB_PASSWORD']; assert re.fullmatch(r'enc:[0-9a-f]+', v) and len(v)>=28\""
 
 # ═══════════════════════════════════════════
 echo ""
@@ -259,7 +268,7 @@ echo "────────────────────────�
 OUT=$($BIN apply examples/autoscale.yaml 2>&1)
 check "HPA applied" "echo '$OUT' | grep -q 'hpa/web-hpa'"
 check "HPA bound to deployment" "echo '$OUT' | grep -q 'min=2, max=8'"
-check "HPA reconcile fires" "echo '$OUT' | grep -q '\\[hpa\\] web'"
+check "HPA reconcile fires" "echo '$OUT' | grep -q '\\[hpa\\] default/web'"
 
 # ═══════════════════════════════════════════
 echo ""
@@ -469,29 +478,38 @@ $BIN watch --interval 60 > /tmp/rk-watch.log 2>&1 &
 WATCH_PID=$!
 sleep 4
 check "Dashboard served (HTTP 200)" "curl -sf http://127.0.0.1:6443/ | grep -qi 'royak'"
-check "Prometheus /metrics endpoint" "curl -sf http://127.0.0.1:6443/metrics | grep -q 'royak_'"
+check "Prometheus /metrics endpoint" "curl -sf -H '$AUTH' http://127.0.0.1:6443/metrics | grep -q 'royak_'"
+check "/metrics refuses anonymous callers" "[ \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6443/metrics) = 401 ]"
 check "API /api/v1 reachable" "curl -sf http://127.0.0.1:6443/api/v1 >/dev/null || curl -sf http://127.0.0.1:6443/healthz >/dev/null || curl -sf http://127.0.0.1:6443/ >/dev/null"
 kill -TERM "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
 
 # ═══════════════════════════════════════════
 echo ""
-echo "25. Graceful Shutdown (SIGTERM saves state)"
-echo "───────────────────────────────────────────"
+echo "25. Durability: API writes survive SIGKILL; SIGTERM shuts down cleanly"
+echo "──────────────────────────────────────────────────────────────────────"
 lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 sleep 1
-# Touch state so we can detect re-save
-touch -t 202001010000 "$STATE" 2>/dev/null || touch -d "2020-01-01" "$STATE" 2>/dev/null || true
-OLD_MTIME=$(stat -f%m "$STATE" 2>/dev/null || stat -c%Y "$STATE")
+$BIN watch --interval 60 > /tmp/rk-watch2.log 2>&1 &
+WATCH_PID=$!
+sleep 3
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$AUTH" -H 'Content-Type: application/yaml' \
+    --data-binary $'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: durable-cm}\ndata: {K: v}' \
+    http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "API write acknowledged" "echo '$CODE' | grep -qE '^20[01]$'"
+kill -KILL "$WATCH_PID" 2>/dev/null || true
+wait "$WATCH_PID" 2>/dev/null || true
+check "acknowledged write is on disk after SIGKILL" "python3 -c \"import json; d=json.load(open('$STATE')); assert 'default/durable-cm' in d['state']['configmaps']\""
 $BIN watch --interval 60 > /tmp/rk-watch2.log 2>&1 &
 WATCH_PID=$!
 sleep 3
 kill -TERM "$WATCH_PID" 2>/dev/null || true
-sleep 2
+for _ in $(seq 1 20); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep 0.5; done
+check "watch exits on SIGTERM" "! kill -0 $WATCH_PID"
+kill -KILL "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
-NEW_MTIME=$(stat -f%m "$STATE" 2>/dev/null || stat -c%Y "$STATE")
-check "State re-saved on SIGTERM" "[ \"$NEW_MTIME\" -gt \"$OLD_MTIME\" ]"
-check "Graceful shutdown logged" "grep -qi 'shutdown\\|saved\\|SIGTERM\\|graceful' /tmp/rk-watch2.log || grep -qi 'state saved' /tmp/rk-watch2.log"
+check "Graceful shutdown logged" "grep -qi 'shutdown' /tmp/rk-watch2.log"
+$BIN delete configmap/durable-cm >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════
 echo ""
@@ -528,39 +546,36 @@ echo "27. RBAC Enforcement (API-level 403)"
 echo "────────────────────────────────────"
 lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 sleep 1
-# Apply a read-only role with no write permissions
+# The viewer token's group gets the read-only "view" role.
 $BIN apply - >/dev/null 2>&1 <<'YAML' || true
-apiVersion: v1
-kind: RbacRole
-metadata:
-  name: readonly
-spec:
-  rules:
-  - resources: ["pods", "configmaps"]
-    verbs: ["get", "list"]
-    namespaces: ["*"]
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: ci-viewers}
+roleRef: {kind: ClusterRole, name: view}
+subjects: [{kind: Group, name: viewers}]
 YAML
-# Start API
 $BIN watch --interval 60 > /tmp/rk-rbac.log 2>&1 &
 WATCH_PID=$!
 sleep 4
-# Unauthorized POST as role=readonly — expect 403
-CODE_DENY=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST http://127.0.0.1:6443/api/v1/namespaces/default/configmaps \
-    -H "x-royak-role: readonly" \
-    -H "Content-Type: application/yaml" \
-    --data-binary $'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: forbidden-cm\nspec:\n  KEY: v' || echo "curl-fail")
-check "POST as readonly role returns 403" "[ \"$CODE_DENY\" = \"403\" ]"
-# Authorized POST as role=admin — expect 2xx
-CODE_OK=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST http://127.0.0.1:6443/api/v1/namespaces/default/configmaps \
-    -H "x-royak-role: admin" \
-    -H "Content-Type: application/yaml" \
-    --data-binary $'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: allowed-cm\nspec:\n  KEY: v' || echo "curl-fail")
-check "POST as admin role returns 2xx" "echo '$CODE_OK' | grep -qE '^2[0-9]{2}$'"
-check "RBAC denial logged" "grep -qi 'rbac.*denied\\|cannot create' /tmp/rk-rbac.log"
+CM=$'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rbac-cm\ndata:\n  KEY: v'
+CODE_ANON=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "anonymous read returns 401" "[ \"$CODE_ANON\" = \"401\" ]"
+CODE_SPOOF=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "x-royak-role: admin" -H "Content-Type: application/yaml" \
+    --data-binary "$CM" http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "x-royak-role header grants nothing (401)" "[ \"$CODE_SPOOF\" = \"401\" ]"
+CODE_VREAD=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $VIEW_TOKEN" http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "viewer can read (200)" "[ \"$CODE_VREAD\" = \"200\" ]"
+CODE_DENY=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $VIEW_TOKEN" -H "Content-Type: application/yaml" \
+    --data-binary "$CM" http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "POST as viewer returns 403" "[ \"$CODE_DENY\" = \"403\" ]"
+CODE_OK=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AUTH" -H "Content-Type: application/yaml" \
+    --data-binary "$CM" http://127.0.0.1:6443/api/v1/namespaces/default/configmaps)
+check "POST as admin returns 2xx" "echo '$CODE_OK' | grep -qE '^2[0-9]{2}$'"
+check "RBAC denial logged" "grep -qi 'rbac.*denied' /tmp/rk-rbac.log"
+check "no token in the server log" "! grep -q -e '$ROYAK_TOKEN' -e '$VIEW_TOKEN' /tmp/rk-rbac.log"
 kill -TERM "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
+$BIN delete configmap/rbac-cm >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════
 echo ""
@@ -571,12 +586,13 @@ if ! command -v kubectl >/dev/null 2>&1; then
 else
     lsof -ti:6443 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     sleep 1
-    $BIN watch --interval 60 > /tmp/rk-kubectl.log 2>&1 &
+    # kubectl only sends a bearer token over TLS.
+    $BIN watch --tls --interval 5 > /tmp/rk-kubectl.log 2>&1 &
     WATCH_PID=$!
     sleep 4
     # kubectl apply now works natively thanks to full OpenAPI v3 operation
     # scaffolding (v0.3). No --validate=false flag needed.
-    KSRV="--server=http://127.0.0.1:6443 --insecure-skip-tls-verify=true"
+    KSRV="--server=https://127.0.0.1:6443 --insecure-skip-tls-verify=true --token=$ROYAK_TOKEN"
     OUT=$(kubectl $KSRV get namespaces 2>&1 || true)
     check "kubectl get namespaces" "echo '$OUT' | grep -q 'default'"
     OUT=$(kubectl $KSRV get pods 2>&1 || true)
@@ -597,13 +613,21 @@ YAML
     check "kubectl delete succeeds" "echo '$OUT' | grep -Eqi 'deleted|not found'"
 
     # ── kubectl logs / scale / events / server-side apply (v0.4-beta) ──
-    OUT=$(kubectl $KSRV logs rk-web-1 2>&1 || true)
+    # Pod names change across the rollout/rollback above; use a live one.
+    KPOD=$(docker ps --filter label=royak.deployment=web --filter status=running --format '{{.Names}}' | head -1)
+    OUT=$(kubectl $KSRV logs "$KPOD" 2>&1 || true)
     check "kubectl logs streams container output" "echo '$OUT' | grep -Eqi 'docker-entrypoint|nginx|worker'"
     OUT=$(kubectl $KSRV scale deployment web --replicas=3 2>&1 || true)
     check "kubectl scale succeeds" "echo '$OUT' | grep -qi 'scaled'"
-    check "scale persisted to disk (write-through)" "python3 -c \"import json;s=json.load(open('$STATE'));exit(0 if [d for d in s['deployments'] if d['name']=='web' and d['replicas']==3] else 1)\""
-    OUT=$(kubectl $KSRV get events 2>&1 || true)
-    check "kubectl get events lists cluster events" "echo '$OUT' | grep -Eq 'NAME|rk-|web'"
+    check "scale persisted to disk (write-through)" "python3 -c \"import json;s=json.load(open('$STATE'));exit(0 if s['state']['deployments']['default/web']['replicas']==3 else 1)\""
+    # Events live in the server's memory: wait for the scale above to create a pod.
+    for _ in $(seq 1 20); do
+        OUT=$(kubectl $KSRV get events -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name,LAST:.lastTimestamp 2>&1 || true)
+        echo "$OUT" | grep -q 'Created' && break
+        sleep 1
+    done
+    check "kubectl get events lists cluster events" "echo '$OUT' | grep -q 'Created'"
+    check "event timestamps are RFC 3339" "echo '$OUT' | grep 'Created' | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z'"
     cat > /tmp/kctl-web-ssa.yaml <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
@@ -641,16 +665,16 @@ YAML
     sed -i.bak 's/replicas: 1/replicas: 2/' /tmp/kctl-ca.yaml
     OUT=$(kubectl $KSRV apply -f /tmp/kctl-ca.yaml 2>&1 || true)
     check "client-side apply UPDATES existing (configured)" "echo '$OUT' | grep -qi 'configured'"
-    check "client-side update persisted" "python3 -c \"import json;s=json.load(open('$STATE'));exit(0 if [d for d in s['deployments'] if d['name']=='catest' and d['replicas']==2] else 1)\""
+    check "client-side update persisted" "python3 -c \"import json;s=json.load(open('$STATE'));exit(0 if s['state']['deployments']['default/catest']['replicas']==2 else 1)\""
     kubectl $KSRV delete deployment catest >/dev/null 2>&1 || true
 
     # ── kubectl exec over WebSocket (non-interactive) ──
-    OUT=$(kubectl $KSRV exec rk-web-1 -- echo exec-ws-proof 2>&1 || true)
+    OUT=$(kubectl $KSRV exec "$KPOD" -- echo exec-ws-proof 2>&1 || true)
     check "kubectl exec runs command (WebSocket)" "echo '$OUT' | grep -q 'exec-ws-proof'"
-    OUT=$(kubectl $KSRV exec rk-web-1 -- sh -c 'exit 3' 2>&1 || true)
+    OUT=$(kubectl $KSRV exec "$KPOD" -- sh -c 'exit 3' 2>&1 || true)
     check "kubectl exec reports non-zero exit" "echo '$OUT' | grep -q 'exit code 3'"
     # interactive exec -i: stdin must reach the container
-    OUT=$(echo 'stdin-it-proof' | kubectl $KSRV exec -i rk-web-1 -- sh -c 'cat > /tmp/it-in && cat /tmp/it-in' 2>&1 || true)
+    OUT=$(echo 'stdin-it-proof' | kubectl $KSRV exec -i "$KPOD" -- sh -c 'cat > /tmp/it-in && cat /tmp/it-in' 2>&1 || true)
     check "kubectl exec -i pipes stdin to the container" "echo '$OUT' | grep -q 'stdin-it-proof'"
 
     kill -TERM "$WATCH_PID" 2>/dev/null || true
@@ -974,6 +998,7 @@ echo "════════════════════════�
 # Cleanup
 docker ps -a --filter "name=rk-" --format '{{.ID}}' | xargs -r docker rm -f 2>/dev/null || true
 rm -f "$STATE" "$STATE.nrns" "$STATE.lock" 2>/dev/null || true
+rm -rf "$TOKDIR"
 
 if [ $FAIL -gt 0 ]; then
     echo "  SOME TESTS FAILED"

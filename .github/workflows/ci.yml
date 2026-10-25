@@ -80,7 +80,7 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Integration tests (62 checks)
+      - name: Integration tests (test-demo.sh)
         run: bash test-demo.sh
 
       - name: StorageClass auto-provisioning
@@ -129,7 +129,7 @@ jobs:
           key: ubuntu-cargo-multinode-${{ hashFiles('**/Cargo.lock') }}
       - name: Build
         run: cargo build --release
-      - name: Multi-node sync test
+      - name: "Multi-node: signed census, remote workload contract, self-healing, node loss"
         run: bash test-multinode.sh
 
   ha-lease:
@@ -150,8 +150,29 @@ jobs:
           key: ubuntu-cargo-ha-${{ hashFiles('**/Cargo.lock') }}
       - name: Build
         run: cargo build --release
-      - name: HA leader lease test
+      - name: "Single writer: state owner lock + standby"
         run: bash test-ha-lease.sh
+
+  raft-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-raft-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: "Raft: failover, catch-up, minority partition, delete propagation, snapshots"
+        run: bash test-raft-cluster.sh
 
   mesh:
     runs-on: ubuntu-latest

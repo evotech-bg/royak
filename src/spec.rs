@@ -103,6 +103,8 @@ pub struct ContainerSpec {
     #[serde(rename = "envFrom", default)]
     pub env_from: Option<Vec<EnvFromSpec>>,
     pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
     pub resources: Option<ResourceSpec>,
     #[serde(rename = "volumeMounts")]
     pub volume_mounts: Option<Vec<VolumeMount>>,
@@ -344,6 +346,25 @@ pub struct PortSpec {
 pub struct EnvVar {
     pub name: String,
     pub value: Option<String>,
+    #[serde(rename = "valueFrom", default)]
+    pub value_from: Option<EnvVarSource>,
+}
+
+/// `env[].valueFrom`: one key of a ConfigMap or Secret.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvVarSource {
+    #[serde(rename = "configMapKeyRef", default)]
+    pub config_map_key_ref: Option<KeyRef>,
+    #[serde(rename = "secretKeyRef", default)]
+    pub secret_key_ref: Option<KeyRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyRef {
+    pub name: String,
+    pub key: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,31 +1,26 @@
-#![allow(dead_code)]
-//! v0.4 openraft — Phase 1
+//! Raft consensus for clustered desired state (openraft 0.9).
 //!
-//! This module plugs openraft into our reconcile plane without yet turning on
-//! multi-node replication. Scope:
-//!   * A [`RaftTypeConfig`] with our [`consensus::Command`] as the app data type
-//!     and a serialisable response.
-//!   * A combined in-memory [`RaftStorage`] (log + state machine + optional
-//!     snapshot). openraft v0.9 exposes an [`Adaptor`] that splits a V1
-//!     `RaftStorage` into the V2 (log, state-machine) pair `Raft::new` wants.
-//!   * A stub `RaftNetworkFactory` — Phase 1 is single-node, so the network
-//!     path must exist but never actually fire.
-//!   * [`build_single_node`] — bootstrap a cluster of one, wire the state
-//!     machine to a shared `DesiredWorld`, and return a ready `Raft`.
-//!
-//! Phase 2 (next session) will replace the memory log with a persistent one
-//! (backed by `.nrns`), and the stub network with the HTTP transport that
-//! already exists for `/royak/v1/state`.
-//!
-//! Integration with the reconcile loop is NOT done here. Phase 1 produces a
-//! Raft handle + tests proving commands flow: `client_write(Command)` → append
-//! to log → apply to state machine → `DesiredWorld` mutation. Swapping the
-//! live reconcile write-path onto this happens in Phase 3.
+//! * One command ([`Command::Commit`]): full next state + base generation,
+//!   applied with compare-and-swap on the generation. See `consensus.rs`.
+//! * Durable storage under `{data_dir}/raft-{node_id}/`:
+//!     - `vote.json`, `committed.json` — atomic replace + fsync
+//!     - `log.bin` — append-only records `[u32 len][8B sha256 prefix][json]`,
+//!       fsync'd on append; a torn (incomplete) final record is truncated on
+//!       start, a checksum mismatch is fatal
+//!     - `snapshot.json` — last snapshot (meta + full sealed state); also the
+//!       state machine's restart point (the log is replayed on top of it)
+//! * Transport: HTTP POST to the peer's `/royak/v1/raft/*`, HMAC-signed with
+//!   the cluster secret (see `auth.rs`); the receiver verifies before
+//!   dispatching to the local Raft.
+//! * [`commit_blocking`] is the clustered commit point used by
+//!   [`crate::store::commit_state`]: it returns success only after the entry
+//!   is committed by a quorum and applied on this (leader) node.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use openraft::storage::{Adaptor, LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
@@ -36,21 +31,21 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock as TokioRwLock;
 
-use crate::consensus::{Command, ProposeOutcome};
+use crate::consensus::Command;
 use crate::reconcile::DesiredWorld;
+use crate::store::{CommitError, DesiredState};
 
 pub type NeuroNodeId = u64;
 
-/// Response returned from the state machine after each applied command.
+/// State machine reply.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct NeuroResponse {
+    pub applied: bool,
+    pub generation: u64,
     pub message: String,
 }
 
 openraft::declare_raft_types!(
-    /// openraft configuration for Royak: Command as the app request,
-    /// NeuroResponse as the state machine reply, u64 node ids, BasicNode
-    /// for identity, default Entry/SnapshotData/AsyncRuntime.
     pub NeuroTypeConfig:
         D = Command,
         R = NeuroResponse,
@@ -61,143 +56,256 @@ openraft::declare_raft_types!(
         AsyncRuntime = openraft::TokioRuntime,
 );
 
-/// Shape of a snapshot stored in memory — metadata + the serialised state.
-#[derive(Debug, Clone)]
-pub struct NeuroSnapshot {
-    pub meta: SnapshotMeta<NeuroNodeId, BasicNode>,
-    pub data: Vec<u8>,
+/// How replicated state is protected in log entries and snapshots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sealing {
+    /// AES-256-GCM with a key derived from the cluster secret (production).
+    Cluster,
+    /// Plain JSON — in-process unit tests only.
+    Plain,
 }
 
-/// Combined V1 `RaftStorage` impl — log + vote + state-machine-linked world.
-/// openraft's `Adaptor` splits this into the V2 `(log_store, state_machine)`
-/// pair that `Raft::new` expects.
+const SEAL_PURPOSE: &[u8] = b"royak-raft-state-v1";
+
+impl Sealing {
+    pub fn seal(self, s: &DesiredState) -> Result<String, String> {
+        let json = serde_json::to_vec(s).map_err(|e| e.to_string())?;
+        match self {
+            Sealing::Cluster => crate::auth::seal_for_cluster(SEAL_PURPOSE, &json),
+            Sealing::Plain => String::from_utf8(json).map_err(|e| e.to_string()),
+        }
+    }
+    pub fn unseal(self, sealed: &str) -> Result<DesiredState, String> {
+        let bytes = match self {
+            Sealing::Cluster => crate::auth::unseal_for_cluster(SEAL_PURPOSE, sealed)?,
+            Sealing::Plain => sealed.as_bytes().to_vec(),
+        };
+        serde_json::from_slice(&bytes).map_err(|e| format!("replicated state: {e}"))
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SnapshotFile {
+    meta: SnapshotMeta<NeuroNodeId, BasicNode>,
+    /// Sealed DesiredState at `meta.last_log_id`.
+    state: String,
+}
+
+struct SmState {
+    last_applied: Option<LogId<NeuroNodeId>>,
+    membership: StoredMembership<NeuroNodeId, BasicNode>,
+}
+
 pub struct NeuroStore {
-    /// Last persisted vote.
+    /// Durable directory; `None` keeps everything in memory (unit tests).
+    dir: Option<PathBuf>,
+    sealing: Sealing,
     vote: TokioRwLock<Option<Vote<NeuroNodeId>>>,
-    /// Append-only log.
-    log: TokioRwLock<BTreeMap<u64, Entry<NeuroTypeConfig>>>,
-    /// Highest purged log id (ids up to and including this are deleted).
-    last_purged: TokioRwLock<Option<LogId<NeuroNodeId>>>,
-    /// Last committed log id (optional hint, openraft persists its own).
     committed: TokioRwLock<Option<LogId<NeuroNodeId>>>,
-    /// State machine pointer into the real cluster world.
+    log: TokioRwLock<BTreeMap<u64, Entry<NeuroTypeConfig>>>,
+    last_purged: TokioRwLock<Option<LogId<NeuroNodeId>>>,
     world: Arc<std::sync::RwLock<DesiredWorld>>,
-    /// Last applied log id to the state machine.
-    last_applied: TokioRwLock<Option<LogId<NeuroNodeId>>>,
-    /// Last applied membership.
-    last_membership: TokioRwLock<StoredMembership<NeuroNodeId, BasicNode>>,
-    /// Current installed/generated snapshot.
-    current_snapshot: TokioRwLock<Option<NeuroSnapshot>>,
+    sm: std::sync::Mutex<SmState>,
+    current_snapshot: TokioRwLock<Option<SnapshotFile>>,
+}
+
+fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+fn checksum(b: &[u8]) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(b);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&d[..8]);
+    out
+}
+
+fn encode_record(e: &Entry<NeuroTypeConfig>) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec(e).map_err(|e| e.to_string())?;
+    let mut rec = Vec::with_capacity(json.len() + 12);
+    rec.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    rec.extend_from_slice(&checksum(&json));
+    rec.extend_from_slice(&json);
+    Ok(rec)
+}
+
+/// Parse `log.bin`. Returns the entries and the byte length of the valid
+/// prefix (a torn final record is excluded). A corrupt complete record is an error.
+fn decode_log(bytes: &[u8]) -> Result<(Vec<Entry<NeuroTypeConfig>>, usize), String> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        if bytes.len() - off < 12 { break; }
+        let len = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        if bytes.len() - off - 12 < len { break; } // torn tail
+        let sum = &bytes[off + 4..off + 12];
+        let json = &bytes[off + 12..off + 12 + len];
+        if checksum(json) != sum {
+            return Err(format!("raft log record at byte {off} fails its checksum"));
+        }
+        let e: Entry<NeuroTypeConfig> = serde_json::from_slice(json)
+            .map_err(|e| format!("raft log record at byte {off}: {e}"))?;
+        out.push(e);
+        off += 12 + len;
+    }
+    Ok((out, off))
 }
 
 impl NeuroStore {
-    pub fn new(world: Arc<std::sync::RwLock<DesiredWorld>>) -> Arc<Self> {
-        Arc::new(Self {
-            vote: TokioRwLock::new(None),
-            log: TokioRwLock::new(BTreeMap::new()),
-            last_purged: TokioRwLock::new(None),
-            committed: TokioRwLock::new(None),
-            world,
-            last_applied: TokioRwLock::new(None),
-            last_membership: TokioRwLock::new(StoredMembership::default()),
-            current_snapshot: TokioRwLock::new(None),
-        })
+    pub fn in_memory(world: Arc<std::sync::RwLock<DesiredWorld>>) -> Arc<Self> {
+        Arc::new(Self::empty(None, Sealing::Plain, world))
     }
 
-    /// Apply a single committed command to the cluster world. This is the
-    /// Raft state machine: openraft guarantees every voter applies the exact
-    /// same command sequence, so mutating `DesiredWorld` here keeps every
-    /// node's desired state identical. Phase 3: real mutation (apply/scale/
-    /// delete), not a stub. The reconcile loop then converges Docker to it.
+    fn empty(dir: Option<PathBuf>, sealing: Sealing, world: Arc<std::sync::RwLock<DesiredWorld>>) -> Self {
+        Self {
+            dir,
+            sealing,
+            vote: TokioRwLock::new(None),
+            committed: TokioRwLock::new(None),
+            log: TokioRwLock::new(BTreeMap::new()),
+            last_purged: TokioRwLock::new(None),
+            world,
+            sm: std::sync::Mutex::new(SmState { last_applied: None, membership: StoredMembership::default() }),
+            current_snapshot: TokioRwLock::new(None),
+        }
+    }
+
+    /// Open (or create) durable storage in `dir` and restore the state machine
+    /// from the last snapshot into `world`.
+    pub fn open(dir: PathBuf, sealing: Sealing, world: Arc<std::sync::RwLock<DesiredWorld>>) -> Result<Arc<Self>, String> {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let read_json = |name: &str| -> Result<Option<serde_json::Value>, String> {
+            let p = dir.join(name);
+            match std::fs::read(&p) {
+                Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: {e}", p.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", p.display())),
+            }
+        };
+        let store = Self::empty(Some(dir.clone()), sealing, world.clone());
+        let vote: Option<Vote<NeuroNodeId>> = read_json("vote.json")?.map(serde_json::from_value).transpose().map_err(|e| e.to_string())?;
+        let committed: Option<LogId<NeuroNodeId>> = read_json("committed.json")?.and_then(|v| serde_json::from_value(v).ok());
+        let purged: Option<LogId<NeuroNodeId>> = read_json("purged.json")?.and_then(|v| serde_json::from_value(v).ok());
+        let snap: Option<SnapshotFile> = read_json("snapshot.json")?.map(serde_json::from_value).transpose().map_err(|e| format!("snapshot.json: {e}"))?;
+        let log_path = dir.join("log.bin");
+        let (entries, valid) = match std::fs::read(&log_path) {
+            Ok(b) => {
+                let (entries, valid) = decode_log(&b)?;
+                if valid < b.len() {
+                    eprintln!("  [raft] truncating torn tail of {} ({} bytes)", log_path.display(), b.len() - valid);
+                    let f = std::fs::OpenOptions::new().write(true).open(&log_path).map_err(|e| e.to_string())?;
+                    f.set_len(valid as u64).map_err(|e| e.to_string())?;
+                    f.sync_all().map_err(|e| e.to_string())?;
+                }
+                (entries, valid)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), 0),
+            Err(e) => return Err(format!("{}: {e}", log_path.display())),
+        };
+        let _ = valid;
+        {
+            let mut log = store.log.try_write().expect("fresh lock");
+            for e in entries { log.insert(e.log_id.index, e); }
+        }
+        *store.vote.try_write().expect("fresh lock") = vote;
+        *store.committed.try_write().expect("fresh lock") = committed;
+        *store.last_purged.try_write().expect("fresh lock") = purged;
+        if let Some(s) = snap {
+            let state = sealing.unseal(&s.state).map_err(|e| format!("snapshot.json: {e}"))?;
+            eprintln!("  [raft] restored snapshot from disk (up to log {:?}, generation {})",
+                s.meta.last_log_id.map(|l| l.index), state.generation);
+            {
+                let mut w = world.write().unwrap_or_else(|e| e.into_inner());
+                w.install_state(state);
+            }
+            {
+                let mut sm = store.sm.lock().unwrap();
+                sm.last_applied = s.meta.last_log_id;
+                sm.membership = s.meta.last_membership.clone();
+            }
+            *store.current_snapshot.try_write().expect("fresh lock") = Some(s);
+        }
+        Ok(Arc::new(store))
+    }
+
+    fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
+        if let Some(dir) = &self.dir {
+            let p = dir.join(name);
+            crate::persist::atomic_write(&p.to_string_lossy(), bytes).map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_log(&self, log: &BTreeMap<u64, Entry<NeuroTypeConfig>>) -> Result<(), std::io::Error> {
+        if self.dir.is_none() { return Ok(()); }
+        let mut buf = Vec::new();
+        for e in log.values() { buf.extend(encode_record(e).map_err(io_err)?); }
+        self.write_file("log.bin", &buf)
+    }
+
+    fn append_records(&self, entries: &[Entry<NeuroTypeConfig>]) -> Result<(), std::io::Error> {
+        use std::io::Write;
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let mut buf = Vec::new();
+        for e in entries { buf.extend(encode_record(e).map_err(io_err)?); }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.bin"))?;
+        f.write_all(&buf)?;
+        f.sync_all()
+    }
+
+    /// The state machine: compare-and-swap install of a replicated state.
     fn apply_command(&self, cmd: &Command) -> NeuroResponse {
-        let Ok(mut w) = self.world.write() else {
-            return NeuroResponse { message: "world lock poisoned".into() };
-        };
-        // Stamp the last applied command so tests + `royak get` can observe
-        // that the Raft log drove the mutation.
-        let stamp;
-        let message = match cmd {
-            Command::Apply { kind, name, namespace, spec_json } => {
-                // spec_json is the canonical manifest JSON captured at propose
-                // time. Reconstruct a Resource and run the real apply path.
-                match serde_json::from_str::<serde_json::Value>(spec_json)
-                    .ok()
-                    .and_then(|v| serde_yaml::to_string(&v).ok())
-                    .and_then(|y| crate::spec::parse_yaml(&y).ok())
-                    .and_then(|rs| rs.into_iter().next())
-                {
-                    Some(resource) => match w.apply(&resource) {
-                        Ok(m) => m,
-                        Err(e) => format!("apply {kind}/{name} ns={namespace} failed: {e}"),
-                    },
-                    None => format!("apply {kind}/{name}: could not parse spec_json"),
+        match cmd {
+            Command::Commit { base_generation, state } => {
+                let next = match self.sealing.unseal(state) {
+                    Ok(s) => s,
+                    Err(e) => return NeuroResponse { applied: false, generation: 0, message: format!("cannot open replicated state: {e}") },
+                };
+                let mut w = self.world.write().unwrap_or_else(|e| e.into_inner());
+                if w.generation != *base_generation {
+                    return NeuroResponse {
+                        applied: false,
+                        generation: w.generation,
+                        message: format!("conflict: state is at generation {}, write was based on {base_generation}", w.generation),
+                    };
                 }
+                let g = next.generation;
+                w.install_state(next);
+                NeuroResponse { applied: true, generation: g, message: format!("generation {g}") }
             }
-            Command::Scale { name, namespace, replicas } => {
-                if let Some(d) = w.deployments.get_mut(name) {
-                    d.replicas = *replicas;
-                    format!("scale {name} ns={namespace} → {replicas}")
-                } else {
-                    format!("scale {name}: not found")
-                }
-            }
-            Command::Delete { kind, name, namespace } => {
-                let ok = w.delete_resource(kind, name);
-                format!("delete {kind}/{name} ns={namespace} ({})", if ok { "removed" } else { "not found" })
-            }
-            Command::Heartbeat { node, cpu_used, mem_used, pod_count } => {
-                if let Some(n) = w.nodes.get_mut(node) {
-                    n.cpu_used = *cpu_used; n.mem_used = *mem_used; n.pod_count = *pod_count;
-                }
-                format!("heartbeat {node}")
-            }
-        };
-        stamp = format!("raft:[raft] {message}");
-        w.config.runtime = stamp;
-        NeuroResponse { message }
+        }
     }
 }
 
-// ─── RaftLogReader ──────────────────────────────────────────────────────
 impl RaftLogReader<NeuroTypeConfig> for Arc<NeuroStore> {
-    async fn try_get_log_entries<RB>(
-        &mut self,
-        range: RB,
-    ) -> Result<Vec<Entry<NeuroTypeConfig>>, StorageError<NeuroNodeId>>
-    where
-        RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend,
-    {
+    async fn try_get_log_entries<RB>(&mut self, range: RB) -> Result<Vec<Entry<NeuroTypeConfig>>, StorageError<NeuroNodeId>>
+    where RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend {
         let log = self.log.read().await;
         Ok(log.range(range).map(|(_, e)| e.clone()).collect())
     }
 }
 
-// ─── RaftSnapshotBuilder ────────────────────────────────────────────────
 impl RaftSnapshotBuilder<NeuroTypeConfig> for Arc<NeuroStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NeuroTypeConfig>, StorageError<NeuroNodeId>> {
-        let last_applied = *self.last_applied.read().await;
-        let last_membership = self.last_membership.read().await.clone();
-        // For Phase 1 the snapshot payload is a stamp, not the full world —
-        // persisting the full world to a snapshot is Phase 2 work.
-        let data = serde_json::to_vec(&last_applied)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-
-        let snapshot_id = last_applied
-            .map(|l| format!("{}-{}-0", l.leader_id, l.index))
-            .unwrap_or_else(|| "--0".to_string());
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-            snapshot_id,
+        // Capture state and last_applied atomically w.r.t. apply.
+        let (meta, sealed) = {
+            let sm = self.sm.lock().unwrap();
+            let state = self.world.read().unwrap_or_else(|e| e.into_inner()).to_state();
+            let sealed = self.sealing.seal(&state).map_err(|e| StorageIOError::read_state_machine(&io_err(e)))?;
+            let snapshot_id = sm.last_applied
+                .map(|l| format!("{}-{}-{}", l.leader_id, l.index, state.generation))
+                .unwrap_or_else(|| format!("--{}", state.generation));
+            (SnapshotMeta { last_log_id: sm.last_applied, last_membership: sm.membership.clone(), snapshot_id }, sealed)
         };
-        let stored = NeuroSnapshot { meta: meta.clone(), data: data.clone() };
-        *self.current_snapshot.write().await = Some(stored);
-        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data)) })
+        let file = SnapshotFile { meta: meta.clone(), state: sealed };
+        let bytes = serde_json::to_vec(&file).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e)))?;
+        self.write_file("snapshot.json", &bytes).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        *self.current_snapshot.write().await = Some(file);
+        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
     }
 }
 
-// ─── RaftStorage (V1 combined) ──────────────────────────────────────────
 impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
     type LogReader = Self;
     type SnapshotBuilder = Self;
@@ -206,13 +314,12 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
         let log = self.log.read().await;
         let last_purged = *self.last_purged.read().await;
         let last = log.iter().next_back().map(|(_, e)| e.log_id);
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last.or(last_purged),
-        })
+        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last.or(last_purged) })
     }
 
     async fn save_vote(&mut self, vote: &Vote<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes = serde_json::to_vec(vote).map_err(|e| StorageIOError::write_vote(&io_err(e)))?;
+        self.write_file("vote.json", &bytes).map_err(|e| StorageIOError::write_vote(&e))?;
         *self.vote.write().await = Some(*vote);
         Ok(())
     }
@@ -221,58 +328,61 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
         Ok(*self.vote.read().await)
     }
 
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NeuroNodeId>>
-    where I: IntoIterator<Item = Entry<NeuroTypeConfig>> + openraft::OptionalSend {
-        let mut log = self.log.write().await;
-        for entry in entries {
-            log.insert(entry.log_id.index, entry);
-        }
+    async fn save_committed(&mut self, committed: Option<LogId<NeuroNodeId>>) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes = serde_json::to_vec(&committed).map_err(|e| StorageIOError::write(&io_err(e)))?;
+        self.write_file("committed.json", &bytes).map_err(|e| StorageIOError::write(&e))?;
+        *self.committed.write().await = committed;
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(
-        &mut self,
-        log_id: LogId<NeuroNodeId>,
-    ) -> Result<(), StorageError<NeuroNodeId>> {
+    async fn read_committed(&mut self) -> Result<Option<LogId<NeuroNodeId>>, StorageError<NeuroNodeId>> {
+        Ok(*self.committed.read().await)
+    }
+
+    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NeuroNodeId>>
+    where I: IntoIterator<Item = Entry<NeuroTypeConfig>> + openraft::OptionalSend {
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() { return Ok(()); }
+        self.append_records(&entries).map_err(|e| StorageIOError::write_logs(&e))?;
+        let mut log = self.log.write().await;
+        for e in entries { log.insert(e.log_id.index, e); }
+        Ok(())
+    }
+
+    async fn delete_conflict_logs_since(&mut self, log_id: LogId<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
         let mut log = self.log.write().await;
         let keys: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
         for k in keys { log.remove(&k); }
+        self.rewrite_log(&log).map_err(|e| StorageIOError::write_logs(&e))?;
         Ok(())
     }
 
-    async fn purge_logs_upto(
-        &mut self,
-        log_id: LogId<NeuroNodeId>,
-    ) -> Result<(), StorageError<NeuroNodeId>> {
+    async fn purge_logs_upto(&mut self, log_id: LogId<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes = serde_json::to_vec(&Some(log_id)).map_err(|e| StorageIOError::write(&io_err(e)))?;
+        self.write_file("purged.json", &bytes).map_err(|e| StorageIOError::write(&e))?;
         *self.last_purged.write().await = Some(log_id);
         let mut log = self.log.write().await;
         let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for k in keys { log.remove(&k); }
+        self.rewrite_log(&log).map_err(|e| StorageIOError::write_logs(&e))?;
         Ok(())
     }
 
-    async fn last_applied_state(
-        &mut self,
-    ) -> Result<(Option<LogId<NeuroNodeId>>, StoredMembership<NeuroNodeId, BasicNode>), StorageError<NeuroNodeId>> {
-        Ok((
-            *self.last_applied.read().await,
-            self.last_membership.read().await.clone(),
-        ))
+    async fn last_applied_state(&mut self) -> Result<(Option<LogId<NeuroNodeId>>, StoredMembership<NeuroNodeId, BasicNode>), StorageError<NeuroNodeId>> {
+        let sm = self.sm.lock().unwrap();
+        Ok((sm.last_applied, sm.membership.clone()))
     }
 
-    async fn apply_to_state_machine(
-        &mut self,
-        entries: &[Entry<NeuroTypeConfig>],
-    ) -> Result<Vec<NeuroResponse>, StorageError<NeuroNodeId>> {
+    async fn apply_to_state_machine(&mut self, entries: &[Entry<NeuroTypeConfig>]) -> Result<Vec<NeuroResponse>, StorageError<NeuroNodeId>> {
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            *self.last_applied.write().await = Some(entry.log_id);
+            let mut sm = self.sm.lock().unwrap();
+            sm.last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Blank => out.push(NeuroResponse::default()),
                 EntryPayload::Normal(cmd) => out.push(self.apply_command(cmd)),
                 EntryPayload::Membership(m) => {
-                    *self.last_membership.write().await =
-                        StoredMembership::new(Some(entry.log_id), m.clone());
+                    sm.membership = StoredMembership::new(Some(entry.log_id), m.clone());
                     out.push(NeuroResponse::default());
                 }
             }
@@ -280,36 +390,38 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
         Ok(out)
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NeuroNodeId>> {
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NeuroNodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NeuroNodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NeuroNodeId>> {
-        let data = snapshot.into_inner();
-        *self.last_applied.write().await = meta.last_log_id;
-        *self.last_membership.write().await = meta.last_membership.clone();
-        *self.current_snapshot.write().await = Some(NeuroSnapshot {
-            meta: meta.clone(),
-            data,
-        });
+    async fn install_snapshot(&mut self, meta: &SnapshotMeta<NeuroNodeId, BasicNode>, snapshot: Box<Cursor<Vec<u8>>>) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes = snapshot.into_inner();
+        let file: SnapshotFile = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
+        let state = self.sealing.unseal(&file.state)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
+        eprintln!("  [raft] installing snapshot from leader (up to log {:?}, generation {})",
+            meta.last_log_id.map(|l| l.index), state.generation);
+        let file = SnapshotFile { meta: meta.clone(), state: file.state };
+        let disk = serde_json::to_vec(&file).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e)))?;
+        self.write_file("snapshot.json", &disk).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        {
+            let mut sm = self.sm.lock().unwrap();
+            self.world.write().unwrap_or_else(|e| e.into_inner()).install_state(state);
+            sm.last_applied = meta.last_log_id;
+            sm.membership = meta.last_membership.clone();
+        }
+        *self.current_snapshot.write().await = Some(file);
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<NeuroTypeConfig>>, StorageError<NeuroNodeId>> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<NeuroTypeConfig>>, StorageError<NeuroNodeId>> {
         let cur = self.current_snapshot.read().await;
         match cur.as_ref() {
-            Some(s) => Ok(Some(Snapshot {
-                meta: s.meta.clone(),
-                snapshot: Box::new(Cursor::new(s.data.clone())),
-            })),
+            Some(s) => {
+                let bytes = serde_json::to_vec(s).map_err(|e| StorageIOError::read_snapshot(Some(s.meta.signature()), &io_err(e)))?;
+                Ok(Some(Snapshot { meta: s.meta.clone(), snapshot: Box::new(Cursor::new(bytes)) }))
+            }
             None => Ok(None),
         }
     }
@@ -318,89 +430,19 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder { self.clone() }
 }
 
-// ─── Stub network — retained for single-node smoke tests ────────────────
-#[derive(Clone, Default)]
-pub struct StubNetworkFactory;
+// ─── In-process network (unit tests: partitions, failover) ─────────────
 
-impl openraft::RaftNetworkFactory<NeuroTypeConfig> for StubNetworkFactory {
-    type Network = StubNetwork;
-
-    async fn new_client(&mut self, _target: NeuroNodeId, _node: &BasicNode) -> Self::Network {
-        StubNetwork
-    }
-}
-
-#[derive(Default)]
-pub struct StubNetwork;
-
-impl openraft::RaftNetwork<NeuroTypeConfig> for StubNetwork {
-    async fn append_entries(
-        &mut self,
-        _rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        Err(openraft::error::RPCError::Network(
-            openraft::error::NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "StubNetwork: used for single-node smoke tests only",
-            )),
-        ))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        _rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
-        Err(openraft::error::RPCError::Network(
-            openraft::error::NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "StubNetwork: snapshot not supported",
-            )),
-        ))
-    }
-
-    async fn vote(
-        &mut self,
-        _rpc: openraft::raft::VoteRequest<NeuroNodeId>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::VoteResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        Err(openraft::error::RPCError::Network(
-            openraft::error::NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "StubNetwork: vote not supported",
-            )),
-        ))
-    }
-}
-
-// ─── In-process channel network (Phase 2 test transport) ────────────────
-//
-// For unit-testing a multi-node cluster without opening TCP sockets, we
-// ship an in-process transport: every node registers itself in a shared
-// registry, and new_client looks up the target node's Raft handle and
-// dispatches the RPC in-process. This covers the openraft "does the
-// algorithm work when messages actually flow between peers" invariant.
-// Real inter-host transport is the HTTP variant below.
-
-pub type NodeRegistry = Arc<tokio::sync::RwLock<
-    std::collections::HashMap<NeuroNodeId, Arc<openraft::Raft<NeuroTypeConfig>>>
->>;
-
-pub fn new_registry() -> NodeRegistry {
-    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
-}
-
-/// Shared set of isolated node ids — used only by chaos tests to simulate a
-/// network partition. Empty in production (the HTTP transport is real). If
-/// either endpoint of an RPC is isolated, the RPC fails as unreachable,
-/// exactly as it would across a partition.
+#[cfg(test)]
+pub type NodeRegistry = Arc<tokio::sync::RwLock<std::collections::HashMap<NeuroNodeId, Arc<openraft::Raft<NeuroTypeConfig>>>>>;
+#[cfg(test)]
 pub type Partition = Arc<tokio::sync::RwLock<std::collections::HashSet<NeuroNodeId>>>;
 
-pub fn new_partition() -> Partition {
-    Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()))
-}
+#[cfg(test)]
+pub fn new_registry() -> NodeRegistry { Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())) }
+#[cfg(test)]
+pub fn new_partition() -> Partition { Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())) }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub struct InProcNetworkFactory {
     pub registry: NodeRegistry,
@@ -408,25 +450,15 @@ pub struct InProcNetworkFactory {
     pub isolated: Partition,
 }
 
-impl InProcNetworkFactory {
-    /// Production/simple test path: no partition controller.
-    pub fn simple(registry: NodeRegistry) -> Self {
-        Self { registry, source: 0, isolated: new_partition() }
-    }
-}
-
+#[cfg(test)]
 impl openraft::RaftNetworkFactory<NeuroTypeConfig> for InProcNetworkFactory {
     type Network = InProcNetwork;
     async fn new_client(&mut self, target: NeuroNodeId, _node: &BasicNode) -> Self::Network {
-        InProcNetwork {
-            target,
-            source: self.source,
-            registry: self.registry.clone(),
-            isolated: self.isolated.clone(),
-        }
+        InProcNetwork { target, source: self.source, registry: self.registry.clone(), isolated: self.isolated.clone() }
     }
 }
 
+#[cfg(test)]
 pub struct InProcNetwork {
     target: NeuroNodeId,
     source: NeuroNodeId,
@@ -434,83 +466,54 @@ pub struct InProcNetwork {
     isolated: Partition,
 }
 
+type RpcErr<E = openraft::error::RaftError<NeuroNodeId>> = openraft::error::RPCError<NeuroNodeId, BasicNode, E>;
+
+fn unreachable<E: std::error::Error>(msg: String) -> RpcErr<E> {
+    openraft::error::RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, msg)))
+}
+
+#[cfg(test)]
 impl InProcNetwork {
     async fn peer(&self) -> Option<Arc<openraft::Raft<NeuroTypeConfig>>> {
-        // A partitioned endpoint on either side drops the RPC.
-        {
-            let iso = self.isolated.read().await;
-            if iso.contains(&self.source) || iso.contains(&self.target) {
-                return None;
-            }
-        }
+        let iso = self.isolated.read().await;
+        if iso.contains(&self.source) || iso.contains(&self.target) { return None; }
+        drop(iso);
         self.registry.read().await.get(&self.target).cloned()
     }
-
-    fn unreachable<E>(&self) -> openraft::error::RPCError<NeuroNodeId, BasicNode, E>
-    where E: std::error::Error {
-        openraft::error::RPCError::Network(
-            openraft::error::NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("peer {} not registered", self.target),
-            )),
-        )
-    }
 }
 
+#[cfg(test)]
 impl openraft::RaftNetwork<NeuroTypeConfig> for InProcNetwork {
-    async fn append_entries(
-        &mut self,
-        rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        let peer = self.peer().await.ok_or_else(|| self.unreachable())?;
-        peer.append_entries(rpc).await.map_err(|e| {
-            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e))
-        })
+    async fn append_entries(&mut self, rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
+        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.append_entries(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
     }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
-        let peer = self.peer().await.ok_or_else(|| self.unreachable())?;
-        peer.install_snapshot(rpc).await.map_err(|e| {
-            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e))
-        })
+    async fn install_snapshot(&mut self, rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
+        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.install_snapshot(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
     }
-
-    async fn vote(
-        &mut self,
-        rpc: openraft::raft::VoteRequest<NeuroNodeId>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::VoteResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        let peer = self.peer().await.ok_or_else(|| self.unreachable())?;
-        peer.vote(rpc).await.map_err(|e| {
-            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e))
-        })
+    async fn vote(&mut self, rpc: openraft::raft::VoteRequest<NeuroNodeId>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
+        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.vote(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
     }
 }
 
-// ─── HTTP network (production transport) ───────────────────────────────
-//
-// One RoyakNetwork per (local, peer) pair. POSTs go to the peer's
-// API server at /royak/v1/raft/{append,vote,install-snapshot}. The
-// receiving side's API handler (in api.rs) dispatches to the local
-// Raft handle. Bodies are JSON-serialised openraft RPC structs.
+// ─── HTTP network (production) ─────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HttpNetworkFactory {
-    /// Map of peer node id → address ("host:port") of peer's API server.
     pub peers: Arc<std::sync::RwLock<std::collections::HashMap<NeuroNodeId, String>>>,
 }
 
 impl HttpNetworkFactory {
-    pub fn new() -> Self {
-        Self { peers: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())) }
-    }
     pub fn set_peer(&self, id: NeuroNodeId, addr: String) {
         self.peers.write().unwrap().insert(id, addr);
+    }
+    pub fn peer_addr(&self, id: NeuroNodeId) -> Option<String> {
+        self.peers.read().unwrap().get(&id).cloned()
     }
 }
 
@@ -527,133 +530,114 @@ pub struct HttpNetwork {
 }
 
 impl HttpNetwork {
-    fn peer_addr(&self) -> Option<String> {
-        self.peers.read().unwrap().get(&self.target).cloned()
-    }
-
-    async fn post_json<Req: serde::Serialize, Resp: for<'de> serde::Deserialize<'de>>(
-        &self,
-        path: &str,
-        req: &Req,
-    ) -> Result<Resp, String> {
-        let addr = self.peer_addr().ok_or_else(|| format!("peer {} not registered", self.target))?;
-        let url = format!("http://{addr}{path}");
+    async fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(&self, path: &str, req: &Req, timeout: std::time::Duration) -> Result<Resp, String> {
+        let addr = self.peers.read().unwrap().get(&self.target).cloned().ok_or_else(|| format!("peer {} not registered", self.target))?;
         let body = serde_json::to_vec(req).map_err(|e| format!("serialize: {e}"))?;
-
-        // Use raw tokio TCP to keep the dep surface minimal — we already
-        // have this pattern in cluster_mesh for the proxy.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(&addr).await
-            .map_err(|e| format!("connect {url}: {e}"))?;
-        let req_bytes = format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(req_bytes.as_bytes()).await.map_err(|e| format!("write head: {e}"))?;
-        stream.write_all(&body).await.map_err(|e| format!("write body: {e}"))?;
-
-        let mut raw = Vec::with_capacity(4096);
-        stream.read_to_end(&mut raw).await.map_err(|e| format!("read: {e}"))?;
-        let sep = b"\r\n\r\n";
-        let body_start = raw.windows(sep.len()).position(|w| w == sep)
-            .map(|p| p + sep.len()).ok_or_else(|| "no body separator".to_string())?;
-        let resp_body = &raw[body_start..];
-        serde_json::from_slice::<Resp>(resp_body)
-            .map_err(|e| format!("deserialize ({} bytes): {e}", resp_body.len()))
+        let resp_body = crate::node_rpc::call_async("POST", &addr, path, &body, timeout).await
+            .map_err(|e| format!("raft rpc: {e}"))?;
+        serde_json::from_slice::<Resp>(&resp_body).map_err(|e| format!("decode ({} bytes): {e}", resp_body.len()))
     }
 }
+
+const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl openraft::RaftNetwork<NeuroTypeConfig> for HttpNetwork {
-    async fn append_entries(
-        &mut self,
-        rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        self.post_json("/royak/v1/raft/append-entries", &rpc).await
-            .map_err(|e| openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other, e))))
+    async fn append_entries(&mut self, rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
+        self.post_json("/royak/v1/raft/append-entries", &rpc, RPC_TIMEOUT).await.map_err(unreachable)
     }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
-        self.post_json("/royak/v1/raft/install-snapshot", &rpc).await
-            .map_err(|e| openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other, e))))
+    async fn install_snapshot(&mut self, rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
+        self.post_json("/royak/v1/raft/install-snapshot", &rpc, SNAPSHOT_TIMEOUT).await.map_err(unreachable)
     }
-
-    async fn vote(
-        &mut self,
-        rpc: openraft::raft::VoteRequest<NeuroNodeId>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<openraft::raft::VoteResponse<NeuroNodeId>, openraft::error::RPCError<NeuroNodeId, BasicNode, openraft::error::RaftError<NeuroNodeId>>> {
-        self.post_json("/royak/v1/raft/vote", &rpc).await
-            .map_err(|e| openraft::error::RPCError::Network(
-                openraft::error::NetworkError::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other, e))))
+    async fn vote(&mut self, rpc: openraft::raft::VoteRequest<NeuroNodeId>, _o: openraft::network::RPCOption)
+        -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
+        self.post_json("/royak/v1/raft/vote", &rpc, RPC_TIMEOUT).await.map_err(unreachable)
     }
 }
 
-// ─── Live HTTP-transport cluster node + global handle ───────────────────
+// ─── Live node ─────────────────────────────────────────────────────────
 
-/// The local process's Raft handle + its HTTP network factory, set once when
-/// the cluster runtime starts. The API server dispatches inbound raft RPCs
-/// (`/royak/v1/raft/*`) to this handle.
 pub struct RaftHandle {
     pub raft: Arc<openraft::Raft<NeuroTypeConfig>>,
     pub net: HttpNetworkFactory,
     pub node_id: NeuroNodeId,
+    pub sealing: Sealing,
+    pub rt: tokio::runtime::Handle,
 }
 
 pub static RAFT: std::sync::OnceLock<RaftHandle> = std::sync::OnceLock::new();
 
-/// Build a live Raft node using the HTTP transport. `peers` maps every other
-/// node id → "host:port" of its API server. If `bootstrap` is true this node
-/// initialises the cluster membership (run on exactly one node).
+pub fn raft_config() -> Result<Arc<openraft::Config>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Arc::new(openraft::Config {
+        cluster_name: "royak".to_string(),
+        heartbeat_interval: 250,
+        election_timeout_min: 1000,
+        election_timeout_max: 2000,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
+        max_in_snapshot_log_to_keep: 16,
+        ..Default::default()
+    }.validate()?))
+}
+
+/// Start this process's Raft node with durable storage in `dir`.
+///
+/// `seed` is the desired state found in this node's state file; on the
+/// bootstrap node of a brand-new cluster it becomes the first committed
+/// state (so an existing single-node install can be turned into a cluster
+/// without losing its resources). On every other start the replicated state
+/// (snapshot + log) is authoritative and `seed` is ignored.
 pub async fn build_http_node(
     node_id: NeuroNodeId,
     world: Arc<std::sync::RwLock<DesiredWorld>>,
     peers: &[(NeuroNodeId, String)],
     bootstrap: bool,
+    dir: PathBuf,
+    seed: Option<DesiredState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = Arc::new(openraft::Config {
-        cluster_name: "royak".to_string(),
-        heartbeat_interval: 250,
-        election_timeout_min: 500,
-        election_timeout_max: 1000,
-        ..Default::default()
-    }.validate()?);
-
-    let net = HttpNetworkFactory::new();
-    for (id, addr) in peers {
-        net.set_peer(*id, addr.clone());
-    }
-
-    let store = NeuroStore::new(world);
+    let net = HttpNetworkFactory::default();
+    for (id, addr) in peers { net.set_peer(*id, addr.clone()); }
+    let store = NeuroStore::open(dir, Sealing::Cluster, world.clone())?;
+    let fresh = store.log.read().await.is_empty() && store.current_snapshot.read().await.is_none();
     let (log_store, state_machine) = Adaptor::new(store);
-    let raft = Arc::new(openraft::Raft::new(node_id, config, net.clone(), log_store, state_machine).await?);
+    let raft = Arc::new(openraft::Raft::new(node_id, raft_config()?, net.clone(), log_store, state_machine).await?);
+    RAFT.set(RaftHandle { raft: raft.clone(), net, node_id, sealing: Sealing::Cluster, rt: tokio::runtime::Handle::current() })
+        .map_err(|_| "RAFT already set")?;
 
-    if bootstrap {
-        let mut members = std::collections::BTreeMap::new();
+    if bootstrap && fresh {
+        let mut members = BTreeMap::new();
         members.insert(node_id, BasicNode::default());
-        for (id, _) in peers {
-            members.insert(*id, BasicNode::default());
+        for (id, _) in peers { members.insert(*id, BasicNode::default()); }
+        match raft.initialize(members).await {
+            Ok(()) => eprintln!("  [raft] cluster initialised by node {node_id}"),
+            Err(e) => eprintln!("  [raft] initialise skipped: {e}"),
         }
-        // Give peers a moment to start their listeners, then initialise.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        raft.initialize(members).await?;
+        if let Some(mut seed) = seed {
+            if !seed.same_content(&DesiredWorld::new().to_state()) || seed.generation > 0 {
+                // Wait for our own leadership, then commit the seed as generation 1.
+                for _ in 0..120 {
+                    if raft.current_leader().await == Some(node_id) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                let base = world.read().unwrap_or_else(|e| e.into_inner()).generation;
+                if base == 0 {
+                    seed.generation = 1;
+                    seed.cluster_id = world.read().unwrap_or_else(|e| e.into_inner()).cluster_id.clone();
+                    let state = Sealing::Cluster.seal(&seed)?;
+                    match raft.client_write(Command::Commit { base_generation: 0, state }).await {
+                        Ok(r) if r.data.applied => eprintln!("  [raft] seeded cluster state from local file ({} deployments)", seed.deployments.len()),
+                        Ok(r) => eprintln!("  [raft] seed not applied: {}", r.data.message),
+                        Err(e) => eprintln!("  [raft] seed commit failed: {e}"),
+                    }
+                }
+            }
+        }
     }
-
-    RAFT.set(RaftHandle { raft, net, node_id }).map_err(|_| "RAFT already set")?;
     Ok(())
 }
 
-/// Dispatch an inbound raft RPC (append-entries / vote / install-snapshot) to
-/// the local handle. `which` is the last path segment. Returns the JSON body.
+/// Dispatch an inbound (already node-authenticated) Raft RPC.
 pub async fn handle_rpc(which: &str, body: &[u8]) -> Result<String, String> {
     let handle = RAFT.get().ok_or("raft not running on this node")?;
     match which {
@@ -676,62 +660,80 @@ pub async fn handle_rpc(which: &str, body: &[u8]) -> Result<String, String> {
     }
 }
 
-/// Propose a command through the live cluster (leader-committed). Used by the
-/// write path when Raft is active. Returns the state-machine message.
-pub async fn propose(cmd: Command) -> Result<String, String> {
-    let handle = RAFT.get().ok_or("raft not running")?;
-    match handle.raft.client_write(cmd).await {
-        Ok(resp) => Ok(resp.data.message),
-        Err(e) => Err(format!("raft write failed: {e}")),
+/// How long a clustered write waits for quorum before it is reported as
+/// unavailable (HTTP 503). The client was not told "success", so a write
+/// without quorum is never confirmed.
+pub const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Replicate `next` through Raft. Blocking — call from a non-async thread.
+pub fn commit_blocking(base_generation: u64, next: DesiredState) -> Result<(), CommitError> {
+    let h = RAFT.get().ok_or_else(|| CommitError::Unavailable("raft is not running yet on this node".into()))?;
+    let state = h.sealing.seal(&next).map_err(CommitError::Unavailable)?;
+    let raft = h.raft.clone();
+    let res = h.rt.block_on(async move {
+        tokio::time::timeout(COMMIT_TIMEOUT, raft.client_write(Command::Commit { base_generation, state })).await
+    });
+    match res {
+        Err(_) => Err(CommitError::Unknown(format!(
+            "no quorum within {}s — the write is NOT confirmed; it may still be applied if a quorum returns, so re-read before retrying",
+            COMMIT_TIMEOUT.as_secs()))),
+        Ok(Err(e)) => {
+            if let openraft::error::RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(f)) = &e {
+                return Err(CommitError::NotLeader(f.leader_id));
+            }
+            Err(CommitError::Unavailable(format!("raft write failed: {e}")))
+        }
+        Ok(Ok(resp)) if resp.data.applied => Ok(()),
+        Ok(Ok(resp)) => Err(CommitError::Unavailable(resp.data.message)),
     }
 }
 
-/// True if this process is the current Raft leader (or Raft is off → single
-/// writer via the file lease, treated as "may write").
-pub async fn is_leader_or_off() -> bool {
-    match RAFT.get() {
-        None => true,
-        Some(h) => h.raft.current_leader().await == Some(h.node_id),
-    }
+/// API address of a Raft node, if known (for not-leader redirects).
+pub fn peer_address(id: NeuroNodeId) -> Option<String> {
+    RAFT.get().and_then(|h| h.net.peer_addr(id))
 }
 
-/// (current_leader_id, this_node_id) — both None when Raft is off.
-pub async fn raft_status() -> (Option<NeuroNodeId>, Option<NeuroNodeId>) {
-    match RAFT.get() {
-        None => (None, None),
-        Some(h) => (h.raft.current_leader().await, Some(h.node_id)),
-    }
-}
-
-/// Set true once this process runs clustered (`--node-id` + `--peers`). When
-/// false (single-node) the reconcile loop always schedules — the local file
-/// lease is the only writer, exactly as before Raft existed.
 pub static CLUSTER_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Cached "am I the Raft leader" flag, refreshed by [`leadership_poller`]. The
-/// reconcile loop is synchronous and cannot await `current_leader()` each tick,
-/// so a background task keeps this fresh. Starts false so a booting follower
-/// does NOT schedule before an election confirms a leader.
+/// Set once this node's Raft instance is up (and, on the bootstrap node, the
+/// seed commit was attempted). The reconcile loop does not tick before it.
+pub static RAFT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static IS_RAFT_LEADER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The scheduler gate for the reconcile loop: only the node that owns
-/// desired-state reconciliation creates / scales / routes pods. Single-node
-/// (Raft off) → always true. Clustered → true only on the confirmed leader.
-/// Followers still manage their own pods' health; they just don't schedule,
-/// which is what stops both nodes independently satisfying the same deployment.
+pub fn is_clustered() -> bool {
+    CLUSTER_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Only the node that owns scheduling creates/scales/rolls pods: single-node
+/// → always; clustered → the confirmed Raft leader.
 pub fn is_cluster_scheduler() -> bool {
     use std::sync::atomic::Ordering;
     !CLUSTER_MODE.load(Ordering::Acquire) || IS_RAFT_LEADER.load(Ordering::Acquire)
 }
 
-/// Background task (clustered mode only): refresh [`IS_RAFT_LEADER`] ~4×/sec
-/// from live Raft state. Treats "Raft not up yet" as NOT leader so no follower
-/// schedules during the startup/election window.
+/// Leadership that a quorum has confirmed recently. `current_leader()` alone
+/// is not enough: a restarted node restores its committed self-vote and calls
+/// itself leader before any peer answered, and a leader cut off in a minority
+/// keeps the title until it learns of a newer term. Either would schedule
+/// pods next to the real leader.
+fn confirmed_leader(m: &openraft::RaftMetrics<NeuroNodeId, BasicNode>, me: NeuroNodeId) -> bool {
+    if m.current_leader != Some(me) {
+        return false;
+    }
+    let voters = m.membership_config.membership().voter_ids().count();
+    if voters <= 1 {
+        return true;
+    }
+    // Within one minimum election timeout no other node can have been elected.
+    matches!(m.millis_since_quorum_ack, Some(ms) if ms < LEADER_LEASE_MS)
+}
+
+const LEADER_LEASE_MS: u64 = 1000;
+
 pub async fn leadership_poller() {
     use std::sync::atomic::Ordering;
     loop {
         let is_leader = match RAFT.get() {
-            Some(h) => h.raft.current_leader().await == Some(h.node_id),
+            Some(h) => confirmed_leader(&h.raft.metrics().borrow(), h.node_id),
             None => false,
         };
         IS_RAFT_LEADER.store(is_leader, Ordering::Release);
@@ -739,364 +741,235 @@ pub async fn leadership_poller() {
     }
 }
 
-// ─── Bootstrap helper ──────────────────────────────────────────────────
-pub async fn build_single_node(
-    node_id: NeuroNodeId,
-    world: Arc<std::sync::RwLock<DesiredWorld>>,
-) -> Result<openraft::Raft<NeuroTypeConfig>, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Arc::new(openraft::Config {
-        cluster_name: "royak".to_string(),
-        heartbeat_interval: 150,
-        election_timeout_min: 300,
-        election_timeout_max: 600,
-        ..Default::default()
-    }.validate()?);
-
-    let store = NeuroStore::new(world);
-    let (log_store, state_machine) = Adaptor::new(store);
-
-    let raft = openraft::Raft::new(
-        node_id,
-        config,
-        StubNetworkFactory,
-        log_store,
-        state_machine,
-    ).await?;
-
-    // Bootstrap a single-node cluster (this node is the only voter).
-    let mut nodes = std::collections::BTreeMap::new();
-    nodes.insert(node_id, BasicNode::default());
-    raft.initialize(nodes).await?;
-
-    Ok(raft)
-}
-
-/// Build one Raft node bound to an in-process registry (for tests).
-/// Unlike `build_single_node`, this does NOT auto-initialize; callers
-/// bootstrap a cluster once across all nodes after every node is in
-/// the registry.
+#[cfg(test)]
+/// Test helper: a node on the in-process network, optionally durable.
 pub async fn build_node_in_proc(
     node_id: NeuroNodeId,
     world: Arc<std::sync::RwLock<DesiredWorld>>,
     registry: NodeRegistry,
-) -> Result<Arc<openraft::Raft<NeuroTypeConfig>>, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Arc::new(openraft::Config {
-        cluster_name: "royak".to_string(),
-        heartbeat_interval: 150,
-        election_timeout_min: 300,
-        election_timeout_max: 600,
-        ..Default::default()
-    }.validate()?);
-
-    let store = NeuroStore::new(world);
-    let (log_store, state_machine) = Adaptor::new(store);
-
-    let raft = openraft::Raft::new(
-        node_id,
-        config,
-        InProcNetworkFactory::simple(registry.clone()),
-        log_store,
-        state_machine,
-    ).await?;
-
-    let raft = Arc::new(raft);
-    registry.write().await.insert(node_id, raft.clone());
-    Ok(raft)
-}
-
-/// Build a Raft node with a partition controller for chaos tests. Same as
-/// `build_node_in_proc` but the network respects the `isolated` set.
-pub async fn build_node_in_proc_chaos(
-    node_id: NeuroNodeId,
-    world: Arc<std::sync::RwLock<DesiredWorld>>,
-    registry: NodeRegistry,
     isolated: Partition,
+    dir: Option<PathBuf>,
 ) -> Result<Arc<openraft::Raft<NeuroTypeConfig>>, Box<dyn std::error::Error + Send + Sync>> {
     let config = Arc::new(openraft::Config {
-        cluster_name: "royak".to_string(),
-        heartbeat_interval: 150,
+        cluster_name: "royak-test".to_string(),
+        heartbeat_interval: 100,
         election_timeout_min: 300,
         election_timeout_max: 600,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(8),
+        max_in_snapshot_log_to_keep: 2,
         ..Default::default()
     }.validate()?);
-
-    let store = NeuroStore::new(world);
+    let store = match dir {
+        Some(d) => NeuroStore::open(d, Sealing::Plain, world)?,
+        None => NeuroStore::in_memory(world),
+    };
     let (log_store, state_machine) = Adaptor::new(store);
-
-    let raft = openraft::Raft::new(
-        node_id,
-        config,
-        InProcNetworkFactory { registry: registry.clone(), source: node_id, isolated },
-        log_store,
-        state_machine,
-    ).await?;
-
-    let raft = Arc::new(raft);
+    let raft = Arc::new(openraft::Raft::new(node_id, config,
+        InProcNetworkFactory { registry: registry.clone(), source: node_id, isolated }, log_store, state_machine).await?);
     registry.write().await.insert(node_id, raft.clone());
     Ok(raft)
-}
-
-/// Phase 1 backend: forwards ProposeOutcome through a real Raft log.
-/// Can be swapped into `ConsensusBackend` once the reconcile loop is ready
-/// to call a backend instead of mutating `DesiredWorld` directly.
-pub struct RaftLocalBackend {
-    pub node_id: NeuroNodeId,
-    pub raft: openraft::Raft<NeuroTypeConfig>,
-}
-
-impl RaftLocalBackend {
-    pub async fn propose(&self, cmd: Command) -> ProposeOutcome {
-        match self.raft.client_write(cmd).await {
-            Ok(resp) => ProposeOutcome {
-                committed: true,
-                message: resp.data.message.clone(),
-                index: Some(resp.log_id.index),
-            },
-            Err(e) => ProposeOutcome {
-                committed: false,
-                message: format!("raft write failed: {e}"),
-                index: None,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    async fn await_leader(raft: &openraft::Raft<NeuroTypeConfig>) {
-        // Single-node clusters become leader quickly; wait for it.
-        for _ in 0..40 {
-            if raft.current_leader().await.is_some() { return; }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        panic!("single node never became leader");
+    type Rafts = HashMap<u64, Arc<openraft::Raft<NeuroTypeConfig>>>;
+    type Worlds = HashMap<u64, Arc<std::sync::RwLock<DesiredWorld>>>;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("royak-raft-{tag}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
-    #[tokio::test]
-    async fn single_node_commits_command_through_raft() {
-        let world = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-        let raft = build_single_node(1, world.clone()).await.expect("build raft");
-        await_leader(&raft).await;
-
-        let cmd = Command::Scale {
-            name: "web".into(),
-            namespace: "default".into(),
-            replicas: 3,
-        };
-        let resp = raft.client_write(cmd.clone()).await.expect("client_write");
-        assert!(resp.data.message.contains("scale web"), "sm response: {:?}", resp.data);
-
-        // State machine stamped its marker on the world — proof the Raft log
-        // round-tripped through apply_to_state_machine.
-        let stamp = world.read().unwrap().config.runtime.clone();
-        assert!(stamp.contains("raft:"), "world was not mutated via raft, got: {stamp}");
-        assert!(stamp.contains("scale web"), "stamp missing scale marker: {stamp}");
-
-        raft.shutdown().await.ok();
-    }
-
-    #[tokio::test]
-    async fn two_commands_get_consecutive_indices() {
-        let world = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-        let raft = build_single_node(1, world).await.expect("build raft");
-        await_leader(&raft).await;
-
-        let r1 = raft.client_write(Command::Heartbeat {
-            node: "node-a".into(), cpu_used: 0.1, mem_used: 10.0, pod_count: 0,
-        }).await.expect("write 1");
-        let r2 = raft.client_write(Command::Heartbeat {
-            node: "node-a".into(), cpu_used: 0.2, mem_used: 20.0, pod_count: 1,
-        }).await.expect("write 2");
-
-        assert!(r2.log_id.index > r1.log_id.index, "expected increasing log indices");
-        raft.shutdown().await.ok();
-    }
-
-    #[tokio::test]
-    async fn three_node_cluster_elects_leader_and_replicates() {
-        // Three in-process Raft instances sharing a registry. One becomes
-        // leader; client_write on the leader propagates to the other two
-        // state machines.
-        let registry = new_registry();
-        let w1 = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-        let w2 = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-        let w3 = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-
-        let r1 = build_node_in_proc(1, w1.clone(), registry.clone()).await.expect("node 1");
-        let r2 = build_node_in_proc(2, w2.clone(), registry.clone()).await.expect("node 2");
-        let r3 = build_node_in_proc(3, w3.clone(), registry.clone()).await.expect("node 3");
-
-        // Bootstrap the cluster on node 1 with all three members.
-        let mut members = std::collections::BTreeMap::new();
-        members.insert(1u64, BasicNode::default());
-        members.insert(2u64, BasicNode::default());
-        members.insert(3u64, BasicNode::default());
-        r1.initialize(members).await.expect("initialize");
-
-        // Wait for a leader to emerge. Election takes a few ticks.
-        let mut leader_id = None;
-        for _ in 0..60 {
-            if let Some(id) = r1.current_leader().await {
-                leader_id = Some(id);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        }
-        let leader_id = leader_id.expect("a leader should be elected");
-        let leader = match leader_id {
-            1 => r1.clone(), 2 => r2.clone(), 3 => r3.clone(),
-            other => panic!("unexpected leader id {other}"),
-        };
-
-        // Write a command to the leader.
-        let cmd = Command::Scale {
-            name: "multi".into(), namespace: "default".into(), replicas: 7,
-        };
-        leader.client_write(cmd).await.expect("client_write");
-
-        // Give followers a moment to apply.
-        for _ in 0..20 {
-            let seen = [&w1, &w2, &w3].iter()
-                .filter(|w| w.read().unwrap().config.runtime.contains("scale multi"))
-                .count();
-            if seen == 3 { break; }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        for (i, w) in [&w1, &w2, &w3].iter().enumerate() {
-            let stamp = w.read().unwrap().config.runtime.clone();
-            assert!(stamp.contains("scale multi"),
-                "node {} did not see the replicated command: stamp={stamp}", i + 1);
-        }
-
-        // Graceful shutdown. We drop the Arc via try_unwrap best-effort.
-        for r in [r1, r2, r3] {
-            let _ = r.shutdown().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn backend_wrapper_reports_committed_and_index() {
-        let world = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-        let raft = build_single_node(1, world).await.expect("build raft");
-        await_leader(&raft).await;
-
-        let backend = RaftLocalBackend { node_id: 1, raft };
-        let outcome = backend.propose(Command::Delete {
-            kind: "ConfigMap".into(),
-            name: "deleted-cm".into(),
-            namespace: "default".into(),
-        }).await;
-
-        assert!(outcome.committed, "propose should commit");
-        assert!(outcome.index.is_some(), "raft backend must report log index");
-        assert!(outcome.message.contains("delete ConfigMap"), "message: {}", outcome.message);
-
-        backend.raft.shutdown().await.ok();
-    }
-
-    // ─── CHAOS: kill leader → re-elect → no committed op lost;
-    //     partition minority → can't commit; heal → catches up. ───
-    #[tokio::test]
-    async fn chaos_kill_leader_partition_heal_no_lost_commit() {
+    async fn cluster(n: u64, durable: Option<&PathBuf>) -> (Rafts, Worlds, NodeRegistry, Partition) {
         let registry = new_registry();
         let isolated = new_partition();
-        let worlds: Vec<_> = (1..=3).map(|_| Arc::new(std::sync::RwLock::new(DesiredWorld::new()))).collect();
-        let mut rafts = std::collections::HashMap::new();
-        for id in 1u64..=3 {
-            let r = build_node_in_proc_chaos(id, worlds[(id-1) as usize].clone(), registry.clone(), isolated.clone())
-                .await.expect("build node");
+        let mut rafts = HashMap::new();
+        let mut worlds = HashMap::new();
+        for id in 1..=n {
+            let w = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
+            let dir = durable.map(|d| d.join(format!("n{id}")));
+            let r = build_node_in_proc(id, w.clone(), registry.clone(), isolated.clone(), dir).await.unwrap();
             rafts.insert(id, r);
+            worlds.insert(id, w);
         }
-        let mut members = std::collections::BTreeMap::new();
-        for id in 1u64..=3 { members.insert(id, BasicNode::default()); }
-        rafts[&1].initialize(members).await.expect("init");
+        let mut members = BTreeMap::new();
+        for id in 1..=n { members.insert(id, BasicNode::default()); }
+        rafts[&1].initialize(members).await.unwrap();
+        (rafts, worlds, registry, isolated)
+    }
 
-        // helper: current leader id
-        async fn leader_of(rafts: &std::collections::HashMap<u64, Arc<openraft::Raft<NeuroTypeConfig>>>) -> Option<u64> {
-            for _ in 0..80 {
-                for r in rafts.values() {
-                    if let Some(id) = r.current_leader().await {
-                        if rafts.contains_key(&id) { return Some(id); }
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            None
-        }
-
-        // helper: write a scale command to the current leader, retrying across
-        // re-elections. Returns committed log index.
-        async fn commit_scale(rafts: &std::collections::HashMap<u64, Arc<openraft::Raft<NeuroTypeConfig>>>, replicas: u32) -> Option<u64> {
-            for _ in 0..40 {
-                if let Some(lid) = leader_of(rafts).await {
-                    let cmd = Command::Scale { name: "svc".into(), namespace: "default".into(), replicas };
-                    if let Ok(resp) = rafts[&lid].client_write(cmd).await {
-                        return Some(resp.log_id.index);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            }
-            None
-        }
-
-        // 1. Baseline commit under full cluster.
-        let l0 = leader_of(&rafts).await.expect("initial leader");
-        assert!(commit_scale(&rafts, 2).await.is_some(), "baseline commit failed");
-
-        // 2. KILL the leader (shutdown + remove from registry so peers lose it).
-        let killed = l0;
-        rafts[&killed].shutdown().await.ok();
-        registry.write().await.remove(&killed);
-        let survivors: std::collections::HashMap<u64, _> =
-            rafts.iter().filter(|(k,_)| **k != killed).map(|(k,v)| (*k, v.clone())).collect();
-
-        // 3. Re-election among the 2 survivors (still a quorum of 3).
-        let new_leader = leader_of(&survivors).await.expect("survivors must re-elect");
-        assert_ne!(new_leader, killed, "a new leader must emerge");
-
-        // 4. New commit succeeds on the surviving quorum.
-        let idx_after_kill = commit_scale(&survivors, 5).await.expect("commit after kill failed");
-
-        // 5. The earlier committed op (replicas=2 → then 5) is present on a
-        //    survivor's state machine — nothing committed was lost.
-        let mut applied = false;
-        for _ in 0..30 {
-            if survivors.values().any(|_| true) {
-                let s = worlds[(new_leader-1) as usize].read().unwrap().config.runtime.clone();
-                if s.contains("scale svc") { applied = true; break; }
+    async fn leader(rafts: &Rafts, isolated: &Partition) -> u64 {
+        for _ in 0..100 {
+            let iso = isolated.read().await.clone();
+            for (id, r) in rafts {
+                if iso.contains(id) { continue; }
+                if r.current_leader().await == Some(*id) { return *id; }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(applied, "committed command not applied on the new leader's state machine");
-        assert!(idx_after_kill > 0);
-
-        // 6. PARTITION: isolate one survivor → it's a minority of 1, cannot
-        //    become leader or commit; the other survivor + (dead) = no quorum
-        //    either, so with only 2 live of 3, isolating 1 leaves 1 live → NO
-        //    quorum → writes must NOT commit.
-        let (a, b) = {
-            let mut it = survivors.keys().copied();
-            (it.next().unwrap(), it.next().unwrap())
-        };
-        isolated.write().await.insert(b);
-        // Now only `a` is reachable (killed removed, b isolated). 1 of 3 = no quorum.
-        let mut one = std::collections::HashMap::new();
-        one.insert(a, survivors[&a].clone());
-        let committed_in_partition = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            commit_scale(&one, 9),
-        ).await.ok().flatten();
-        assert!(committed_in_partition.is_none(),
-            "write MUST NOT commit without a quorum (got index {:?})", committed_in_partition);
-
-        // 7. HEAL: bring b back → quorum of 2 restored → writes commit again.
-        isolated.write().await.remove(&b);
-        let healed = commit_scale(&survivors, 4).await;
-        assert!(healed.is_some(), "after healing, writes must commit again");
-
-        for r in rafts.into_values() { let _ = r.shutdown().await; }
+        panic!("no leader elected");
     }
 
+    /// A write as the API would make it: next state = current + one change.
+    fn next_state(w: &Arc<std::sync::RwLock<DesiredWorld>>, f: impl FnOnce(&mut DesiredWorld)) -> (u64, DesiredState) {
+        let base = w.read().unwrap().to_state();
+        let mut scratch = DesiredWorld::from_state(base.clone());
+        f(&mut scratch);
+        let mut next = scratch.to_state();
+        next.generation = base.generation + 1;
+        (base.generation, next)
+    }
+
+    fn add_ns(name: &str) -> impl FnOnce(&mut DesiredWorld) + '_ {
+        move |w: &mut DesiredWorld| w.namespaces.push(name.to_string())
+    }
+
+    async fn write(r: &openraft::Raft<NeuroTypeConfig>, base: u64, next: DesiredState) -> Result<NeuroResponse, String> {
+        let state = Sealing::Plain.seal(&next).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(3), r.client_write(Command::Commit { base_generation: base, state })).await {
+            Ok(Ok(resp)) => Ok(resp.data),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("timeout".into()),
+        }
+    }
+
+    async fn converge(worlds: &Worlds, ids: &[u64], ns: &str) -> bool {
+        for _ in 0..50 {
+            if ids.iter().all(|i| worlds[i].read().unwrap().namespaces.iter().any(|n| n == ns)) { return true; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn replicates_and_rejects_stale_base() {
+        let (rafts, worlds, _reg, iso) = cluster(3, None).await;
+        let l = leader(&rafts, &iso).await;
+        let (base, next) = next_state(&worlds[&l], add_ns("a"));
+        let r = write(&rafts[&l], base, next.clone()).await.unwrap();
+        assert!(r.applied);
+        assert!(converge(&worlds, &[1, 2, 3], "a").await, "followers must apply the committed state");
+        // A retried / duplicated write based on the old generation is a no-op.
+        let r2 = write(&rafts[&l], base, next).await.unwrap();
+        assert!(!r2.applied, "stale-base commit must be rejected by CAS");
+        assert_eq!(worlds[&l].read().unwrap().generation, 1);
+        for r in rafts.values() { let _ = r.shutdown().await; }
+    }
+
+    #[tokio::test]
+    async fn minority_cannot_commit_and_failover_keeps_committed_writes() {
+        let (rafts, worlds, _reg, iso) = cluster(3, None).await;
+        let l = leader(&rafts, &iso).await;
+        let (b, n) = next_state(&worlds[&l], add_ns("before"));
+        assert!(write(&rafts[&l], b, n).await.unwrap().applied);
+        assert!(converge(&worlds, &[1, 2, 3], "before").await);
+
+        // Isolate the leader: it is a minority of one and cannot commit.
+        iso.write().await.insert(l);
+        let (b, n) = next_state(&worlds[&l], add_ns("minority"));
+        assert!(write(&rafts[&l], b, n).await.is_err(), "an isolated leader must not confirm a write");
+        assert!(!worlds[&l].read().unwrap().namespaces.iter().any(|x| x == "minority"),
+            "an unconfirmed write must not reach the state machine");
+
+        // The majority elects a new leader and keeps the committed write.
+        let l2 = leader(&rafts, &iso).await;
+        assert_ne!(l2, l);
+        assert!(worlds[&l2].read().unwrap().namespaces.iter().any(|x| x == "before"));
+        let (b, n) = next_state(&worlds[&l2], add_ns("after"));
+        assert!(write(&rafts[&l2], b, n).await.unwrap().applied);
+
+        // Heal: the old leader catches up, its unconfirmed write is discarded.
+        iso.write().await.clear();
+        assert!(converge(&worlds, &[1, 2, 3], "after").await, "old leader must catch up after heal");
+        assert!(!worlds[&l].read().unwrap().namespaces.iter().any(|x| x == "minority"));
+        for r in rafts.values() { let _ = r.shutdown().await; }
+    }
+
+    #[tokio::test]
+    async fn delete_propagates() {
+        let (rafts, worlds, _reg, iso) = cluster(3, None).await;
+        let l = leader(&rafts, &iso).await;
+        let (b, n) = next_state(&worlds[&l], add_ns("gone"));
+        assert!(write(&rafts[&l], b, n).await.unwrap().applied);
+        assert!(converge(&worlds, &[1, 2, 3], "gone").await);
+        let (b, n) = next_state(&worlds[&l], |w| w.namespaces.retain(|x| x != "gone"));
+        assert!(write(&rafts[&l], b, n).await.unwrap().applied);
+        for _ in 0..50 {
+            if [1, 2, 3].iter().all(|i| !worlds[i].read().unwrap().namespaces.iter().any(|x| x == "gone")) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        for i in [1u64, 2, 3] {
+            assert!(!worlds[&i].read().unwrap().namespaces.iter().any(|x| x == "gone"), "node {i} still has deleted object");
+        }
+        for r in rafts.values() { let _ = r.shutdown().await; }
+    }
+
+    #[tokio::test]
+    async fn restart_restores_vote_log_and_state_from_disk() {
+        let dir = tmpdir("restart");
+        let (rafts, worlds, _reg, iso) = cluster(3, Some(&dir)).await;
+        let l = leader(&rafts, &iso).await;
+        // Enough writes to trigger a snapshot + purge (policy: every 8 logs).
+        for i in 0..20 {
+            let (b, n) = next_state(&worlds[&l], add_ns(&format!("ns{i}")));
+            assert!(write(&rafts[&l], b, n).await.unwrap().applied);
+        }
+        assert!(converge(&worlds, &[1, 2, 3], "ns19").await);
+        let gen_before = worlds[&l].read().unwrap().generation;
+        for r in rafts.values() { let _ = r.shutdown().await; }
+        drop(rafts);
+
+        // Restart all three from the same directories with EMPTY worlds.
+        let registry = new_registry();
+        let isolated = new_partition();
+        let mut rafts2 = HashMap::new();
+        let mut worlds2 = HashMap::new();
+        for id in 1..=3u64 {
+            let w = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
+            let r = build_node_in_proc(id, w.clone(), registry.clone(), isolated.clone(), Some(dir.join(format!("n{id}")))).await.unwrap();
+            rafts2.insert(id, r);
+            worlds2.insert(id, w);
+        }
+        assert!(dir.join("n1/snapshot.json").exists(), "a snapshot must have been persisted");
+        let l2 = leader(&rafts2, &isolated).await;
+        // Restored state (snapshot + replayed log) and a new write still works.
+        for _ in 0..50 {
+            if worlds2[&l2].read().unwrap().generation >= gen_before { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(worlds2[&l2].read().unwrap().generation, gen_before);
+        assert!(worlds2[&l2].read().unwrap().namespaces.iter().any(|x| x == "ns19"));
+        let (b, n) = next_state(&worlds2[&l2], add_ns("post-restart"));
+        assert!(write(&rafts2[&l2], b, n).await.unwrap().applied);
+        assert!(converge(&worlds2, &[1, 2, 3], "post-restart").await);
+        for r in rafts2.values() { let _ = r.shutdown().await; }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn torn_log_tail_is_truncated_and_corruption_is_fatal() {
+        let e: Entry<NeuroTypeConfig> = Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Blank,
+        };
+        let rec = encode_record(&e).unwrap();
+        let mut two = rec.clone();
+        two.extend_from_slice(&rec);
+        let (entries, valid) = decode_log(&two).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(valid, two.len());
+        let torn = &two[..two.len() - 3];
+        let (entries, valid) = decode_log(torn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(valid, rec.len());
+        let mut bad = two.clone();
+        let n = bad.len();
+        bad[n - 2] ^= 0x20;
+        assert!(decode_log(&bad).is_err());
+    }
 }

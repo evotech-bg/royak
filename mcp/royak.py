@@ -6,10 +6,35 @@ The brain detects. You decide. Claude executes.
 """
 
 import json
+import os
 import urllib.request
 from fastmcp import FastMCP
 
-API = "http://127.0.0.1:6443"
+API = os.environ.get("ROYAK_API", "http://127.0.0.1:6443")
+
+
+def _token() -> str:
+    """Bearer token: ROYAK_TOKEN, else the admin token a local server generated
+    at $ROYAK_DATA_DIR/admin.token (default ~/.royak/admin.token).
+    (ROYAK_TOKEN_FILE is the server's token table, not a client token.)"""
+    tok = os.environ.get("ROYAK_TOKEN", "").strip()
+    if not tok:
+        data_dir = os.environ.get("ROYAK_DATA_DIR") or os.path.expanduser("~/.royak")
+        try:
+            with open(os.path.join(data_dir, "admin.token")) as f:
+                tok = f.read().strip()
+        except OSError:
+            pass
+    return tok
+
+
+def _request(url: str, data=None, headers=None, method=None):
+    """urllib Request carrying the API bearer token (never logged)."""
+    h = dict(headers or {})
+    tok = _token()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return urllib.request.Request(url, data=data, headers=h, method=method)
 
 mcp = FastMCP("royak", instructions="""
 You are connected to a Royak cluster — an AI-first container orchestrator.
@@ -18,12 +43,12 @@ The cluster has a neural brain that detects anomalies and predicts load.
 """)
 
 def _get(path: str) -> dict:
-    req = urllib.request.Request(f"{API}{path}")
+    req = _request(f"{API}{path}")
     with urllib.request.urlopen(req, timeout=5) as r:
         return json.loads(r.read())
 
 def _post(path: str, data: str, content_type: str = "application/yaml") -> dict:
-    req = urllib.request.Request(f"{API}{path}", data=data.encode(),
+    req = _request(f"{API}{path}", data=data.encode(),
         headers={"Content-Type": content_type}, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
@@ -106,7 +131,7 @@ def scale(deployment: str, replicas: int) -> str:
         replicas: Target number of replicas
     """
     patch = json.dumps({"spec": {"replicas": replicas}})
-    req = urllib.request.Request(
+    req = _request(
         f"{API}/apis/apps/v1/namespaces/default/deployments/{deployment}",
         data=patch.encode(),
         headers={"Content-Type": "application/json"},
@@ -135,7 +160,7 @@ def delete(resource_type: str, name: str) -> str:
         "namespace": f"/api/v1/namespaces/{name}",
     }
     path = path_map.get(resource_type, f"/api/v1/{resource_type}s/{name}")
-    req = urllib.request.Request(f"{API}{path}", method="DELETE")
+    req = _request(f"{API}{path}", method="DELETE")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             d = json.loads(r.read())
@@ -149,7 +174,7 @@ def health() -> str:
     """Check cluster health: API server, brain, node status."""
     lines = []
     try:
-        req = urllib.request.Request(f"{API}/healthz")
+        req = _request(f"{API}/healthz")
         with urllib.request.urlopen(req, timeout=3) as r:
             lines.append(f"API: {r.read().decode()}")
     except Exception as e:
@@ -178,10 +203,11 @@ def heal(pod_name: str) -> str:
     """Attempt to heal a broken pod by deleting it (the deployment will recreate it).
 
     Args:
-        pod_name: Name of the broken pod to restart
+        pod_name: Name of the broken pod to restart ("pod" or "namespace/pod")
     """
     # In Royak, healing = delete the pod, reconcile loop recreates it
-    req = urllib.request.Request(f"{API}/api/v1/pods/{pod_name}", method="DELETE")
+    ns, _, pod = pod_name.rpartition("/")
+    req = _request(f"{API}/api/v1/namespaces/{ns or 'default'}/pods/{pod}", method="DELETE")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return f"Pod {pod_name} deleted — reconcile loop will recreate it"
@@ -292,7 +318,7 @@ def apply_patch(deployment: str, replicas: int = None, image: str = None) -> str
     if image is not None:
         patch["spec"]["template"] = {"spec": {"containers": [{"image": image}]}}
     body = json.dumps(patch)
-    req = urllib.request.Request(
+    req = _request(
         f"{API}/apis/apps/v1/namespaces/default/deployments/{deployment}",
         data=body.encode(),
         headers={"Content-Type": "application/json"},

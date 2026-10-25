@@ -100,7 +100,7 @@ impl<'a> Router<'a> {
         let replicas = deployment.replicas.max(1);
         let mut remote: Option<(String, String)> = None; // (pod_name, peer_api_addr)
         for i in 1..=replicas {
-            let pod = format!("rk-{}-{}", deployment.name, i);
+            let pod = format!("{}-{}", crate::store::pod_stem(namespace, &deployment.name), i);
             match self.lookup_pod_node(&pod) {
                 // Pod lives on a peer node — remember the first, keep scanning
                 // in case a later replica turns out to be local (prefer local).
@@ -124,7 +124,7 @@ impl<'a> Router<'a> {
             }
             // Unreachable in practice (loop returns Local when remote stays None),
             // but keep a sane local fallback rather than a panic.
-            None => Endpoint::Local { pod_name: format!("rk-{}-1", deployment.name) },
+            None => Endpoint::Local { pod_name: format!("{}-1", crate::store::pod_stem(namespace, &deployment.name)) },
         }
     }
 
@@ -298,7 +298,10 @@ fn remote_mesh_addr(api_addr: &str) -> String {
 /// header + Router to decide where to forward, then bridges raw bytes
 /// between client and upstream. Blocks forever (or until accept errors
 /// in a way we can't recover from).
-pub async fn run_proxy(port: u16, local_node: String, world: Arc<RwLock<DesiredWorld>>) {
+/// `require_sealed`: accept only connections sealed with the cluster secret
+/// (cluster mode — the port listens on every interface, and a plaintext
+/// handoff would let anyone who reaches it talk to any pod).
+pub async fn run_proxy(port: u16, local_node: String, world: Arc<RwLock<DesiredWorld>>, require_sealed: bool) {
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -307,7 +310,7 @@ pub async fn run_proxy(port: u16, local_node: String, world: Arc<RwLock<DesiredW
             return;
         }
     };
-    println!("  ✓ mesh proxy listening on {addr} (node={local_node})");
+    println!("  ✓ mesh proxy listening on {addr} (node={local_node}{})", if require_sealed { ", sealed peers only" } else { "" });
 
     loop {
         let (client, remote) = match listener.accept().await {
@@ -317,7 +320,7 @@ pub async fn run_proxy(port: u16, local_node: String, world: Arc<RwLock<DesiredW
         let world = world.clone();
         let local_node = local_node.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(client, world, local_node, remote.to_string()).await {
+            if let Err(e) = handle_conn(client, world, local_node, remote.to_string(), require_sealed).await {
                 eprintln!("  [mesh] conn from {remote}: {e}");
             }
         });
@@ -335,6 +338,11 @@ pub async fn run_proxy(port: u16, local_node: String, world: Arc<RwLock<DesiredW
 /// a single-host / same-filesystem setup). If we can't obtain one, we warn and
 /// disable encryption rather than pretend (fail-safe, visible, not fail-open).
 fn cluster_secret() -> Option<String> {
+    // The node-auth cluster secret (env or ROYAK_CLUSTER_SECRET_FILE) wins:
+    // cluster mode requires it, so every node derives the same mesh key.
+    if let Some(s) = crate::auth::cluster_secret() {
+        return Some(String::from_utf8_lossy(s).into_owned());
+    }
     if let Ok(s) = std::env::var("ROYAK_CLUSTER_SECRET") {
         if !s.trim().is_empty() { return Some(s); }
     }
@@ -373,9 +381,10 @@ async fn handle_conn(
     mut client: TcpStream,
     world: Arc<RwLock<DesiredWorld>>,
     local_node: String,
-    _remote: String,
+    remote: String,
+    require_sealed: bool,
 ) -> Result<(), String> {
-    use crate::mesh_crypto::{MESH_MAGIC, mesh_key};
+    use crate::mesh_crypto::MESH_MAGIC;
 
     // Read the first chunk. It's either (a) a plaintext HTTP request from a
     // local pod, or (b) an encrypted peer connection that starts with the
@@ -390,6 +399,10 @@ async fn handle_conn(
     if n >= MESH_MAGIC.len() && &buf[..MESH_MAGIC.len()] == MESH_MAGIC {
         return serve_encrypted_peer(client, buf[MESH_MAGIC.len()..n].to_vec(), world, local_node).await;
     }
+    if require_sealed {
+        eprintln!("  ⛔ [mesh] refused unsealed connection from {remote}");
+        return reply_status(&mut client, 403, "this mesh accepts only sealed peer connections").await;
+    }
 
     let head = String::from_utf8_lossy(&buf[..n]);
 
@@ -398,6 +411,11 @@ async fn handle_conn(
     // worker node has no service/deployment definition to resolve against, so
     // this is how cross-node ingress reaches a pod that lives here.
     if let Some(pod) = parse_header(&head, "x-royak-pod") {
+        // Only a pod THIS node runs for Royak may be targeted — never an
+        // arbitrary container on the host's Docker daemon.
+        if !is_our_local_pod(&world, &local_node, &pod) {
+            return reply_status(&mut client, 404, "no such Royak pod on this node").await;
+        }
         // The sending ingress resolved the pod's Service targetPort and carried
         // it in X-Royak-Port; dial that, not a hardcoded :80. Absent header (old
         // peer) → 80.
@@ -602,6 +620,9 @@ async fn serve_encrypted_peer(
     // definitions to re-resolve against, so this is how autonomous Host-routed
     // cross-node traffic (and cross-node ingress) reaches the pod living here.
     let upstream_addr = if let Some(pod) = parse_header(&plain_head, "x-royak-pod") {
+        if !is_our_local_pod(&world, &local_node, &pod) {
+            return Err(format!("peer: handoff target {pod} is not a Royak pod of this node"));
+        }
         let port = parse_pod_port(&plain_head);
         match docker::container_ip(&pod) {
             Ok(ip) if !ip.is_empty() => format!("{ip}:{port}"),
@@ -664,6 +685,55 @@ async fn serve_encrypted_peer(
     });
     let _ = tokio::join!(up, down);
     Ok(())
+}
+
+/// Only a pod THIS node runs for this cluster may be a handoff target — never
+/// an arbitrary container on the host's Docker daemon.
+fn is_our_local_pod(world: &Arc<RwLock<DesiredWorld>>, local_node: &str, pod: &str) -> bool {
+    let cluster_id = world.read().unwrap_or_else(|e| e.into_inner()).cluster_id.clone();
+    docker::list_containers(false).map(|cs| cs.iter().any(|c|
+        crate::store::container_is_ours(c, &cluster_id, Some(local_node))
+        && c.labels.get(crate::store::LABEL_POD).map(|p| p == pod).unwrap_or(false)
+        && c.names.iter().any(|n| n.trim_start_matches('/') == pod))).unwrap_or(false)
+}
+
+/// One sealed request/response exchange with a peer's mesh proxy: the request
+/// goes out as frames sealed with the cluster key, the reply comes back sealed
+/// and is opened here. Without a cluster secret there is no peer hop at all.
+pub async fn sealed_exchange(peer: &str, request: &[u8], timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    use crate::mesh_crypto::{MESH_MAGIC, mesh_key, seal_frame, open_frame};
+    let secret = crate::auth::cluster_secret().ok_or("cross-node hop needs the cluster secret")?;
+    let key = mesh_key(&String::from_utf8_lossy(secret));
+    let fut = async {
+        let mut s = TcpStream::connect(peer).await.map_err(|e| format!("connect {peer}: {e}"))?;
+        let mut out = MESH_MAGIC.to_vec();
+        out.extend_from_slice(&seal_frame(&key, request, rand_nonce()));
+        s.write_all(&out).await.map_err(|e| format!("write {peer}: {e}"))?;
+        let mut acc = Vec::new();
+        let mut plain = Vec::new();
+        let mut b = [0u8; 16384];
+        loop {
+            match s.read(&mut b).await {
+                Ok(0) => break,
+                Ok(m) => {
+                    acc.extend_from_slice(&b[..m]);
+                    loop {
+                        match open_frame(&key, &acc) {
+                            Ok(Some((pt, used))) => { plain.extend_from_slice(&pt); acc.drain(..used); }
+                            Ok(None) => break,
+                            Err(e) => return Err(format!("{peer}: bad sealed frame: {e}")),
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("read {peer}: {e}")),
+            }
+        }
+        if !acc.is_empty() {
+            return Err(format!("{peer}: truncated sealed reply"));
+        }
+        Ok(plain)
+    };
+    tokio::time::timeout(timeout, fut).await.map_err(|_| format!("{peer}: timed out"))?
 }
 
 /// A fresh random 96-bit nonce per frame (no reuse).
@@ -736,6 +806,7 @@ mod tests {
             idle_since: None,
             stateful: false,
             owner_ref: None,
+            restart_nonce: 0,
         });
     }
 
@@ -1096,5 +1167,46 @@ mod tests {
         // And the peer can read them straight back out.
         assert_eq!(parse_header(&s, "x-royak-pod").as_deref(), Some("rk-web-1"));
         assert_eq!(parse_pod_port(&s), 8080);
+    }
+
+    #[tokio::test]
+    async fn sealed_mesh_refuses_plaintext_and_round_trips_sealed() {
+        std::env::set_var("ROYAK_CLUSTER_SECRET", "test-cluster-secret-0123456789abcdef");
+        let world = Arc::new(RwLock::new(empty_world()));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        drop(l);
+        tokio::spawn(run_proxy(addr.rsplit_once(':').unwrap().1.parse().unwrap(), "n1".into(), world, true));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A plaintext handoff (anyone who reaches the port) is refused before
+        // anything is resolved or dialled.
+        let mut c = TcpStream::connect(&addr).await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nX-Royak-Pod: rk-anything\r\nX-Royak-Port: 22\r\n\r\n").await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 403"), "{}", String::from_utf8_lossy(&out));
+
+        // A sealed exchange reaches a sealed peer and returns its opened reply.
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use crate::mesh_crypto::{MESH_MAGIC, mesh_key, seal_frame, open_frame};
+            let key = mesh_key(&String::from_utf8_lossy(crate::auth::cluster_secret().unwrap()));
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut acc = Vec::new();
+            let mut b = [0u8; 4096];
+            let req = loop {
+                let m = s.read(&mut b).await.unwrap();
+                acc.extend_from_slice(&b[..m]);
+                if acc.len() > MESH_MAGIC.len() {
+                    if let Ok(Some((pt, _))) = open_frame(&key, &acc[MESH_MAGIC.len()..]) { break pt; }
+                }
+            };
+            assert!(req.starts_with(b"GET /ping"));
+            s.write_all(&seal_frame(&key, b"HTTP/1.1 200 OK\r\n\r\npong", rand_nonce())).await.unwrap();
+        });
+        let reply = sealed_exchange(&echo_addr, b"GET /ping HTTP/1.1\r\n\r\n", std::time::Duration::from_secs(5)).await.unwrap();
+        assert!(reply.ends_with(b"pong"));
     }
 }

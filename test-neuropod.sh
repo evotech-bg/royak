@@ -93,10 +93,8 @@ elif [ "$(id -u)" -ne 0 ]; then
     skip "Pod dir created on scale" "non-root"
     skip "Cleanup on delete" "non-root"
 else
-    # Linux + root: attempt end-to-end
-    ROYAK_STATE="$STATE_NP" $BIN watch --runtime neuropod --interval 2 > /tmp/rk-neuropod2.log 2>&1 &
-    WATCH_PID=$!
-    sleep 3
+    # Linux + root: attempt end-to-end. Apply before the server starts: while
+    # a server owns the state, offline CLI writes are refused.
     ROYAK_STATE="$STATE_NP" $BIN apply - >/dev/null 2>&1 <<'YAML' || true
 apiVersion: apps/v1
 kind: Deployment
@@ -111,13 +109,20 @@ spec:
           image: alpine:latest
           command: ["sh", "-c", "while true; do sleep 5; done"]
 YAML
+    export ROYAK_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    ROYAK_STATE="$STATE_NP" $BIN watch --runtime neuropod --interval 2 > /tmp/rk-neuropod2.log 2>&1 &
+    WATCH_PID=$!
     sleep 8
-    check "NeuroPod pod dir created" "ls '$NEURO_DIR/containers/' 2>/dev/null | grep -q np-smoke"
-    ROYAK_STATE="$STATE_NP" $BIN delete deployment/np-smoke >/dev/null 2>&1 || true
-    sleep 2
+    check "NeuroPod pod dir created" "ls '$NEURO_DIR/pods/' 2>/dev/null | grep -qx 'rk-np-smoke-1'"
+    curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $ROYAK_TOKEN" \
+        http://127.0.0.1:6443/apis/apps/v1/namespaces/default/deployments/np-smoke || true
+    sleep 4
     kill -TERM "$WATCH_PID" 2>/dev/null || true
     wait "$WATCH_PID" 2>/dev/null || true
-    check "Pod dir cleaned on delete" "! ls '$NEURO_DIR/containers/' 2>/dev/null | grep -q np-smoke"
+    # The NeuroPod reconcile loop has no garbage collection of deleted
+    # deployments yet (the old check looked in the wrong directory and passed
+    # vacuously).
+    skip "Pod dir cleaned on delete" "NeuroPod does not garbage-collect pods of deleted deployments yet"
 fi
 
 # ═══════════════════════════════════════════

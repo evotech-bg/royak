@@ -23,6 +23,7 @@ use crate::reconcile::DesiredWorld;
 
 #[derive(Clone, PartialEq)]
 struct LbSpec {
+    namespace: String,
     service: String,
     node_port: u16,
     target_port: u16,
@@ -35,13 +36,14 @@ pub async fn run(world: Arc<RwLock<DesiredWorld>>) {
     let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
         let specs: Vec<LbSpec> = {
-            let w = world.read().unwrap();
+            let w = world.read().unwrap_or_else(|e| e.into_inner());
             w.services
                 .values()
                 .filter(|s| s.service_type == "NodePort" || s.service_type == "LoadBalancer")
                 .flat_map(|s| {
                     let dep = s.selector.get("app").cloned().unwrap_or_default();
                     let svc = s.name.clone();
+                    let ns = s.namespace.clone();
                     let is_lb = s.service_type == "LoadBalancer";
                     s.ports
                         .iter()
@@ -51,6 +53,7 @@ pub async fn run(world: Arc<RwLock<DesiredWorld>>) {
                             // "external IP" = the node), klipper-lb-style.
                             let listen = if is_lb { Some(p.port) } else { p.node_port };
                             listen.map(|lp| LbSpec {
+                                namespace: ns.clone(),
                                 service: svc.clone(),
                                 node_port: lp,
                                 target_port: p.target_port,
@@ -77,19 +80,19 @@ pub async fn run(world: Arc<RwLock<DesiredWorld>>) {
                 continue;
             }
             let port = spec.node_port;
-            listeners.insert(port, tokio::spawn(listen(spec)));
+            listeners.insert(port, tokio::spawn(listen(spec, Arc::clone(&world))));
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
 
-async fn listen(spec: LbSpec) {
+async fn listen(spec: LbSpec, world: Arc<RwLock<DesiredWorld>>) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", spec.node_port)).await {
         Ok(l) => {
             eprintln!(
-                "  [servicelb] :{} → {} (svc/{}, targetPort {})",
-                spec.node_port, spec.deployment, spec.service, spec.target_port
+                "  [servicelb] :{} → {}/{} (svc/{}, targetPort {})",
+                spec.node_port, spec.namespace, spec.deployment, spec.service, spec.target_port
             );
             l
         }
@@ -106,6 +109,8 @@ async fn listen(spec: LbSpec) {
             Err(_) => continue,
         };
         let dep = spec.deployment.clone();
+        let ns = spec.namespace.clone();
+        let w = Arc::clone(&world);
         let svc = spec.service.clone();
         let tp = spec.target_port;
         let np = spec.node_port;
@@ -113,7 +118,7 @@ async fn listen(spec: LbSpec) {
         tokio::spawn(async move {
             // Docker calls are blocking unix-socket IO — keep them off the reactor.
             let backend =
-                tokio::task::spawn_blocking(move || pick_backend(&dep, tp, start)).await.ok().flatten();
+                tokio::task::spawn_blocking(move || pick_backend(&w, &ns, &dep, tp, start)).await.ok().flatten();
             let Some(host_port) = backend else { return };
             if let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", host_port)).await {
                 let t0 = std::time::Instant::now();
@@ -138,17 +143,21 @@ async fn listen(spec: LbSpec) {
 
 /// Pick a running pod of `deployment` (round-robin from `start`) that has
 /// `target_port` published, and return its ephemeral host port.
-fn pick_backend(deployment: &str, target_port: u16, start: usize) -> Option<u16> {
+fn pick_backend(world: &Arc<RwLock<DesiredWorld>>, namespace: &str, deployment: &str, target_port: u16, start: usize) -> Option<u16> {
     let containers = crate::docker::list_containers(false).ok()?;
-    let mut pods: Vec<String> = containers
-        .iter()
+    let w = world.read().unwrap_or_else(|e| e.into_inner());
+    // Only this cluster's own main containers of `namespace/deployment`.
+    let mut pods: Vec<String> = crate::reconcile::our_containers(&w, &containers)
+        .into_iter()
         .filter(|c| {
             c.state == "running"
-                && c.labels.get("royak.deployment").map(|d| d.as_str()) == Some(deployment)
-                && c.labels.get("royak.role").map(|r| r.as_str()) != Some("sidecar")
+                && c.labels.get(crate::store::LABEL_DEPLOYMENT).map(|d| d.as_str()) == Some(deployment)
+                && c.labels.get(crate::store::LABEL_NAMESPACE).map(|n| n.as_str()).unwrap_or(crate::store::DEFAULT_NS) == namespace
+                && c.labels.get(crate::store::LABEL_ROLE).map(|r| r == "main").unwrap_or(true)
         })
         .filter_map(|c| c.names.first().map(|n| n.trim_start_matches('/').to_string()))
         .collect();
+    drop(w);
     pods.sort();
     if pods.is_empty() {
         return None;
