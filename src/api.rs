@@ -753,8 +753,14 @@ fn route_request(cx: &Ctx) -> (u16, String) {
     }
     let trigger_fn = {
         let w = world.read().unwrap_or_else(|e| e.into_inner());
-        w.functions.values().find(|f| f.http_triggers.iter().any(|t| t == path) || f.webhook_triggers.iter().any(|t| t == path))
-            .map(|f| f.name.clone())
+        // Only on paths the gate authorized as functions/invoke (a stored
+        // trigger can never shadow another endpoint's authorization).
+        if crate::auth::is_function_trigger_path(path) {
+            w.functions.values().find(|f| f.http_triggers.iter().any(|t| t == path) || f.webhook_triggers.iter().any(|t| t == path))
+                .map(|f| f.name.clone())
+        } else {
+            None
+        }
     };
     if let Some(name) = trigger_fn {
         return match crate::store::commit(world, |w| reconcile::invoke_function(w, &name).map_err(|e| (500, e))) {
@@ -1176,6 +1182,11 @@ async fn handle_request(
             .unwrap());
     }
 
+    // Empty path segments ("//") are never valid and must not reach the gate
+    // or the router, which would otherwise have to agree on how to read them.
+    if path != "/" && path.trim_matches('/').split('/').any(|s| s.is_empty()) {
+        return Ok(json_response(400, &status_json(400, "BadRequest", "empty path segment")));
+    }
     let access = crate::auth::classify(method.as_str(), &path, &query, websocket);
 
     // ── Node endpoints: HMAC signature over method, path, time, nonce, body ──

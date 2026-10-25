@@ -123,7 +123,14 @@ if [ -n "$REMOTE" ]; then
     check "remote pod: namespace label" "[ \$(docker inspect -f '{{index .Config.Labels \"royak.namespace\"}}' $REMOTE) = $NS ]"
     check "remote pod: serves on its container port" "docker exec $REMOTE wget -qO- -T 3 http://127.0.0.1:8080/ | grep -qx ok"
     # Logs of a pod on another node travel over node RPC (signed + sealed).
-    RLOGS=$(api "$L" GET "/api/v1/namespaces/$NS/pods/$REMOTE/log")
+    # The leader learns about a peer's pods through the census poll, so a pod
+    # that just started can be unknown to it for a few seconds (404).
+    end=$((SECONDS+20))
+    while :; do
+        RLOGS=$(api "$L" GET "/api/v1/namespaces/$NS/pods/$REMOTE/log")
+        echo "$RLOGS" | tail -1 | grep -q 'HTTP 404' && [ $SECONDS -lt $end ] || break
+        sleep 1
+    done
     check "remote pod logs through the leader (node RPC)" \
         "echo \"\$RLOGS\" | grep -qx 'hello-from-cfg s3cr3t-value literal-mode'"
     echo "$RLOGS" | grep -qx 'hello-from-cfg s3cr3t-value literal-mode' || echo "    got: $(echo "$RLOGS" | head -c 300)"
@@ -137,6 +144,14 @@ check "viewer can read (node $F)" "[ '$C' = 200 ]"
 printf 'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: nope, namespace: %s}\ndata: {a: b}\n' $NS > "$WORK/nope.yaml"
 C=$(api "$L" POST /api/v1/namespaces/$NS/configmaps "$WORK/nope.yaml" "$VIEW_TOKEN" | code_of)
 check "viewer cannot write → 403" "[ '$C' = 403 ]"
+C=$(api "$F" GET /api/v1/namespaces/$NS/secrets "" "$VIEW_TOKEN" | code_of)
+check "viewer cannot read secrets → 403" "[ '$C' = 403 ]"
+# Empty path segments must not smuggle a resource read past the gate as "discovery".
+for P in "/apis///secrets" "/apis///secrets/sec" "/apis/x//secrets"; do
+    OUT=$(api "$F" GET "$P" "" "$VIEW_TOKEN")
+    C=$(echo "$OUT" | code_of)
+    check "viewer GET $P is refused ($C) and leaks nothing" "[ '$C' != 200 ] && ! echo \"\$OUT\" | grep -q s3cr3t"
+done
 
 echo ""
 echo "5. Self-healing after a pod kill"

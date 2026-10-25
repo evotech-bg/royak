@@ -1812,6 +1812,9 @@ impl DesiredWorld {
                         if let Some(s) = &t.schedule { schedule_triggers.push(s.clone()); }
                     }
                 }
+                if let Some(bad) = http_triggers.iter().chain(&webhook_triggers).find(|p| !crate::auth::is_function_trigger_path(p)) {
+                    return Err(format!("Function {name}: trigger path {bad} is reserved (it is a Kubernetes, Royak or system endpoint); use e.g. /fn/... or /hooks/..."));
+                }
 
                 let timeout = func_spec.timeout.as_deref()
                     .and_then(|t| t.trim_end_matches('s').trim_end_matches('m').parse::<u64>().ok()

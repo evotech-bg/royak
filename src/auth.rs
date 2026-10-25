@@ -241,6 +241,11 @@ pub enum Access {
 /// Split a Kubernetes REST path into (namespace, resource, name, subresource).
 pub fn parse_k8s_path(path: &str) -> Option<(Option<&str>, &str, Option<&str>, Option<&str>)> {
     let segs: Vec<&str> = path.trim_start_matches('/').trim_end_matches('/').split('/').collect();
+    // An empty segment ("//") is never a valid group, version, namespace,
+    // resource or name; refusing it keeps the router and the gate in step.
+    if segs.iter().any(|s| s.is_empty()) {
+        return None;
+    }
     let rest: &[&str] = match segs.as_slice() {
         ["api", "v1", rest @ ..] => rest,
         ["apis", _group, _version, rest @ ..] => rest,
@@ -259,6 +264,24 @@ pub fn parse_k8s_path(path: &str) -> Option<(Option<&str>, &str, Option<&str>, O
         [res] => Some((None, res, None, None)),
         _ => None,
     }
+}
+
+/// A Function trigger may only live on a path whose authorization IS the
+/// functions/invoke permission. Anything the gate maps to another decision
+/// (a Kubernetes resource, discovery, health, node or Royak endpoints) can
+/// never be shadowed by a trigger. The router uses the same check, so the
+/// gate and the router cannot disagree about what a path is.
+pub fn is_function_trigger_path(path: &str) -> bool {
+    let invoke = Access::Rbac(Attrs::new("create", "functions", Some("invoke"), None, None));
+    path.starts_with('/') && !path.starts_with("/hooks/repo/")
+        && ["GET", "POST", "PUT", "DELETE", "PATCH"].iter()
+            .all(|m| classify(m, path, &HashMap::new(), false) == invoke)
+}
+
+/// `/apis/<group>` or `/apis/<group>/<version>` exactly (no empty segments).
+fn is_group_discovery(path: &str) -> bool {
+    let segs: Vec<&str> = path.trim_start_matches('/').trim_end_matches('/').split('/').collect();
+    segs.first() == Some(&"apis") && (2..=3).contains(&segs.len()) && segs.iter().all(|s| !s.is_empty())
 }
 
 pub fn demo_enabled() -> bool {
@@ -288,7 +311,7 @@ pub fn classify(method: &str, path: &str, query: &HashMap<String, String>, webso
         | ("POST", "/royak/v1/delete-pod") | ("GET", "/royak/v1/pods") => return Access::Node,
         ("GET", p) if p.starts_with("/royak/v1/pod-logs/") => return Access::Node,
         ("GET", "/api" | "/apis" | "/api/v1" | "/openapi/v2" | "/openapi/v3") => return Access::Authenticated,
-        ("GET", p) if p.starts_with("/apis/") && p.split('/').filter(|s| !s.is_empty()).count() <= 3 => return Access::Authenticated,
+        ("GET", p) if is_group_discovery(p) => return Access::Authenticated,
         ("GET", p) if p.starts_with("/openapi/") => return Access::Authenticated,
         _ => {}
     }
@@ -393,8 +416,7 @@ fn builtin_cluster_role(name: &str) -> Option<Vec<RbacRule>> {
 }
 
 fn rule_allows(r: &RbacRule, a: &Attrs) -> bool {
-    let verb_ok = r.verbs.iter().any(|v| v == "*" || v == &a.verb
-        || (a.verb == "create" && a.subresource.as_deref() == Some("exec") && v == "get"));
+    let verb_ok = r.verbs.iter().any(|v| v == "*" || v == &a.verb);
     let full = match &a.subresource { Some(s) => format!("{}/{s}", a.resource), None => a.resource.clone() };
     let res_ok = r.resources.iter().any(|x| x == "*" || x == &full
         || (a.subresource.is_none() && x == &a.resource)
@@ -681,6 +703,41 @@ mod tests {
         match classify(method, path, &q(), false) {
             Access::Rbac(a) => a,
             other => panic!("{method} {path} → {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_path_segments_cannot_reach_resources_through_discovery() {
+        // The gate and the router must read a path the same way: an empty
+        // segment ("//") must not turn a resource request into "discovery".
+        for p in ["/apis///secrets", "/apis///secrets/db", "/apis/x//secrets", "/apis//v1/secrets",
+                  "/api//v1/secrets", "/api/v1//secrets", "/api/v1/namespaces//secrets"] {
+            assert_ne!(classify("GET", p, &q(), false), Access::Authenticated, "{p} must not be discovery");
+            assert_eq!(parse_k8s_path(p), None, "{p} must not parse as a resource");
+        }
+        // Real discovery still works.
+        assert_eq!(classify("GET", "/apis/apps/v1", &q(), false), Access::Authenticated);
+        assert_eq!(classify("GET", "/apis/apps", &q(), false), Access::Authenticated);
+        assert_eq!(parse_k8s_path("/apis/apps/v1/namespaces/a/deployments"), Some((Some("a"), "deployments", None, None)));
+    }
+
+    #[test]
+    fn get_on_pods_exec_does_not_grant_exec() {
+        let r = RbacRule { verbs: vec!["get".into()], resources: vec!["pods/exec".into()], namespaces: vec!["*".into()], resource_names: vec![] };
+        assert!(!rule_allows(&r, &Attrs::new("create", "pods", Some("exec"), Some("a"), Some("p"))));
+        let r = RbacRule { verbs: vec!["create".into()], resources: vec!["pods/exec".into()], namespaces: vec!["*".into()], resource_names: vec![] };
+        assert!(rule_allows(&r, &Attrs::new("create", "pods", Some("exec"), Some("a"), Some("p"))));
+    }
+
+    #[test]
+    fn function_triggers_cannot_shadow_other_endpoints() {
+        for ok in ["/api/hello", "/api/date", "/hooks/greet", "/fn/resize"] {
+            assert!(is_function_trigger_path(ok), "{ok} should be a valid trigger");
+        }
+        for bad in ["/api/v1/configmaps", "/api/v1/namespaces/a/secrets", "/apis/apps/v1/deployments",
+                    "/apis/apps", "/api", "/healthz", "/version", "/", "/hooks/repo/x", "/royak/v1/pods",
+                    "/royak/v1/heartbeat", "/openapi/v2", "relative"] {
+            assert!(!is_function_trigger_path(bad), "{bad} must not be accepted as a trigger");
         }
     }
 

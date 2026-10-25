@@ -293,7 +293,9 @@ deployments. Here is the honest ledger:
   returns 504 "outcome unknown" (it may still commit once a quorum returns; re-read before
   retrying). A leader lost mid-write can return 421 for a write that later commits.
 - **A newly elected scheduler waits for the census** (every configured peer reported, or 15 s)
-  before placing pods, so recovery right after a failover is slower.
+  before placing pods, so recovery right after a failover is slower. Other nodes also learn about
+  a peer's pods through that poll: `logs`/`get` for a pod that started seconds ago on another
+  node can briefly return 404.
 - **The mesh port is fixed (`:6550`)**, so only one node per host binds it; sealed peer frames
   are encrypted and authenticated but a captured frame can be replayed.
 - **Canary strategy** is parsed and scheduled with weighted steps, but traffic splitting at the

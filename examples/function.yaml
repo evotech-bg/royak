@@ -4,6 +4,8 @@
 # Or via HTTP: curl -H "Authorization: Bearer $ROYAK_TOKEN" http://localhost:6443/api/hello
 # Or webhook:  curl -H "Authorization: Bearer $ROYAK_TOKEN" http://localhost:6443/hooks/greet
 # (HTTP triggers are API calls: they need a token allowed to invoke functions)
+# Trigger paths must not be Kubernetes, Royak or system endpoints (/api/v1/..., /apis/...,
+# /royak/..., /healthz, /hooks/repo/...): apply refuses them.
 
 apiVersion: royak/v1
 kind: Function
