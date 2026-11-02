@@ -1,0 +1,49 @@
+name: One approved Linux ARM64 build (12GiB diagnostic)
+
+# Temporary one-off entrypoint on this trusted project branch only.
+# No PR/fork trigger, merge, release or deployment.
+on:
+  push:
+    branches: [fix/cluster-census-federation]
+    paths:
+      - .github/workflows/oneoff-linux-build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: royak-approved-single-build
+  cancel-in-progress: false
+
+jobs:
+  linux-build:
+    if: github.repository == 'evotech-bg/royak' && github.ref == 'refs/heads/fix/cluster-census-federation'
+    runs-on: [self-hosted, macOS, ARM64, evotech-bg]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          clean: false
+          path: royak-build-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: One compiler invocation, original profile and exact-owned cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/royak-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          for p in python3.14 python3.13 python3.12 python3.11; do
+            if command -v "$p" >/dev/null; then
+              exec "$p" -B tests/qualification/actions_oneoff_build.py --one-approved-actions-build
+            fi
+          done
+          echo 'Existing Python >=3.11 required; nothing installed.' >&2
+          exit 1
+      - name: Preserve build output and failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: royak-oneoff-linux-${{ github.sha }}
+          path: royak-build-${{ github.run_id }}-${{ github.run_attempt }}/.oneoff-build/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

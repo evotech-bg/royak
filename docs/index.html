@@ -4,9 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Royak — a swarm of containers, one tiny binary</title>
-<meta name="description" content="Royak is a container orchestrator in a single ~7.3 MB Rust binary. Deployments, rolling updates, services, RBAC, autoscaling and kubectl compatibility — without a control plane to babysit. Public beta." />
+<meta name="description" content="Royak is a container orchestrator in a single ~8.9 MB Rust binary. Deployments, rolling updates, services, RBAC, autoscaling and kubectl compatibility — without a control plane to babysit. Public beta." />
 <meta property="og:title" content="Royak — a swarm of containers, one tiny binary" />
-<meta property="og:description" content="Kubernetes-style orchestration in a single ~7.3 MB Rust binary. Public beta." />
+<meta property="og:description" content="Kubernetes-style orchestration in a single ~8.9 MB Rust binary. Public beta." />
 <link rel="icon" type="image/png" href="./assets/royak-mark.png" />
 <meta property="og:image" content="https://evotech-bg.github.io/royak/assets/royak-og.png" />
 <style>
@@ -168,7 +168,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);fo
     <h1>A swarm of containers.<br /><span class="accent">One tiny binary.</span></h1>
     <p class="sub"><b>Royak</b> (<i>рояк</i> — Bulgarian for “swarm”) orchestrates Docker containers the way
     Kubernetes does — deployments, rolling updates, services, RBAC, autoscaling — in a single
-    <b>~7.3&nbsp;MB</b> binary. No etcd, no control-plane zoo, nothing to babysit.</p>
+    <b>~8.9&nbsp;MB</b> binary. No etcd, no control-plane zoo, nothing to babysit.</p>
     <div class="ctas">
       <a class="btn btn-primary" href="https://demo.royak.io" target="_blank" rel="noopener">▶ Watch the live cluster</a>
       <a class="btn btn-ghost" href="https://github.com/evotech-bg/royak">View on GitHub</a>
@@ -181,9 +181,9 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;color:var(--ink2);fo
       <button class="copy-btn" onclick="copyCmd()" id="copybtn">Copy</button>
     </div>
     <div class="stats">
-      <span><b>~7.3 MB</b> release binary</span>
-      <span><b>~16,000</b> lines of Rust</span>
-      <span><b>200+</b> tests</span>
+      <span><b>~8.9 MB</b> release binary (macOS arm64)</span>
+      <span><b>~24,000</b> lines of Rust</span>
+      <span><b>530+</b> tests</span>
       <span><b>0</b> etcd</span>
     </div>
   </div>
@@ -235,15 +235,16 @@ rk-web-4   0s
   <div class="wrap">
     <span class="kicker">Features</span>
     <h2>Small binary. Not a small feature set.</h2>
-    <p class="lead">Everything below is exercised by the test suite on every commit — 85 unit tests
-    plus 120+ integration checks across six suites, and a feature-by-feature
+    <p class="lead">Everything below is covered by the repository’s test suites — 191 unit tests
+    plus 346 integration checks across eleven suites against real Docker (counts from the
+    2026-10-25 run of the current source), and a feature-by-feature
     <a href="https://github.com/evotech-bg/royak/blob/main/COMPATIBILITY.md">compatibility ledger</a>
     verified against a real kubectl.</p>
     <div class="grid g3">
       <div class="card"><h3><span class="ico">🏗️</span>Build from source → deploy</h3><p>Point a pipeline at a git repo with a Dockerfile: <code>git push</code> → Royak builds the image and deploys it, routed and live. A Heroku/Coolify-style PaaS flow with no external CI or registry — in the same one binary.</p></div>
       <div class="card"><h3><span class="ico">📦</span>Deployments &amp; StatefulSets</h3><p>Create, scale, delete with CPU/memory limits and HPA autoscaling. StatefulSets get ordered startup, stable identity and per-ordinal volumes.</p></div>
       <div class="card"><h3><span class="ico">🔄</span>Rolling updates &amp; rollback</h3><p>Zero-downtime rollouts with readiness checks and auto-rollback on timeout. Rollback works even after the rollout completes.</p></div>
-      <div class="card"><h3><span class="ico">🌐</span>Services &amp; ingress</h3><p>ClusterIP discovery with pod-to-service DNS, NodePort via the built-in ServiceLB (userspace load balancer), and a live ingress reverse proxy — async, streaming, TLS.</p></div>
+      <div class="card"><h3><span class="ico">🌐</span>Services &amp; ingress</h3><p>ClusterIP discovery with pod-to-service DNS, NodePort and LoadBalancer via the built-in ServiceLB (userspace load balancer that only sends traffic to Ready pods and follows Service changes live), and a live ingress reverse proxy — async, streaming, TLS.</p></div>
       <div class="card"><h3><span class="ico">🔐</span>RBAC &amp; secrets</h3><p>Role-based access enforced on every API write. Secrets encrypted at rest with AES-256-GCM. mTLS cluster CA with per-pod certificates.</p></div>
       <div class="card"><h3><span class="ico">🤝</span>kubectl compatible</h3><p><code>get</code>, <code>describe</code>, <code>delete</code>, <code>watch</code>, <code>logs</code>, <code>scale</code>, <code>exec -it</code>, <code>get events</code> and <code>apply</code> with client-side updates.</p></div>
       <div class="card"><h3><span class="ico">🖧</span>Multi-node mesh</h3><p>UDP autodiscovery, pod distribution, heartbeat monitoring, and a cross-node service proxy so pods on node B reach services on node A.</p></div>
@@ -304,9 +305,10 @@ spec:
     <div class="truth">
       <div class="truth-row"><b><span class="tag tag-yes">solid</span>Single node</b><span>Deploy, scale, rolling update, rollback, probes, CrashLoopBackOff — covered by the test suite end to end.</span></div>
       <div class="truth-row"><b><span class="tag tag-yes">solid</span>kubectl workflow</b><span>get / describe / delete / watch / logs / scale / exec / events, apply with client-side updates — verified against kubectl v1.36.</span></div>
-      <div class="truth-row"><b><span class="tag tag-yes">solid</span>NodePort ServiceLB</b><span>Userspace load balancer binds every nodePort and round-robins across pods — works on macOS and Linux.</span></div>
-      <div class="truth-row"><b><span class="tag tag-part">partial</span>Multi-node</b><span>Control-plane sync, mesh proxy and HA leader-lease failover work and are tested — but not battle-tested at scale. Split-brain across independent disks is possible until Raft lands.</span></div>
-      <div class="truth-row"><b><span class="tag tag-part">partial</span>Raft consensus</b><span>openraft is integrated: leader election and log replication are proven in tests (in-process + HTTP transports). The live write path doesn’t go through Raft yet — that’s the next milestone.</span></div>
+      <div class="truth-row"><b><span class="tag tag-yes">solid</span>NodePort ServiceLB</b><span>Userspace load balancer binds every nodePort and round-robins across Ready pods only; selector, targetPort and delete/recreate changes reach the live listener without a restart — works on macOS and Linux. Each node forwards to its own pods.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Multi-node</b><span>The leader places pods on any Ready node over signed RPC with the full workload contract, and replaces killed pods and lost nodes without over-provisioning. Tested with three processes on one host and one Docker daemon — not yet across machines.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Raft consensus</b><span>In the current source (not yet in a published release) every desired-state write commits through openraft on a quorum before it is acknowledged, with a durable log, vote and snapshots; a minority answers “outcome unknown” and stops scheduling. Verified with three nodes on one host, not across machines.</span></div>
+      <div class="truth-row"><b><span class="tag tag-part">partial</span>Health probes</b><span>httpGet, tcpSocket and exec, run inside the pod; errors and missing tools count as NotReady, never Ready. Probes run once per reconcile tick — periodSeconds, initialDelaySeconds and readiness/liveness failureThreshold are not honoured yet.</span></div>
       <div class="truth-row"><b><span class="tag tag-part">partial</span>Canary releases</b><span>Parsed and scheduled with weighted steps; service-layer traffic splitting still needs its proxy integration.</span></div>
       <div class="truth-row"><b><span class="tag tag-no">not yet</span>Helm engine</b><span>No native chart rendering. <code>helm template ./chart | royak apply -</code> works today.</span></div>
       <div class="truth-row"><b><span class="tag tag-yes">solid</span>exec &amp; port-forward</b><span>kubectl exec including -it (TTY, resize) works over WebSocket; royak port-forward tunnels local→pod. kubectl port-forward's SPDY tunnel is the one remaining caveat.</span></div>
@@ -321,7 +323,9 @@ spec:
     <h2>Clone to cluster in about two minutes.</h2>
     <p class="lead">Build from source, or grab a pre-built beta binary for Linux (x86_64/aarch64) and
     macOS (Apple silicon/Intel) from
-    <a href="https://github.com/evotech-bg/royak/releases">GitHub Releases</a>.</p>
+    <a href="https://github.com/evotech-bg/royak/releases">GitHub Releases</a>. The latest release
+    is v0.4.0-beta.1; features that landed after it — such as Raft on the write path — are in the
+    source only until the next release.</p>
     <div class="install-block">
       <b>Build &amp; run</b>
       <pre># prerequisites: Docker running, Rust toolchain

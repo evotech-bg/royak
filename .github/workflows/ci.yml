@@ -15,6 +15,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -32,31 +34,40 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Release verifier regression tests (no Docker required)
+        working-directory: tests/qualification
+        run: python3 -B -m unittest -v test_verify_release
+
       - name: Build
-        run: cargo build --release
+        id: release-build
+        run: cargo build --locked --release
 
-      - name: Check binary size (<10MB)
+      - name: Release identity, size and exit-code-checked smoke
+        run: python3 -B tests/qualification/verify_release.py --binary target/release/royak --report release-evidence/smoke.json
+
+      - name: Preserve this commit's release and smoke evidence
+        # The cache may contain an older binary after a failed compilation.
+        # Never upload it as this commit's release.
+        if: always() && steps.release-build.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: royak-release-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            target/release/royak
+            release-evidence/smoke.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Pin signature-verified restic for this hosted test runner
+        shell: bash
         run: |
-          ls -lh target/release/royak
-          SIZE=$(stat -f%z target/release/royak 2>/dev/null || stat -c%s target/release/royak)
-          echo "Binary size: $SIZE bytes"
-          if [ "$SIZE" -gt 10485760 ]; then
-            echo "FAIL: Binary too large (>10MB)"
-            exit 1
-          fi
+          set -euo pipefail
+          gpg --version >/dev/null
+          TOOL_ROOT="tests/qualification/.runs/ci-restic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_OS}-${RUNNER_ARCH}"
+          python3 -B tests/qualification/parallels/get_restic.py --host --root "$TOOL_ROOT" --github-env "$GITHUB_ENV"
 
-      - name: Check build has no errors
-        run: cargo build --release 2>&1 | grep -c "^error" | grep -q "^0$"
-
-      - name: Unit tests (cargo test)
-        run: cargo test --bin royak
-
-      - name: "Smoke: brain + demo (no Docker required)"
-        run: |
-          target/release/royak brain 2>&1 | grep -q "OrinBrain"
-          echo "Brain: OK"
-          target/release/royak demo 2>&1 | grep -q "SCHEDULE\|Noop\|SCALE"
-          echo "Demo: OK"
+      - name: Unit tests (cargo test; pinned restic required)
+        run: cargo test --locked --bin royak
 
   docker-tests:
     runs-on: ubuntu-latest
@@ -80,7 +91,7 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Integration tests (62 checks)
+      - name: Integration tests (test-demo.sh)
         run: bash test-demo.sh
 
       - name: StorageClass auto-provisioning
@@ -129,7 +140,7 @@ jobs:
           key: ubuntu-cargo-multinode-${{ hashFiles('**/Cargo.lock') }}
       - name: Build
         run: cargo build --release
-      - name: Multi-node sync test
+      - name: "Multi-node: signed census, remote workload contract, self-healing, node loss"
         run: bash test-multinode.sh
 
   ha-lease:
@@ -150,8 +161,71 @@ jobs:
           key: ubuntu-cargo-ha-${{ hashFiles('**/Cargo.lock') }}
       - name: Build
         run: cargo build --release
-      - name: HA leader lease test
+      - name: "Single writer: state owner lock + standby"
         run: bash test-ha-lease.sh
+
+  raft-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-raft-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: "Raft: failover, catch-up, minority partition, delete propagation, snapshots"
+        run: bash test-raft-cluster.sh
+
+  servicelb-probes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-slb-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: "ServiceLB readiness, live Service changes, tcpSocket/httpGet/exec probes"
+        run: bash test-servicelb-probes.sh
+
+  auth-http:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-auth-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release
+      - name: "Auth via the real API: malformed paths, trigger shadowing, exec RBAC, kubectl"
+        run: bash test-auth-http.sh
 
   mesh:
     runs-on: ubuntu-latest
@@ -220,11 +294,25 @@ jobs:
             target/
           key: ubuntu-cargo-neuropod-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
-        run: cargo build --release
+      - name: Build the Linux/musl test binary
+        run: python3 -B tests/qualification/run.py build --binary tests/qualification/.runs/linux-royak-neuropod-gc
 
-      - name: NeuroPod smoke (EXPERIMENTAL)
-        run: bash test-neuropod.sh
+      - name: Prepare isolated suite base images
+        run: |
+          docker pull alpine:3.22
+          docker pull alpine:latest
+          docker pull nginx:1.29-alpine
+
+      - name: Real NeuroPod lifecycle and GC (zero skips)
+        run: python3 -B tests/qualification/suites.py --binary tests/qualification/.runs/linux-royak-neuropod-gc --storage-driver overlay2 --suite test-neuropod.sh
+
+      - name: Keep NeuroPod evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neuropod-gc-evidence
+          path: tests/qualification/.runs/rkq-suites-*/
+          include-hidden-files: true
 
   build-pipeline:
     runs-on: ubuntu-latest

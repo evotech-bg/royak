@@ -13,3 +13,7 @@
 target-linux/
 .cargo-docker/
 _linuxtest/
+
+# local multi-node test artifacts
+royak-node
+cluster-test.yaml

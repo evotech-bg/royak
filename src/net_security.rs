@@ -12,6 +12,7 @@
 
 /// Cluster Certificate Authority — generates and signs pod certificates.
 /// One CA per cluster, stored in state, rotated on demand.
+#[derive(Clone)]
 pub struct ClusterCA {
     pub cert_pem: String,
     pub key_pem: String,
@@ -41,6 +42,7 @@ pub struct NetworkAuditEntry {
 }
 
 /// Neural network pattern tracker — learns normal pod communication patterns
+#[derive(Clone)]
 pub struct NetworkPatternTracker {
     /// Per-pod connection history: pod_name → list of (target_network, count)
     patterns: rustc_hash::FxHashMap<String, Vec<(String, u32)>>,

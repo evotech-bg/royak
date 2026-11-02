@@ -44,10 +44,14 @@ fi
 # ═══════════════════════════════════════════
 echo "1. Bring up cluster state + a service"
 echo "─────────────────────────────────────"
-$BIN watch --interval 60 > /tmp/rk-mesh-watch.log 2>&1 &
+# While a server owns the state, changes go through its API (the offline CLI
+# write is refused), authenticated with this run's admin token.
+export ROYAK_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+$BIN watch --interval 5 > /tmp/rk-mesh-watch.log 2>&1 &
 WATCH_PID=$!
 sleep 3
-$BIN apply - >/dev/null 2>&1 <<'YAML'
+curl -s -o /dev/null -X POST -H "Authorization: Bearer $ROYAK_TOKEN" -H 'Content-Type: application/yaml' \
+    --data-binary @- http://127.0.0.1:6443/apis/apps/v1/namespaces/default/deployments <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -70,7 +74,7 @@ spec:
   selector: {app: mesh-target}
   ports: [{port: 80, targetPort: 80}]
 YAML
-sleep 5
+for _ in $(seq 1 30); do docker ps --filter name=rk-mesh-target-1 --filter status=running -q | grep -q . && break; sleep 1; done
 check "target pod is running" "docker ps --filter name=rk-mesh-target-1 --filter status=running -q | grep -q ."
 
 # ═══════════════════════════════════════════

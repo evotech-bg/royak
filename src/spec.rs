@@ -85,6 +85,8 @@ pub struct PodTemplate {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct PodSpec {
+    #[serde(rename = "securityContext")]
+    pub security_context: Option<crate::security::PodSecurityContext>,
     #[serde(rename = "initContainers")]
     pub init_containers: Option<Vec<ContainerSpec>>,
     pub containers: Vec<ContainerSpec>,
@@ -96,6 +98,8 @@ pub struct PodSpec {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct ContainerSpec {
+    #[serde(rename = "securityContext")]
+    pub security_context: Option<crate::security::SecurityContext>,
     pub name: String,
     pub image: String,
     pub ports: Option<Vec<PortSpec>>,
@@ -103,6 +107,8 @@ pub struct ContainerSpec {
     #[serde(rename = "envFrom", default)]
     pub env_from: Option<Vec<EnvFromSpec>>,
     pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
     pub resources: Option<ResourceSpec>,
     #[serde(rename = "volumeMounts")]
     pub volume_mounts: Option<Vec<VolumeMount>>,
@@ -130,30 +136,60 @@ pub struct NameRef {
 /// Health probe spec (K8s compatible)
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeSpec {
     #[serde(rename = "httpGet")]
     pub http_get: Option<HttpGetProbe>,
     pub exec: Option<ExecProbe>,
+    #[serde(rename = "tcpSocket")]
+    pub tcp_socket: Option<TcpSocketProbe>,
+    /// Kept only to reject it with a clear error — gRPC probes are unsupported.
+    pub grpc: Option<serde_yaml::Value>,
     #[serde(rename = "initialDelaySeconds", default)]
     pub initial_delay_seconds: u64,
     #[serde(rename = "periodSeconds", default = "default_period")]
     pub period_seconds: u64,
     #[serde(rename = "failureThreshold", default = "default_failure_threshold")]
     pub failure_threshold: u32,
+    #[serde(rename = "successThreshold", default = "default_probe_success")]
+    pub success_threshold: u32,
+    #[serde(rename = "timeoutSeconds", default = "default_probe_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpGetProbe {
+    #[serde(default)]
     pub path: String,
-    pub port: u16,
+    pub port: ProbePort,
+    pub scheme: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpSocketProbe {
+    pub port: ProbePort,
+}
+
+/// A probe port as written in the manifest. Kubernetes also allows a named
+/// container port here; Royak does not resolve names and rejects them at apply.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProbePort {
+    Number(i64),
+    Name(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecProbe {
     pub command: Vec<String>,
 }
 
 fn default_period() -> u64 { 10 }
+fn default_probe_success() -> u32 { 1 }
+fn default_probe_timeout() -> u64 { 1 }
 fn default_failure_threshold() -> u32 { 3 }
 
 /// Cluster config — everything configurable, nothing hardcoded
@@ -170,9 +206,9 @@ pub struct ClusterConfigSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct LlmConfig {
-    pub provider: Option<String>,        // "ollama", "openai", "local"
-    pub host: Option<String>,            // "http://10.77.0.1:11434"
-    pub model: Option<String>,           // "qwen2.5:32b", "llama3.2:3b"
+    pub provider: Option<String>,        // "openai" (oMLX), "local"
+    pub host: Option<String>,            // "http://localhost:11433"
+    pub model: Option<String>,           // "mlx-community--Qwen2.5-7B-Instruct-4bit"
     pub temperature: Option<f32>,
 }
 
@@ -344,6 +380,25 @@ pub struct PortSpec {
 pub struct EnvVar {
     pub name: String,
     pub value: Option<String>,
+    #[serde(rename = "valueFrom", default)]
+    pub value_from: Option<EnvVarSource>,
+}
+
+/// `env[].valueFrom`: one key of a ConfigMap or Secret.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvVarSource {
+    #[serde(rename = "configMapKeyRef", default)]
+    pub config_map_key_ref: Option<KeyRef>,
+    #[serde(rename = "secretKeyRef", default)]
+    pub secret_key_ref: Option<KeyRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyRef {
+    pub name: String,
+    pub key: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Debug, Deserialize)]

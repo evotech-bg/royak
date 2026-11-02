@@ -10,7 +10,7 @@
 > in [Limitations](#limitations) and scheduled in [ROADMAP.md](ROADMAP.md) — nothing is swept under a rug.
 
 Royak (*рояк* — Bulgarian for "swarm") manages Docker containers the way Kubernetes does —
-deployments, scaling, rolling updates, RBAC, services — in a single ~7.3 MB Rust binary
+deployments, scaling, rolling updates, RBAC, services — in a single Rust binary (~8.9 MB)
 instead of a control plane you have to babysit.
 
 🌐 **Website:** https://evotech-bg.github.io/royak/
@@ -24,7 +24,9 @@ Royak talks to Docker over a Unix socket.
 **Prerequisites:** Docker running (Docker Desktop, Colima or OrbStack — `DOCKER_HOST` is honoured).
 
 **Option A — download a pre-built beta binary** from [Releases](https://github.com/evotech-bg/royak/releases),
-`tar -xzf`, done.
+`tar -xzf`, done. The latest published release is `v0.4.0-beta.1`; features described here that
+landed after it (Raft on the write path, auth/RBAC rework, readiness-aware ServiceLB, tcpSocket
+probes) are only in the source until the next release.
 
 **Option B — build from source** (Rust toolchain required):
 
@@ -90,9 +92,11 @@ helm template ./chart | royak apply -
 royak get deployment/web -o yaml
 royak get service/web-svc -o json
 
-# kubectl-compatible API server (with background reconcile loop)
-royak api
-kubectl --server=http://localhost:6443 get pods
+# kubectl-compatible API server over TLS (with background reconcile loop).
+# Every API call needs a bearer token: ROYAK_TOKEN / ROYAK_TOKEN_FILE, or the
+# admin token generated at ~/.royak/admin.token. The kubeconfig carries it.
+royak watch --tls
+KUBECONFIG=~/.kube/royak.yaml kubectl get pods
 ```
 
 ## Features
@@ -100,12 +104,14 @@ kubectl --server=http://localhost:6443 get pods
 | Feature | What it does |
 |---------|-------------|
 | **Deployments** | Create, scale, delete. Resource limits (CPU/memory) enforced in Docker |
-| **StatefulSets** | Ordered startup, stable pod identity, per-ordinal volumes (`volumeClaimTemplates`) — data survives pod recreation |
-| **Rolling Updates** | Zero-downtime. maxSurge=1, readiness checks, auto-rollback on timeout |
+| **StatefulSets** | Ordered startup, stable pod identity and per-ordinal local volumes (`volumeClaimTemplates`); same-node pod recreation tested, not cross-node data recovery |
+| **Rolling Updates** | Readiness-gated replacement, maxSurge=1 and auto-rollback on timeout; the local fault tests do not establish a blanket zero-downtime SLO |
 | **Rollback** | Reverse rolling update — works even after rollout completes |
-| **Services** | `kind: Service` with selector + ports. ClusterIP with pod→svc DNS; NodePort served by the built-in ServiceLB (userspace LB, works on macOS too) |
+| **Services** | `kind: Service` with selector + ports. ClusterIP with pod→svc DNS; NodePort and LoadBalancer served by the built-in ServiceLB (userspace LB, works on macOS too): it forwards only to Ready pods, and Service changes (selector, targetPort, delete/recreate) reach the running listener without a restart |
+| **Health probes** | Supported Docker `httpGet`/`tcpSocket`/`exec` handlers with monotonic initial delays/periods, consecutive thresholds, startup gate, incarnation reset and process-group exec timeout cleanup; one readiness model for API/ingress/ServiceLB. See the strict [supported subset](tests/qualification/PROBE-TOPOLOGY-CONTRACT.md) |
+| **Read-only cluster map** | Actual resources, ownership/placement and declared routing/dependencies, with per-resource RBAC, namespace/search/state filters, map/list, fit/zoom and keyboard-preserved detail; no secret values, invented traffic or mutation/tunnel controls |
 | **ConfigMaps/Secrets** | `envFrom` env injection AND file projection as volumes (secrets 0600) |
-| **RBAC** | Native `Role`/`ClusterRole`/`RoleBinding`/`ServiceAccount` + Royak `RbacRole` — checked on API writes (403 on a denied verb+resource+namespace). Note: the role is read from the `x-royak-role` header (self-asserted, **defaults to `admin`**) and is **open-by-default** when no roles are defined — it authorizes a stated role, it does not authenticate the caller |
+| **Auth + RBAC** | Identity only from a verified bearer token (`ROYAK_TOKEN`, a `ROYAK_TOKEN_FILE` table, or a generated admin token); no anonymous access, no role headers. Native `Role`/`ClusterRole`/`RoleBinding`/`ClusterRoleBinding` (+ built-in `view`/`edit`/`admin`) and Royak `RbacRole`, deny-by-default, checked centrally on every read, write, scale, PATCH, exec, logs, watch and port-forward. `ROYAK_AUTH=insecure-dev` is the explicit opt-out |
 | **Admission webhooks** | `ValidatingWebhookConfiguration` — Royak calls your webhook URL and honours allow/deny |
 | **Operators** | `kind: Operator` + `kind: CustomResource` — auto-provision, lifecycle hooks |
 | **Guards** | Auto-remediation: pod_crash → restart, high_memory → scale_up |
@@ -116,10 +122,10 @@ kubectl --server=http://localhost:6443 get pods
 | **HPA** | Auto-scaling based on real Docker CPU stats |
 | **Pipelines** | CI/CD with DAG dependencies, git triggers, matrix builds, and `action: build` (git source → image → deploy, PaaS-style — no external CI/registry) |
 | **Ingress** | Live reverse proxy — async, streaming, binary-safe, TLS, path-based routing |
-| **Multi-node** | UDP autodiscovery, pod distribution, heartbeat monitoring, cross-node mesh proxy |
-| **HA leader lease** | File-based election, automatic failover (15s TTL) |
-| **Raft (in progress)** | openraft integrated: election + log replication proven in tests; live write path lands next |
-| **Encryption** | AES-256-GCM for secrets at rest and inter-node communication |
+| **Multi-node** | `--node-id`/`--peers`: one cluster over HMAC-signed node RPC (signed requests *and* responses, replay-protected, TLS with `--tls`); pods placed on any node carry the full workload contract (command/args, env incl. configMap/secret refs, limits, ports, probes, namespace) |
+| **Raft HA** | Every desired-state write (apply, PATCH, scale, delete, reconcile changes) commits through openraft with a quorum before it is acknowledged; durable log + vote, snapshots. Minority side answers 504 "outcome unknown" and stops scheduling |
+| **Durable state** | Single node: atomic fsync'd writes before any change is acknowledged; corrupt state refuses to start instead of becoming an empty cluster; an exclusive owner lock makes a second process a read-only standby |
+| **Encryption** | AES-256-GCM for secrets at rest and for mesh traffic between nodes |
 | **MCP Server** | 13 tools for AI assistant integration (deploy, scale, exec, top...) |
 
 ## Deploy from source (PaaS)
@@ -161,7 +167,7 @@ spec:
 
 | Trigger | How | When |
 | --- | --- | --- |
-| Webhook | `POST /hooks/repo/myapp` | wire your GitHub/GitLab push webhook here → instant build + deploy |
+| Webhook | `POST /hooks/repo/myapp` with `Authorization: Bearer <token>` | instant build + deploy from CI or a relay. GitHub/GitLab cannot add a bearer header and their signed webhooks (`X-Hub-Signature-256`) are not verified yet — use git-watch for push-to-deploy |
 | Git-watch | the reconcile loop polls the repo each `--interval` tick (`git ls-remote` / `git rev-parse`) | a new commit auto-triggers the linked pipeline |
 | Manual | `royak pipeline run ship` | force a run |
 
@@ -225,7 +231,8 @@ src/consensus.rs       ~240 lines   Command log + ConsensusBackend trait
 mcp/royak.py           ~310 lines   MCP server
 ```
 
-Binary: **~7.3 MB** | ~16,000 lines of Rust
+Binary (release build, measured 2026-10-25 on this source): **8,877,376 bytes (8.5 MiB)** on
+macOS arm64 (rustc 1.94); **9,246,360 bytes (8.8 MiB)** static musl on Linux aarch64 (rustc 1.90).
 
 ## How it works
 
@@ -240,16 +247,22 @@ This is what Kubernetes does with etcd, kubelet, kube-proxy, and a control plane
 ## Test suite
 
 ```bash
-cargo test --bin royak      # 85 unit tests
-./test-demo.sh              # 88 integration tests (needs Docker)
-./test-multinode.sh         # multi-node sync tests (2-process localhost)
-./test-ha-lease.sh          # HA leader-lease tests (election + failover + release)
+cargo test --bin royak      # unit tests
+./test-demo.sh              # single-node integration tests (needs Docker)
+./test-multinode.sh         # 3 local nodes: signed census, remote workload contract, self-healing, node loss
+./test-raft-cluster.sh      # 3 local nodes: failover, catch-up, minority partition, delete propagation, snapshots
+./test-ha-lease.sh          # single writer: state owner lock, read-only standby, takeover
+./test-servicelb-probes.sh  # ServiceLB readiness gating, live Service changes, tcpSocket/httpGet/exec probes
+./test-auth-http.sh         # auth through the real API: malformed paths, trigger shadowing, exec RBAC, kubectl
 ./test-mesh.sh              # cross-node mesh proxy tests (Linux only, see note)
 ./test-ingress.sh           # ingress live proxy tests (Linux only, see note)
 ./test-load.sh              # load + chaos (10 deploys × 2 replicas, pod-kill respawn)
 ./test-neuropod.sh          # NeuroPod smoke tests (EXPERIMENTAL)
 ```
 
+> **Note:** the cluster suites run three processes on one host against one Docker daemon, so a
+> "remote" pod is one created by another node's process, not on another machine.
+>
 > **Note:** the mesh and ingress suites forward traffic to container IPs, which are host-routable
 > only on **Linux**. On macOS run `./test-mesh-macos.sh` — it builds a Linux binary and runs the
 > suites inside a container where IPs are routable (verified: mesh 8/8, ingress 15/15, encrypted
@@ -260,8 +273,21 @@ cargo test --bin royak      # 85 unit tests
 Unit tests cover: YAML parser edges, neural brain (identity, encrypt/decrypt, training convergence,
 anomaly detection, weight persistence), neural state KV + save/load + corruption paths, pod-token
 HMAC verify, AES-256-GCM secret encryption, schema-version migration, atomic state writes, OpenAPI
-v3 spec generation, leader-lease acquisition/renewal/takeover/release, Raft state machine
-(single-node apply, 3-node election + replication over in-process and HTTP transports).
+v3 spec generation, token auth + RBAC decisions, node request/response signing, state owner lock,
+Raft state machine (single-node apply, 3-node election + replication over in-process and HTTP
+transports), probe validation and storage, ServiceLB routing (readiness filter, live route swap
+without rebinding or cutting open connections, port conflicts), publish-aware rollout.
+
+For the current source's real local fault/regression evidence, read
+[qualification results](tests/qualification/CURRENT-RESULTS.md). Use the
+[isolated suite driver](tests/qualification/README.md) for broad shell suites;
+their cleanup must not run against a host containing valuable workloads.
+The [security/HTTP contract](tests/qualification/SECURITY-HTTP-CONTRACT.md)
+defines the Docker securityContext subset, **schema-3 state upgrade boundary**
+and buffered ingress limits. Update all nodes before using constrained
+workloads; mixed-version upgrades are not qualified. Reapply previously ignored
+security contexts and inspect replacement containers rather than assuming
+migration retroactively enforces them.
 
 Integration tests cover: deploy, service + DNS (pod→svc hostname), RBAC enforcement (403), scale
 up/down, logs, rolling update, rollback, stdin pipe, delete, state persistence, namespace, Secrets
@@ -274,26 +300,45 @@ kubectl compatibility (get/apply/delete), graceful shutdown, CrashLoopBackOff, h
 **Beta means beta.** Royak is an MVP of a vision — for learning, demos, edge/homelab and small
 deployments. Here is the honest ledger:
 
-- **Single-writer control plane with file-based leader lease.** Multiple `watch` instances pointed
-  at the same state path compete for a lease file; one becomes leader, the rest stand by. If the
-  leader crashes, the next standby takes over after a 15-second lease TTL. This is a practical HA
-  guarantee for single-host or shared-filesystem setups — **not** a Raft/Paxos replacement.
-- **Raft consensus is integrated but not live yet.** openraft phases 1–2 are done: leader election
-  and log replication are proven in tests over in-process and HTTP transports. Phase 3 — routing
-  the live reconcile write path through Raft — is the next milestone (see ROADMAP).
-- **Multi-node works for basic cases but is not battle-tested at scale.** Node join/drain commands
-  exist; split-brain behavior across independent disks and large-cluster convergence are not yet
-  exercised by the test suite.
+- **Probes remain a Docker subset.** `periodSeconds`, `initialDelaySeconds` and consecutive
+  thresholds are honoured, but execution occurs within synchronous reconcile ticks (default 5 s);
+  tick/load delays are possible, not a real-time deadline guarantee. `httpGet`
+  and `tcpSocket` probes run *inside* the pod (`curl`/`wget`, `nc`/`bash`); an image without those
+  tools is reported NotReady with a log line, never silently Ready. Named probe ports and gRPC
+  probes are rejected at apply.
+- **ServiceLB forwards to this node's pods only**, through ports Docker publishes when the pod is
+  created: when a Service starts targeting a port a running pod does not publish, the pod is
+  replaced through the normal readiness-gated rollout before it receives traffic.
+- **Physical failure domains remain unqualified.** Legacy cluster suites share a Docker daemon;
+  the newer qualification lab exercises three separate Linux VM kernels and Docker daemons,
+  real WireGuard and guest faults, still on one Mac. See the exact
+  [current results](tests/qualification/CURRENT-RESULTS.md); this is not physical-host HA.
+- **Host-local storage is not distributed.** Pods with hostPath/PVC volumes are placed on the
+  scheduling (leader) node only — a remote node refuses them (409). There is no durable volume
+  node binding, replication or fenced attachment handoff; after leader/node change the same
+  logical path can resolve to a different local directory. Do not rely on it for stateful
+  failover or acknowledged-data durability. Requested stateful production support has a
+  separate, currently unqualified [storage gate](tests/qualification/STATEFUL-PRODUCTION-GATE.md).
+- **No node cordon/drain/join commands.** Nodes are declared with `--peers`; `royak node drain`
+  and `node join` exit with an error.
+- **Ambiguous outcomes are reported as such.** A write the leader could not commit within 5 s
+  returns 504 "outcome unknown" (it may still commit once a quorum returns; re-read before
+  retrying). A leader lost mid-write can return 421 for a write that later commits.
+- **A newly elected scheduler waits for the census** (every configured peer reported, or 15 s)
+  before placing pods, so recovery right after a failover is slower. Other nodes also learn about
+  a peer's pods through that poll: `logs`/`get` for a pod that started seconds ago on another
+  node can briefly return 404.
+- **The mesh port is fixed (`:6550`)**, so only one node per host binds it; sealed peer frames
+  are encrypted and authenticated but a captured frame can be replayed.
 - **Canary strategy** is parsed and scheduled with weighted steps, but traffic splitting at the
   service layer still needs a proxy integration.
 - **`kubectl port-forward` uses SPDY-over-WebSocket in kubectl 1.36, which Royak doesn't decode.**
   Use `royak port-forward <pod> <local>:<remote>` for a guaranteed local→pod tunnel (verified).
   `kubectl exec` — including interactive `-i`/`-it` with a TTY — works over WebSocket.
 - **No Helm engine.** Use `helm template ./chart | royak apply -`.
-- **No port-forward.** Exec is one-shot (run command, get output).
 - **NeuroPod runtime (`--runtime neuropod`) is EXPERIMENTAL.** OCI pull and basic pod lifecycle
   work on Linux with root (network namespaces); the macOS path uses Apple Virtualization.framework
-  but is not end-to-end wired.
+  but is not end-to-end wired. Deleting a deployment does not remove its NeuroPods yet (no GC).
 - **Anomaly/prediction is statistical** (z-scores, linear regression) in the public path; the
   neural brain trains via backprop but is a monitor, not the decision-maker in the reconcile loop.
   Autoscaling is **reactive on real Docker CPU stats**; the load-prediction (`[PREDICT]`) line is
@@ -303,15 +348,16 @@ deployments. Here is the honest ledger:
   into each container (`ROYAK_POD_TOKEN`), but these identities are **issued, not yet verified**:
   `verify_pod_token` and the `mtls` NetworkPolicy flag are not enforced on the live path, so the
   mesh is encrypted transport, not per-pod mutual-TLS authentication.
-- **State is JSON + binary neural.** Writes are atomic (write-tmp, rename) with a Unix `flock`
-  guard. No distributed consensus on the live path yet — source of truth is whichever node writes
-  last.
+- **Runtime-only state.** Pipeline run history and the issued cluster CA material are not part of
+  the replicated desired state.
+- **`command` maps to Docker `Cmd`** (the image's `ENTRYPOINT` is kept), and `envFrom` values
+  override literal `env` with the same name.
 
 ## Roadmap
 
 The gaps above are designed, scoped and scheduled in [ROADMAP.md](ROADMAP.md):
 
-- **v0.4 (current)** — real HA: openraft-backed consensus on the live write path, snapshots, log compaction.
+- **v0.4 (current)** — openraft consensus on the live write path, durable log/vote, snapshots (in source, not yet in a published release — `v0.4.0-beta.1` predates it); multi-machine verification next.
 - **v0.5** — WireGuard mesh replacing the proxy MVP for cross-node pod traffic.
 - **Post-v1.0** — eBPF/XDP data path (Cilium-style).
 

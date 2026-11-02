@@ -14,10 +14,8 @@ use crate::spec::{self, Resource};
 use crate::brain::OrinBrain;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-
-/// Label we add to all Royak-managed containers
-const MANAGED_LABEL: &str = "royak.managed";
 
 /// Pipeline stage execution status
 #[derive(Clone, PartialEq)]
@@ -30,12 +28,14 @@ pub enum StageStatus {
 }
 
 /// A stored pipeline definition
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredPipeline {
     pub name: String,
     pub stages: Vec<StoredStage>,
     pub triggers: Vec<StoredTrigger>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredStage {
     pub name: String,
     pub image: Option<String>,
@@ -55,6 +55,7 @@ pub struct StoredStage {
     pub matrix_envs: Vec<String>,       // run with these env vars
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredTrigger {
     pub trigger_type: String,
     pub path: Option<String>,
@@ -62,6 +63,7 @@ pub struct StoredTrigger {
 
 /// A pipeline run (execution instance)
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct PipelineRun {
     pub pipeline: String,
     pub run_id: u64,
@@ -87,6 +89,7 @@ impl PipelineRun {
 
 /// Cluster node
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClusterNode {
     pub name: String,
     pub address: String,           // ip:port of the node's API server
@@ -101,7 +104,7 @@ pub struct ClusterNode {
     pub joined_at: u64,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum NodeStatus {
     Ready,
     NotReady,
@@ -109,6 +112,7 @@ pub enum NodeStatus {
 }
 
 /// Cluster configuration (replaces hardcoded values)
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredConfig {
     // LLM
     pub llm_host: String,
@@ -131,8 +135,8 @@ pub struct StoredConfig {
 impl Default for StoredConfig {
     fn default() -> Self {
         StoredConfig {
-            llm_host: "http://localhost:11434".to_string(),
-            llm_model: "llama3.2:3b".to_string(),
+            llm_host: "http://localhost:11433".to_string(),
+            llm_model: "mlx-community--Llama-3.2-3B-Instruct-4bit".to_string(),
             llm_temperature: 0.3,
             alert_webhook: None,
             alert_on_anomaly: true,
@@ -147,6 +151,7 @@ impl Default for StoredConfig {
 }
 
 /// Serverless Function (Lambda)
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredFunction {
     pub name: String,
     pub image: String,                    // resolved runtime image
@@ -164,7 +169,7 @@ pub struct StoredFunction {
     pub state: FunctionState,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum FunctionState {
     Cold,       // no container, will start on invoke
@@ -174,6 +179,7 @@ pub enum FunctionState {
 }
 
 /// Git repository registration
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredRepository {
     pub name: String,
     pub url: Option<String>,
@@ -185,7 +191,14 @@ pub struct StoredRepository {
 }
 
 /// Stored desired state — replaces etcd (in-memory + persistent JSON)
+#[derive(Clone)]
 pub struct DesiredWorld {
+    /// Monotonic desired-state version. Bumped by every committed change; the
+    /// commit path uses it as a compare-and-swap token (see store::commit).
+    pub generation: u64,
+    /// Identity of the cluster this desired state belongs to. Containers are
+    /// labelled with it and only containers of THIS cluster are ever managed.
+    pub cluster_id: String,
     pub deployments: HashMap<String, StoredDeployment>,
     pub daemonsets: HashMap<String, StoredDaemonSet>,
     pub jobs: HashMap<String, StoredJob>,
@@ -194,6 +207,7 @@ pub struct DesiredWorld {
     pub services: HashMap<String, StoredService>,
     pub restart_count: HashMap<String, u32>,  // pod name → restart count (CrashLoopBackOff)
     pub startup_ok: std::collections::HashSet<String>,  // pods whose startup probe passed (runtime-only)
+    pub pod_ready: std::collections::HashSet<String>,   // local pods whose readiness probe passed (runtime-only)
     pub netpol_applied: std::collections::HashSet<String>,  // pods with L4 iptables applied (runtime-only)
     pub ingress_classes: std::collections::HashSet<String>,  // registered IngressClass names
     pub limit_ranges: HashMap<String, StoredLimitRange>,  // namespace → defaults
@@ -208,8 +222,11 @@ pub struct DesiredWorld {
     pub pvs: HashMap<String, StoredPV>,
     pub pvcs: HashMap<String, StoredPVC>,
     pub namespaces: Vec<String>,
+    pub storage_identities: crate::storage_identity::Identities,
+    pub(crate) storage_node_directory: crate::storage_node_directory::Registry,
+    pub backup_registry: crate::backup_engine::Registry,
     #[allow(dead_code)]
-    pub pod_health: HashMap<String, PodHealth>,
+    pub pod_health: HashMap<String, crate::probes::PodHealth>,
     pub pending_rollouts: HashMap<String, RolloutState>,
     pub pipelines: HashMap<String, StoredPipeline>,
     pub pipeline_runs: Vec<PipelineRun>,
@@ -220,6 +237,8 @@ pub struct DesiredWorld {
     pub guards: HashMap<String, Guard>,
     pub operators: HashMap<String, Operator>,
     pub rbac_roles: HashMap<String, RbacRole>,
+    /// RoleBinding ("ns/name") and ClusterRoleBinding ("name") objects.
+    pub rbac_bindings: HashMap<String, RbacBinding>,
     pub custom_resources: HashMap<String, CustomResource>,
     pub admission_webhooks: HashMap<String, AdmissionWebhook>,
     pub events: Vec<ClusterEvent>,
@@ -236,7 +255,7 @@ pub struct DesiredWorld {
 // ─── RBAC: Role-Based Access Control ───
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionWebhook {
     pub name: String,
     /// HTTP(S) endpoint that receives an AdmissionReview POST.
@@ -247,6 +266,7 @@ pub struct AdmissionWebhook {
     pub failure_policy: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredLimitRange {
     pub name: String,
     pub namespace: String,
@@ -256,18 +276,51 @@ pub struct StoredLimitRange {
     pub request_mem: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RbacRole {
     pub name: String,
     pub rules: Vec<RbacRule>,
+    /// Some(ns) for a namespaced Role, None for a ClusterRole or a legacy
+    /// Royak `RbacRole` (whose rules carry their own namespace list).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// "Role", "ClusterRole" or "RbacRole" (legacy Royak kind).
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RbacRule {
-    pub resources: Vec<String>,     // ["pods", "deployments", "*"]
+    pub resources: Vec<String>,     // ["pods", "deployments", "pods/exec", "*"]
     pub verbs: Vec<String>,         // ["get", "list", "create", "delete", "*"]
     pub namespaces: Vec<String>,    // ["default", "*"]
+    /// Optional resourceNames restriction (empty = any name).
+    #[serde(default)]
+    pub resource_names: Vec<String>,
+}
+
+/// A RoleBinding / ClusterRoleBinding: grants a role's rules to subjects.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RbacBinding {
+    pub name: String,
+    /// Some(ns) for a RoleBinding (grants only inside ns), None for a
+    /// ClusterRoleBinding (grants cluster-wide).
+    pub namespace: Option<String>,
+    /// "Role" or "ClusterRole".
+    pub role_kind: String,
+    pub role_name: String,
+    pub subjects: Vec<RbacSubject>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RbacSubject {
+    /// "User", "Group" or "ServiceAccount".
+    pub kind: String,
+    pub name: String,
+    /// ServiceAccount namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 impl DesiredWorld {
@@ -296,7 +349,7 @@ impl DesiredWorld {
 
 // ─── Resource Limits ───
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     pub cpu_request: Option<f32>,    // CPU cores requested (0.5 = half core)
     pub cpu_limit: Option<f32>,      // CPU cores max
@@ -306,14 +359,14 @@ pub struct ResourceLimits {
 
 // ─── Deployment Strategies (Canary, Blue-Green) ───
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum DeployStrategy {
     RollingUpdate { max_surge: u32, max_unavailable: u32 },
     Canary { weight: u32, steps: Vec<CanaryStep> },       // gradual rollout
     BlueGreen { active: String },                          // instant switch
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct CanaryStep {
     pub weight: u32,        // percentage of traffic (10, 25, 50, 100)
@@ -323,9 +376,11 @@ pub struct CanaryStep {
 
 // ─── Cluster Events (kubectl get events) ───
 
+#[derive(Clone)]
 pub struct ClusterEvent {
     pub kind: String,        // "Pod", "Deployment", "Pipeline"
     pub object: String,      // resource name
+    pub namespace: String,   // namespace of the object ("default" for cluster objects)
     pub reason: String,      // "Created", "Scaled", "Unhealthy", "Triggered"
     pub message: String,
     pub event_type: String,  // "Normal", "Warning"
@@ -340,15 +395,26 @@ impl DesiredWorld {
             let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             format!("{}", secs)
         };
+        // `ns/name` objects carry their namespace; pod names carry it in the
+        // stem (`rk-<ns>_<name>-N`); anything else belongs to "default".
+        let (namespace, object) = match object.split_once('/') {
+            Some((ns, name)) => (ns.to_string(), name),
+            None => {
+                let ns = object.strip_prefix("rk-").and_then(|r| r.split_once('_')).map(|(ns, _)| ns.to_string())
+                    .filter(|ns| crate::store::is_dns_label(ns))
+                    .unwrap_or_else(|| crate::store::DEFAULT_NS.to_string());
+                (ns, object)
+            }
+        };
         // Deduplicate: if same object+reason exists, increment count
-        if let Some(existing) = self.events.iter_mut().find(|e| e.object == object && e.reason == reason) {
+        if let Some(existing) = self.events.iter_mut().find(|e| e.namespace == namespace && e.object == object && e.reason == reason) {
             existing.count += 1;
             existing.last_seen = now;
             existing.message = message.to_string();
             return;
         }
         self.events.push(ClusterEvent {
-            kind: kind.to_string(), object: object.to_string(),
+            kind: kind.to_string(), object: object.to_string(), namespace,
             reason: reason.to_string(), message: message.to_string(),
             event_type: event_type.to_string(), count: 1,
             first_seen: now.clone(), last_seen: now,
@@ -361,6 +427,7 @@ impl DesiredWorld {
 // ─── Neural Guards (auto-remediation: brain detect → action) ───
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Guard {
     pub name: String,
     pub rules: Vec<GuardRule>,
@@ -368,6 +435,7 @@ pub struct Guard {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GuardRule {
     pub when: String,    // "pod_crash", "high_memory", "high_cpu", "anomaly"
     pub action: String,  // "restart", "scale_up", "exec", "alert"
@@ -386,6 +454,7 @@ pub struct GuardRule {
 // K8s operator = 5000 lines Go. Royak operator = YAML + hooks + brain.
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Operator {
     pub name: String,
     pub custom_kind: String,                       // "PostgresCluster", "RedisCluster", etc.
@@ -395,6 +464,7 @@ pub struct Operator {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct OperatorComponent {
     pub role: String,           // "primary", "replica", "sentinel", "proxy"
     pub image: String,          // "postgres:16", "redis:7-alpine"
@@ -406,6 +476,7 @@ pub struct OperatorComponent {
 
 /// Custom Resource instance (created by user, managed by operator)
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CustomResource {
     pub name: String,
     pub kind: String,           // must match an operator's custom_kind
@@ -414,7 +485,7 @@ pub struct CustomResource {
     pub status: CRStatus,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum CRStatus {
     Pending,
@@ -425,13 +496,14 @@ pub enum CRStatus {
 
 /// Reconcile custom resources: for each CR, find its operator and provision
 pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
-    let cr_names: Vec<String> = desired.custom_resources.keys().cloned().collect();
+    let cr_keys: Vec<String> = desired.custom_resources.keys().cloned().collect();
 
-    for cr_name in &cr_names {
-        let (kind, ns, spec, status) = {
-            let cr = &desired.custom_resources[cr_name];
-            (cr.kind.clone(), cr.namespace.clone(), cr.spec.clone(), cr.status.clone())
+    for cr_key in &cr_keys {
+        let (kind, ns, spec, status, cr_name) = {
+            let cr = &desired.custom_resources[cr_key];
+            (cr.kind.clone(), cr.namespace.clone(), cr.spec.clone(), cr.status.clone(), cr.name.clone())
         };
+        let cr_name = &cr_name;
 
         // Find the operator for this kind
         let op = desired.operators.values()
@@ -450,11 +522,11 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
             let mut all_healthy = true;
             for component in &op.provision {
                 let dep_name = format!("{cr_name}-{}", component.role);
-                if !desired.deployments.contains_key(&dep_name) {
+                if !desired.deployments.contains_key(&crate::store::obj_key(&ns, &dep_name)) {
                     log.push(format!("  [operator/{}] {kind}/{cr_name}: component {dep_name} MISSING — re-provisioning", op.name));
                     all_healthy = false;
                     // Reset to Pending to trigger re-provision
-                    if let Some(cr) = desired.custom_resources.get_mut(cr_name) {
+                    if let Some(cr) = desired.custom_resources.get_mut(cr_key) {
                         cr.status = CRStatus::Pending;
                     }
                     break;
@@ -462,7 +534,7 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
             }
             if all_healthy && status == CRStatus::Provisioning {
                 // Promotion: all deployments exist → mark as Running
-                if let Some(cr) = desired.custom_resources.get_mut(cr_name) {
+                if let Some(cr) = desired.custom_resources.get_mut(cr_key) {
                     cr.status = CRStatus::Running;
                     log.push(format!("  [operator/{}] {kind}/{cr_name}: promoted to Running ✓", op.name));
                 }
@@ -499,18 +571,20 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
 
             // Create deployment for this component
             let containers = vec![StoredContainer {
+                host_access: None,
+                security_context: None,
                 name: component.role.clone(),
                 image: component.image.clone(),
                 command: None,
                 env: env.clone(),
-                env_from_configmaps: vec![], env_from_secrets: vec![],
+                env_from_configmaps: vec![], env_from_secrets: vec![], env_refs: vec![],
                 volumes: vec![],
                 liveness_probe: None,
                 startup_probe: None,
                 readiness_probe: None,
             }];
 
-            desired.deployments.insert(dep_name.clone(), StoredDeployment {
+            desired.deployments.insert(crate::store::obj_key(&ns, &dep_name), StoredDeployment {
                 name: dep_name.clone(),
                 namespace: ns.clone(),
                 replicas: if component.role == "primary" { 1 } else { replicas },
@@ -527,6 +601,7 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
                 idle_since: None,
                 stateful: false,
                 owner_ref: Some(cr_name.clone()),
+                restart_nonce: 0,
             });
             log.push(format!("    [{}] {} × {} ✓", component.role, component.image, if component.role == "primary" { 1 } else { replicas }));
         }
@@ -540,7 +615,7 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
         }
 
         // Mark as provisioning
-        if let Some(cr) = desired.custom_resources.get_mut(cr_name) {
+        if let Some(cr) = desired.custom_resources.get_mut(cr_key) {
             cr.status = CRStatus::Provisioning;
         }
     }
@@ -551,15 +626,16 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
 /// A deployment is owned iff its `owner_ref` equals `Some(cr_name)`. Deployments
 /// with no owner ref (user-created) are never selected, so unrelated workloads
 /// are left untouched when a CustomResource is deleted.
-pub fn deployments_owned_by(desired: &DesiredWorld, cr_name: &str) -> Vec<String> {
-    desired.deployments.values()
-        .filter(|d| d.owner_ref.as_deref() == Some(cr_name))
-        .map(|d| d.name.clone())
+pub fn deployments_owned_by(desired: &DesiredWorld, ns: &str, cr_name: &str) -> Vec<String> {
+    desired.deployments.iter()
+        .filter(|(_, d)| d.namespace == ns && d.owner_ref.as_deref() == Some(cr_name))
+        .map(|(k, _)| k.clone())
         .collect()
 }
 
 /// Rolling update state
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RolloutState {
     pub old_image: String,
     pub new_image: String,
@@ -568,6 +644,7 @@ pub struct RolloutState {
     pub new_pods_created: u32,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredService {
     pub name: String,
     pub namespace: String,
@@ -576,6 +653,7 @@ pub struct StoredService {
     pub service_type: String,  // ClusterIP, NodePort, LoadBalancer
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServicePort {
     pub port: u16,
     pub target_port: u16,
@@ -583,6 +661,7 @@ pub struct ServicePort {
     pub node_port: Option<u16>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredIngress {
     pub name: String,
     pub namespace: String,
@@ -593,11 +672,13 @@ pub struct StoredIngress {
     pub ingress_class: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IngressRule {
     pub host: String,            // e.g. "app.example.com"
     pub paths: Vec<IngressPath>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IngressPath {
     pub path: String,            // e.g. "/api"
     pub service: String,         // backend service name
@@ -605,6 +686,7 @@ pub struct IngressPath {
 }
 
 /// Resource quota — namespace-level limits (CPU, memory, pod count)
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredResourceQuota {
     pub name: String,
     pub namespace: String,
@@ -618,6 +700,7 @@ pub struct StoredResourceQuota {
 
 /// Pod certificate tracking — for mTLS cert lifecycle
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct PodCertStatus {
     pub pod_name: String,
     pub namespace: String,
@@ -627,6 +710,7 @@ pub struct PodCertStatus {
     pub revoked: bool,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredNetworkPolicy {
     pub name: String,
     pub namespace: String,
@@ -642,9 +726,12 @@ pub struct StoredNetworkPolicy {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredHPA {
     pub name: String,
-    pub deployment: String,    // target deployment
+    #[serde(default = "default_ns_string")]
+    pub namespace: String,
+    pub deployment: String,    // target deployment (same namespace)
     pub min_replicas: u32,
     pub max_replicas: u32,
     pub target_cpu: f32,       // target CPU % (e.g. 70.0)
@@ -696,6 +783,7 @@ pub fn hpa_decision(
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredDaemonSet {
     pub name: String,
     pub namespace: String,
@@ -703,6 +791,7 @@ pub struct StoredDaemonSet {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredJob {
     pub name: String,
     pub namespace: String,
@@ -712,6 +801,7 @@ pub struct StoredJob {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum JobStatus {
     Pending,
     Running,
@@ -719,6 +809,7 @@ pub enum JobStatus {
     Failed,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredCronJob {
     pub name: String,
     pub namespace: String,
@@ -727,6 +818,7 @@ pub struct StoredCronJob {
     pub last_run: Option<u64>,  // unix timestamp
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredDeployment {
     pub name: String,
     pub namespace: String,
@@ -753,53 +845,87 @@ pub struct StoredDeployment {
     // Cascade-delete: name of the CustomResource that provisioned this
     // deployment (owner reference). None = user-owned, never GC'd on CR delete.
     pub owner_ref: Option<String>,
+    /// Bumped when something the pods consume but the spec does not show
+    /// changes (a referenced ConfigMap/Secret). Part of the pod template hash,
+    /// so a bump rolls the pods through the normal rolling-update path instead
+    /// of apply() deleting containers as a side effect.
+    #[serde(default)]
+    pub restart_nonce: u64,
 }
 
+fn default_ns_string() -> String { "default".to_string() }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredContainer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_access: Option<crate::host_access::Permit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_context: Option<crate::security::SecurityContext>,
     pub name: String,
     pub image: String,
     pub command: Option<Vec<String>>,
     pub env: Vec<String>,
     pub env_from_configmaps: Vec<String>,  // ConfigMap names to inject as env
     pub env_from_secrets: Vec<String>,     // Secret names to inject as env
+    /// `env[].valueFrom` ConfigMap/Secret keys, resolved when the pod is
+    /// planned. Omitted when empty so existing pod template hashes are stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_refs: Vec<EnvKeyRef>,
     pub volumes: Vec<(String, String)>,    // (host_path, container_path)
     pub liveness_probe: Option<StoredProbe>,
     pub readiness_probe: Option<StoredProbe>,
     pub startup_probe: Option<StoredProbe>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EnvKeyRef {
+    pub name: String,
+    pub secret: bool,
+    pub object: String,
+    pub key: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
 /// Stored health probe configuration
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct StoredProbe {
     pub http_get: Option<(String, u16)>,   // (path, port)
     pub exec: Option<Vec<String>>,          // command
+    /// TCP connect probe port. Skipped when absent so existing HTTP/exec probes
+    /// serialize (and template-hash) exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_socket: Option<u16>,
     pub initial_delay_seconds: u64,
     pub period_seconds: u64,
     pub failure_threshold: u32,
+    #[serde(default = "legacy_probe_timeout", skip_serializing_if = "is_legacy_probe_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "probe_success_default", skip_serializing_if = "is_probe_success_default")]
+    pub success_threshold: u32,
 }
 
-/// Per-pod health tracking
-#[allow(dead_code)]
-pub struct PodHealth {
-    pub created_at: std::time::Instant,
-    pub liveness_failures: u32,
-    pub readiness_failures: u32,
-    pub ready: bool,
-}
+fn legacy_probe_timeout() -> u64 { 3 }
+fn is_legacy_probe_timeout(n: &u64) -> bool { *n == 3 }
+fn probe_success_default() -> u32 { 1 }
+fn is_probe_success_default(n: &u32) -> bool { *n == 1 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredConfigMap {
     pub name: String,
     pub namespace: String,
     pub data: HashMap<String, String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredSecret {
     pub name: String,
     pub namespace: String,
     pub data: HashMap<String, String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredPV {
     pub name: String,
     pub capacity: String,        // "10Gi", "500Mi"
@@ -810,7 +936,7 @@ pub struct StoredPV {
     pub bound_to: Option<String>, // PVC name
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub enum PVStatus {
     Available,
@@ -818,6 +944,7 @@ pub enum PVStatus {
     Released,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredPVC {
     pub name: String,
     pub namespace: String,
@@ -828,6 +955,7 @@ pub struct StoredPVC {
 }
 
 /// StorageClass — dynamic volume provisioner
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredStorageClass {
     pub name: String,
     pub provisioner: String,        // "royak/host-path", "royak/tmpfs"
@@ -839,6 +967,8 @@ pub struct StoredStorageClass {
 impl DesiredWorld {
     pub fn new() -> Self {
         DesiredWorld {
+            generation: 0,
+            cluster_id: crate::store::LEGACY_CLUSTER_ID.to_string(),
             deployments: HashMap::new(),
             daemonsets: HashMap::new(),
             jobs: HashMap::new(),
@@ -847,6 +977,7 @@ impl DesiredWorld {
             services: HashMap::new(),
             restart_count: HashMap::new(),
             startup_ok: std::collections::HashSet::new(),
+            pod_ready: std::collections::HashSet::new(),
             netpol_applied: std::collections::HashSet::new(),
             ingress_classes: std::collections::HashSet::new(),
             limit_ranges: HashMap::new(),
@@ -858,6 +989,9 @@ impl DesiredWorld {
             pvs: HashMap::new(),
             pvcs: HashMap::new(),
             namespaces: vec!["default".to_string()],
+            storage_identities: crate::storage_identity::Identities::fresh(),
+            storage_node_directory: crate::storage_node_directory::Registry::fresh(),
+            backup_registry: crate::backup_engine::Registry::fresh(),
             pod_health: HashMap::new(),
             pending_rollouts: HashMap::new(),
             pipelines: HashMap::new(),
@@ -869,6 +1003,7 @@ impl DesiredWorld {
             guards: HashMap::new(),
             operators: HashMap::new(),
             rbac_roles: HashMap::new(),
+            rbac_bindings: HashMap::new(),
             custom_resources: HashMap::new(),
             admission_webhooks: HashMap::new(),
             events: Vec::new(),
@@ -886,9 +1021,10 @@ impl DesiredWorld {
     /// NodePort or LoadBalancer service selects this deployment. The ServiceLB
     /// proxy forwards service traffic to those ephemeral ports — works even
     /// where container IPs are not host-routable (macOS Docker VMs).
-    pub fn nodeport_publish_ports(&self, deployment: &str) -> Vec<u16> {
+    pub fn nodeport_publish_ports(&self, ns: &str, deployment: &str) -> Vec<u16> {
         let mut ports: Vec<u16> = self.services.values()
             .filter(|s| (s.service_type == "NodePort" || s.service_type == "LoadBalancer")
+                && s.namespace == ns
                 && s.selector.get("app").map(|a| a.as_str()) == Some(deployment))
             .flat_map(|s| s.ports.iter().map(|p| p.target_port))
             .collect();
@@ -897,7 +1033,69 @@ impl DesiredWorld {
         ports
     }
 
+    pub fn synchronize_storage_identities(&mut self) -> Result<(),String> {
+        self.storage_identities.synchronize(&self.namespaces,&self.pvs,&self.pvcs)
+    }
+
     pub fn apply(&mut self, resource: &Resource) -> Result<String, String> {
+        self.apply_with_host_access(resource, true)
+    }
+    pub fn apply_with_host_access(&mut self, resource: &Resource, authorized: bool) -> Result<String, String> {
+        if crate::host_access::resource_requires(resource)? && !authorized {
+            return Err("host access requires cluster-scoped use hostaccess permission".into());
+        }
+        let result=self.apply_resource(resource)?;
+        self.synchronize_storage_identities()?;
+        crate::host_access::issue_resource(self,resource,authorized)?;
+        crate::storage_lifecycle::Registry::register_pending(self)?;
+        Ok(result)
+    }
+
+    fn apply_resource(&mut self, resource: &Resource) -> Result<String, String> {
+        // Identity validation: names become store keys ("ns/name") and Docker
+        // container names, so they must be valid RFC 1123 names — in
+        // particular they can never contain '/' or '_', the separators used to
+        // keep namespaces apart.
+        let kind = resource.kind.as_str();
+        let cluster_scoped = crate::store::is_cluster_scoped_kind(kind);
+        if kind != "Config" || !resource.metadata.name.is_empty() {
+            if !crate::store::is_dns_subdomain(&resource.metadata.name) {
+                return Err(format!("{kind} name {:?} is invalid: must be a lowercase RFC 1123 subdomain (a-z, 0-9, '-', '.')",
+                    resource.metadata.name));
+            }
+        }
+        if kind == "Namespace" && !crate::store::is_dns_label(&resource.metadata.name) {
+            return Err(format!("namespace name {:?} is invalid: must be a lowercase RFC 1123 label", resource.metadata.name));
+        }
+        if !cluster_scoped {
+            let ns = crate::store::ns_of(resource);
+            if !crate::store::is_dns_label(&ns) {
+                return Err(format!("namespace {ns:?} is invalid: must be a lowercase RFC 1123 label"));
+            }
+            // The legacy vct: lowering below discards the template spec. Refuse
+            // explicit native/unknown classes before either that loss or an
+            // implicit namespace insertion; no fresh native claim is invented.
+            if kind == "StatefulSet" {
+                if let Some(deployment) = spec::as_deployment(resource) {
+                    for template in deployment.volume_claim_templates.as_deref().unwrap_or(&[]) {
+                        crate::storage::require_legacy_template_class(self, template)?;
+                    }
+                }
+            }
+            // The first native consumer has no policy-capable network effect
+            // permit. Refuse BEFORE even implicit namespace mutation; all API
+            // apply/patch/replace scratch commits share this admission path.
+            if kind=="NetworkPolicy" {
+                let selector=resource.spec.as_ref().and_then(|s|s.get("podSelector"))
+                    .and_then(|s|s.get("matchLabels")).and_then(|s|s.get("app"))
+                    .and_then(|s|s.as_str()).unwrap_or("*");
+                crate::workload::managed::require_supported_policy_admission(self,&ns,selector)?;
+            }
+            // Royak creates namespaces implicitly on first use.
+            if !self.namespaces.iter().any(|n| n == &ns) {
+                self.namespaces.push(ns);
+            }
+        }
         match resource.kind.as_str() {
             // ReplicaSet gets Deployment semantics (replicas + template, no
             // rollout history of its own). A bare Pod becomes a single-replica
@@ -923,117 +1121,25 @@ impl DesiredWorld {
                 let mut vct_map: HashMap<String, String> = HashMap::new();
                 if resource.kind == "StatefulSet" {
                     for vct in dep.volume_claim_templates.as_deref().unwrap_or(&[]) {
+                        if !crate::store::is_dns_label(&vct.metadata.name){return Err("invalid volumeClaimTemplate name".into());}
                         vct_map.insert(vct.metadata.name.clone(), format!("vct:{}", vct.metadata.name));
                     }
                 }
 
-                // Build volume map from pod-level volumes
-                let mut volume_map: HashMap<String, String> = dep.template.spec.volumes.as_ref()
-                    .map(|vols| vols.iter().filter_map(|v| {
-                        if let Some(hp) = &v.host_path {
-                            if !validate_path(&hp.path) {
-                                eprintln!("  ⚠ [security] blocked unsafe hostPath: {}", hp.path);
-                                None
-                            } else {
-                                Some((v.name.clone(), hp.path.clone()))
-                            }
-                        } else if v.empty_dir.is_some() {
-                            let tmp = format!("/tmp/royak-{}-{}", name, v.name);
-                            std::fs::create_dir_all(&tmp).ok();
-                            Some((v.name.clone(), tmp))
-                        } else if let Some(cm) = &v.config_map {
-                            // Materialised at pod-creation time (data may change)
-                            Some((v.name.clone(), format!("cmv:{}", cm.name)))
-                        } else if let Some(sv) = &v.secret {
-                            Some((v.name.clone(), format!("sev:{}", sv.secret_name)))
-                        } else if let Some(pvc_ref) = &v.pvc {
-                            // Resolve PVC → PV → host path
-                            self.pvcs.get(&pvc_ref.claim_name)
-                                .and_then(|pvc| pvc.bound_pv.as_ref())
-                                .and_then(|pv_name| self.pvs.get(pv_name))
-                                .map(|pv| (v.name.clone(), pv.host_path.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect())
-                    .unwrap_or_default();
-                volume_map.extend(vct_map);
+                let volume_map = pod_volume_map(dep.template.spec.volumes.as_deref().unwrap_or(&[]), vct_map)?;
+                let stored_containers: Vec<StoredContainer> = dep.template.spec.containers.iter()
+                    .map(|c| parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())).collect::<Result<_, _>>()?;
 
-                // Parse ALL containers in the pod
-                let stored_containers: Vec<StoredContainer> = dep.template.spec.containers.iter().map(|c| {
-                    let env: Vec<String> = c.env.as_ref()
-                        .map(|vars| vars.iter().filter_map(|e| {
-                            e.value.as_ref().map(|v| format!("{}={}", e.name, v))
-                        }).collect())
-                        .unwrap_or_default();
-
-                    // Resolve volumeMounts → (host_path, container_path)
-                    let volumes: Vec<(String, String)> = c.volume_mounts.as_ref()
-                        .map(|mounts| mounts.iter().filter_map(|m| {
-                            volume_map.get(&m.name).map(|host| (host.clone(), m.mount_path.clone()))
-                        }).collect())
-                        .unwrap_or_default();
-
-                    // Parse health probes
-                    let liveness_probe = c.liveness_probe.as_ref().map(|p| StoredProbe {
-                        http_get: p.http_get.as_ref().map(|h| (h.path.clone(), h.port)),
-                        exec: p.exec.as_ref().map(|e| e.command.clone()),
-                        initial_delay_seconds: p.initial_delay_seconds,
-                        period_seconds: p.period_seconds,
-                        failure_threshold: p.failure_threshold,
-                    });
-                    let readiness_probe = c.readiness_probe.as_ref().map(|p| StoredProbe {
-                        http_get: p.http_get.as_ref().map(|h| (h.path.clone(), h.port)),
-                        exec: p.exec.as_ref().map(|e| e.command.clone()),
-                        initial_delay_seconds: p.initial_delay_seconds,
-                        period_seconds: p.period_seconds,
-                        failure_threshold: p.failure_threshold,
-                    });
-
-                    // Parse envFrom references
-                    let env_from_configmaps: Vec<String> = c.env_from.as_ref()
-                        .map(|refs| refs.iter().filter_map(|r| r.config_map_ref.as_ref().map(|cm| cm.name.clone())).collect())
-                        .unwrap_or_default();
-                    let env_from_secrets: Vec<String> = c.env_from.as_ref()
-                        .map(|refs| refs.iter().filter_map(|r| r.secret_ref.as_ref().map(|s| s.name.clone())).collect())
-                        .unwrap_or_default();
-
-                    let startup_probe = c.startup_probe.as_ref().map(|p| StoredProbe {
-                        http_get: p.http_get.as_ref().map(|h| (h.path.clone(), h.port)),
-                        exec: p.exec.as_ref().map(|e| e.command.clone()),
-                        initial_delay_seconds: p.initial_delay_seconds,
-                        period_seconds: p.period_seconds,
-                        failure_threshold: p.failure_threshold,
-                    });
-                    StoredContainer {
-                        name: c.name.clone(),
-                        image: c.image.clone(),
-                        command: c.command.clone(),
-                        env,
-                        env_from_configmaps,
-                        env_from_secrets,
-                        volumes,
-                        liveness_probe,
-                        readiness_probe,
-                        startup_probe,
-                    }
-                }).collect();
-
-                // Parse init containers (run before main, must complete)
+                // Init containers (run before main, must complete) get the same
+                // full contract as main containers (env, envFrom, volumes).
                 let init_containers: Vec<StoredContainer> = dep.template.spec.init_containers.as_ref()
                     .map(|inits| inits.iter().map(|c| {
-                        let env: Vec<String> = c.env.as_ref()
-                            .map(|vars| vars.iter().filter_map(|e| {
-                                e.value.as_ref().map(|v| format!("{}={}", e.name, v))
-                            }).collect())
-                            .unwrap_or_default();
-                        StoredContainer {
-                            name: c.name.clone(), image: c.image.clone(),
-                            command: c.command.clone(), env, volumes: vec![],
-                env_from_configmaps: vec![], env_from_secrets: vec![],
-                            liveness_probe: None, readiness_probe: None, startup_probe: None,
+                        if c.liveness_probe.is_some() || c.readiness_probe.is_some() || c.startup_probe.is_some() {
+                            return Err(format!("init container {:?}: regular init containers cannot define probes", c.name));
                         }
-                    }).collect())
+                        parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())
+                    }).collect::<Result<_, _>>())
+                    .transpose()?
                     .unwrap_or_default();
 
                 let first = match stored_containers.first() {
@@ -1044,9 +1150,10 @@ impl DesiredWorld {
                 let init_count = init_containers.len();
                 let new_image = first.image.clone();
                 let replicas = dep.replicas.unwrap_or(1);
+                let key = crate::store::obj_key(&ns, &name);
 
                 // Detect image change → trigger rolling update
-                let rolling = if let Some(existing) = self.deployments.get(&name) {
+                let rolling = if let Some(existing) = self.deployments.get(&key) {
                     if existing.image != new_image && !existing.image.is_empty() {
                         Some(existing.image.clone())
                     } else {
@@ -1082,7 +1189,7 @@ impl DesiredWorld {
                 // LimitRange defaults: deployments without explicit limits
                 // inherit the namespace defaults (K8s LimitRange semantics).
                 let resource_limits = resource_limits.or_else(|| {
-                    self.limit_ranges.get(&ns).map(|lr| {
+                    self.limit_ranges.values().find(|lr| lr.namespace == ns).map(|lr| {
                         let parse_cpu = |s: &str| -> f32 {
                             if s.ends_with('m') { s.trim_end_matches('m').parse::<f32>().unwrap_or(0.0) / 1000.0 }
                             else { s.parse::<f32>().unwrap_or(0.0) }
@@ -1101,10 +1208,12 @@ impl DesiredWorld {
                     })
                 });
 
-                // Save previous image for rollback
-                let previous_image = self.deployments.get(&name).map(|d| d.image.clone());
+                // Save previous image for rollback; keep the restart nonce so a
+                // re-apply of an unchanged spec does not roll the pods.
+                let previous_image = self.deployments.get(&key).map(|d| d.image.clone());
+                let restart_nonce = self.deployments.get(&key).map(|d| d.restart_nonce).unwrap_or(0);
 
-                self.deployments.insert(name.clone(), StoredDeployment {
+                self.deployments.insert(key.clone(), StoredDeployment {
                     name: name.clone(),
                     namespace: ns,
                     replicas,
@@ -1139,10 +1248,11 @@ impl DesiredWorld {
                     idle_since: None,
                     stateful: resource.kind == "StatefulSet",
                     owner_ref: None,
+                    restart_nonce,
                 });
 
                 if let Some(old_image) = rolling {
-                    self.pending_rollouts.insert(name.clone(), RolloutState {
+                    self.pending_rollouts.insert(key.clone(), RolloutState {
                         old_image: old_image.clone(),
                         new_image: new_image.clone(),
                         total_replicas: replicas,
@@ -1182,45 +1292,29 @@ impl DesiredWorld {
                     }
                 }
 
-                // Detect change: if ConfigMap existed before with different data, trigger rolling restart
-                let changed = self.configmaps.get(&name)
+                let key = crate::store::obj_key(&ns, &name);
+                // Detect change: if the ConfigMap existed with different data,
+                // the pods consuming it must be restarted. That is expressed in
+                // desired state (restart nonce) — the reconcile loop rolls them —
+                // so a write that is never committed restarts nothing.
+                let changed = self.configmaps.get(&key)
                     .map(|old| old.data != data)
                     .unwrap_or(false);
-
-                self.configmaps.insert(name.clone(), StoredConfigMap {
+                let n_keys = data.len();
+                self.configmaps.insert(key, StoredConfigMap {
                     name: name.clone(),
                     namespace: ns.clone(),
                     data,
                 });
-
                 if changed {
-                    // Find deployments that reference this ConfigMap and trigger rolling restart
-                    let mut restarted = Vec::new();
-                    for (dep_name, dep) in &self.deployments {
-                        if dep.namespace != ns { continue; }
-                        let uses_cm = dep.containers.iter()
-                            .any(|c| c.env_from_configmaps.contains(&name));
-                        if uses_cm {
-                            restarted.push(dep_name.clone());
-                        }
-                    }
-                    // Trigger restart by removing containers (reconcile loop recreates with new env)
-                    for dep_name in &restarted {
-                        let prefix = format!("rk-{dep_name}-");
-                        if let Ok(containers) = crate::docker::list_containers(true) {
-                            for c in containers.iter().filter(|c| c.names.iter().any(|n| n.contains(&prefix))) {
-                                crate::docker::stop_container(&c.id).ok();
-                                crate::docker::remove_container(&c.id, true).ok();
-                            }
-                        }
-                    }
+                    let restarted = self.bump_consumers(&ns, &name, false);
                     if restarted.is_empty() {
-                        Ok(format!("configmap/{name} updated ({} keys)", self.configmaps[&name].data.len()))
+                        Ok(format!("configmap/{name} updated ({n_keys} keys)"))
                     } else {
                         Ok(format!("configmap/{name} updated → rolling restart: {}", restarted.join(", ")))
                     }
                 } else {
-                    Ok(format!("configmap/{name} applied ({} keys)", self.configmaps[&name].data.len()))
+                    Ok(format!("configmap/{name} applied ({n_keys} keys)"))
                 }
             }
 
@@ -1257,12 +1351,21 @@ impl DesiredWorld {
                     }
                 }
 
-                self.secrets.insert(name.clone(), StoredSecret {
+                let key = crate::store::obj_key(&ns, &name);
+                let changed = self.secrets.get(&key).map(|old| old.data != data).unwrap_or(false);
+                let n_keys = data.len();
+                self.secrets.insert(key, StoredSecret {
                     name: name.clone(),
-                    namespace: ns,
+                    namespace: ns.clone(),
                     data,
                 });
-                Ok(format!("secret/{name} applied ({} keys)", self.secrets[&name].data.len()))
+                if changed {
+                    let restarted = self.bump_consumers(&ns, &name, true);
+                    if !restarted.is_empty() {
+                        return Ok(format!("secret/{name} updated → rolling restart: {}", restarted.join(", ")));
+                    }
+                }
+                Ok(format!("secret/{name} applied ({n_keys} keys)"))
             }
 
             "Service" => {
@@ -1277,8 +1380,26 @@ impl DesiredWorld {
                 }).collect();
                 let selector = svc.selector.clone().unwrap_or_default();
                 let service_type = svc.service_type.clone().unwrap_or("ClusterIP".to_string());
+                // A node port is one host socket: two Services may not claim it.
+                let key = crate::store::obj_key(&ns, &name);
+                let listen_ports = |t: &str, ps: &[ServicePort]| -> Vec<u16> {
+                    match t {
+                        "NodePort" => ps.iter().filter_map(|p| p.node_port).collect(),
+                        "LoadBalancer" => ps.iter().map(|p| p.port).collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                for lp in listen_ports(&service_type, &ports) {
+                    if lp == 0 {
+                        return Err(format!("service/{name}: port 0 cannot be exposed on the node"));
+                    }
+                    if let Some((other, _)) = self.services.iter()
+                        .find(|(k, o)| **k != key && listen_ports(&o.service_type, &o.ports).contains(&lp)) {
+                        return Err(format!("service/{name}: node port {lp} is already allocated to service {other}"));
+                    }
+                }
                 let port_desc: Vec<String> = ports.iter().map(|p| format!("{}→{}", p.port, p.target_port)).collect();
-                self.services.insert(name.clone(), StoredService {
+                self.services.insert(key, StoredService {
                     name: name.clone(), namespace: ns, selector, ports, service_type: service_type.clone(),
                 });
                 Ok(format!("service/{name} ({service_type}, ports: {})", port_desc.join(", ")))
@@ -1296,12 +1417,30 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let provisioner = spec.get("provisioner").and_then(|v| v.as_str())
-                    .unwrap_or("royak/host-path").to_string();
-                let host_path_prefix = spec.get("hostPathPrefix").and_then(|v| v.as_str())
-                    .unwrap_or("/data/royak/volumes").to_string();
-                let reclaim_policy = spec.get("reclaimPolicy").and_then(|v| v.as_str())
-                    .unwrap_or("Delete").to_string();
+                let provisioner = crate::storage::string_field(spec, &["provisioner"], "royak/host-path")?;
+                let native=provisioner==crate::storage_lifecycle::PROVISIONER;
+                let host_path_prefix = crate::storage::string_field(spec, &["hostPathPrefix"], if native {""} else {"/data/royak/volumes"})?;
+                let reclaim_policy = crate::storage::string_field(spec, &["reclaimPolicy"], "Delete")?;
+
+                if provisioner != "royak/host-path" && !native {
+                    return Err(format!("storageclass/{name}: unsupported provisioner {provisioner:?}; no storage driver is installed"));
+                }
+                if native && !host_path_prefix.is_empty() {
+                    return Err("managed storage never accepts a user-supplied host path".into());
+                }
+                if !native && crate::host_access::validate_public_path(&host_path_prefix).is_err() {
+                    return Err(format!("storageclass/{name}: unsafe hostPathPrefix"));
+                }
+                if !matches!(reclaim_policy.as_str(), "Retain" | "Delete") {
+                    return Err(format!("storageclass/{name}: reclaimPolicy must be Retain or Delete"));
+                }
+                if let Some(existing) = self.storage_classes.get(&name) {
+                    if existing.provisioner != provisioner || existing.host_path_prefix != host_path_prefix
+                        || existing.reclaim_policy != reclaim_policy {
+                        return Err(format!("storageclass/{name}: provisioning and retention settings are immutable"));
+                    }
+                    return Ok(format!("storageclass/{name} unchanged"));
+                }
 
                 self.storage_classes.insert(name.clone(), StoredStorageClass {
                     name: name.clone(),
@@ -1317,26 +1456,31 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let capacity = spec.get("capacity")
-                    .and_then(|c| c.get("storage"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("1Gi").to_string();
-                let storage_class = spec.get("storageClassName")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("local").to_string();
-                let host_path = spec.get("hostPath")
-                    .and_then(|h| h.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("/data").to_string();
-                let access_mode = spec.get("accessModes")
-                    .and_then(|a| a.as_sequence())
-                    .and_then(|s| s.first())
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ReadWriteOnce").to_string();
+                let capacity = crate::storage::string_field(spec, &["capacity", "storage"], "1Gi")?;
+                let capacity_bytes = crate::storage::capacity_bytes(&capacity)?;
+                let storage_class = crate::storage::string_field(spec, &["storageClassName"], "local")?;
+                if self.storage_classes.get(&storage_class).is_some_and(|s|s.provisioner==crate::storage_lifecycle::PROVISIONER) {
+                    return Err("managed PV metadata is controller-owned; create a PersistentVolumeClaim instead".into());
+                }
+                let host_path = crate::storage::string_field(spec, &["hostPath", "path"], "/data")?;
+                let access_mode = crate::storage::access_mode(spec)?;
 
-                // Create host path directory
-                std::fs::create_dir_all(&host_path).ok();
-
+                if crate::host_access::validate_public_path(&host_path).is_err() {
+                    return Err(format!("pv/{name}: unsafe hostPath {host_path}"));
+                }
+                // Reapply is not a release/adoption operation. In particular,
+                // it cannot turn a Bound or Released volume back to Available.
+                if let Some(existing) = self.pvs.get(&name) {
+                    if crate::storage::capacity_bytes(&existing.capacity)? != capacity_bytes
+                        || existing.storage_class != storage_class || existing.host_path != host_path
+                        || existing.access_mode != access_mode {
+                        return Err(format!("pv/{name}: capacity, class, path and access mode are immutable; expansion is not implemented"));
+                    }
+                    return Ok(format!("pv/{name} unchanged"));
+                }
+                // The host directory is created when a pod mounts it (or after
+                // the commit, see materialize_storage) — never during apply,
+                // which may run on a scratch copy that is then rejected.
                 self.pvs.insert(name.clone(), StoredPV {
                     name: name.clone(),
                     capacity: capacity.clone(),
@@ -1354,29 +1498,43 @@ impl DesiredWorld {
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let storage_class = spec.get("storageClassName")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("local").to_string();
-                let requested = spec.get("resources")
-                    .and_then(|r| r.get("requests"))
-                    .and_then(|r| r.get("storage"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("1Gi").to_string();
-                let access_mode = spec.get("accessModes")
-                    .and_then(|a| a.as_sequence())
-                    .and_then(|s| s.first())
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ReadWriteOnce").to_string();
+                let storage_class = crate::storage::string_field(spec, &["storageClassName"], "local")?;
+                let requested = crate::storage::string_field(spec, &["resources", "requests", "storage"], "1Gi")?;
+                let requested_bytes = crate::storage::capacity_bytes(&requested)?;
+                let access_mode = crate::storage::access_mode(spec)?;
 
+                let key = crate::store::obj_key(&ns, &name);
+                if self.storage_classes.get(&storage_class).is_some_and(|s|s.provisioner==crate::storage_lifecycle::PROVISIONER)
+                    && access_mode!="ReadWriteOnce" {
+                    return Err("managed replicated volumes require ReadWriteOnce and one active writer pod".into());
+                }
+                // Re-applying a bound claim keeps its binding.
+                if let Some(existing) = self.pvcs.get(&key) {
+                    if let Some(pv) = existing.bound_pv.clone() {
+                        if existing.storage_class != storage_class || existing.access_mode != access_mode
+                            || crate::storage::capacity_bytes(&existing.requested)? != requested_bytes {
+                            return Err(format!("pvc/{name}: a bound claim is immutable; expansion is not implemented"));
+                        }
+                        let volume = self.pvs.get(&pv).ok_or_else(|| format!("pvc/{name}: bound PV is missing"))?;
+                        if volume.status != PVStatus::Bound || volume.bound_to.as_deref() != Some(key.as_str())
+                            || volume.storage_class != storage_class || volume.access_mode != access_mode
+                            || crate::storage::capacity_bytes(&volume.capacity)? < requested_bytes {
+                            return Err(format!("pvc/{name}: inconsistent PV binding; refusing to adopt storage"));
+                        }
+                        return Ok(format!("pvc/{name} Bound ({requested}) → pv/{pv}"));
+                    }
+                }
                 // Auto-bind to matching PV
                 let mut bound_pv = None;
                 for (pv_name, pv) in self.pvs.iter_mut() {
                     if pv.status == PVStatus::Available
+                        && pv.bound_to.is_none()
                         && pv.storage_class == storage_class
                         && pv.access_mode == access_mode
+                        && crate::storage::capacity_bytes(&pv.capacity).is_ok_and(|n| n >= requested_bytes)
                     {
                         pv.status = PVStatus::Bound;
-                        pv.bound_to = Some(name.clone());
+                        pv.bound_to = Some(key.clone());
                         bound_pv = Some(pv_name.clone());
                         break;
                     }
@@ -1385,13 +1543,18 @@ impl DesiredWorld {
                 // Dynamic provisioning: if no PV matches, use StorageClass to create one
                 if bound_pv.is_none() {
                     if let Some(sc) = self.storage_classes.get_mut(&storage_class) {
-                        let pv_name = format!("pv-auto-{}-{}", sc.name, sc.provisioned_count);
-                        let host_path = format!("{}/{}/{}", sc.host_path_prefix, ns, name);
-
-                        // Create directory on host (for host-path provisioner)
-                        if sc.provisioner == "royak/host-path" {
-                            std::fs::create_dir_all(&host_path).ok();
+                        let native=sc.provisioner==crate::storage_lifecycle::PROVISIONER;
+                        if !native && (sc.provisioner != "royak/host-path" || !validate_path(&sc.host_path_prefix)) {
+                            return Err(format!("pvc/{name}: unsupported or unsafe provisioner"));
                         }
+                        let count = sc.provisioned_count.checked_add(1).ok_or("storage class provision counter exhausted")?;
+                        // Fresh data identity even when the same claim/class is
+                        // deleted and recreated. Retained paths are never reused.
+                        let identity = format!("{:032x}", rand::random::<u128>());
+                        let pv_name = format!("pv-auto-{identity}");
+                        if self.pvs.contains_key(&pv_name) { return Err("storage identity collision; retry admission".into()); }
+                        let host_path = if native {String::new()} else {format!("{}/{}/{name}-{identity}", sc.host_path_prefix, ns)};
+                        // Directory is created after commit (materialize_storage).
 
                         let pv = StoredPV {
                             name: pv_name.clone(),
@@ -1400,18 +1563,18 @@ impl DesiredWorld {
                             host_path: host_path.clone(),
                             access_mode: access_mode.clone(),
                             status: PVStatus::Bound,
-                            bound_to: Some(name.clone()),
+                            bound_to: Some(key.clone()),
                         };
                         self.pvs.insert(pv_name.clone(), pv);
-                        sc.provisioned_count += 1;
+                        sc.provisioned_count = count;
                         bound_pv = Some(pv_name);
-                        eprintln!("  [storage] auto-provisioned pv from storageclass/{} → {host_path}", sc.name);
+                        let _ = &host_path;
                     }
                 }
 
                 let status = if bound_pv.is_some() { "Bound" } else { "Pending" };
 
-                self.pvcs.insert(name.clone(), StoredPVC {
+                self.pvcs.insert(key, StoredPVC {
                     name: name.clone(),
                     namespace: ns,
                     storage_class,
@@ -1426,45 +1589,32 @@ impl DesiredWorld {
 
             "DaemonSet" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid DaemonSet spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
-                let c = &dep.template.spec.containers[0];
-                let env: Vec<String> = c.env.as_ref()
-                    .map(|vars| vars.iter().filter_map(|e| e.value.as_ref().map(|v| format!("{}={}", e.name, v))).collect())
-                    .unwrap_or_default();
-
-                self.daemonsets.insert(name.clone(), StoredDaemonSet {
+                let c = dep.template.spec.containers.first().ok_or("DaemonSet has no containers")?;
+                let volume_map = pod_volume_map(dep.template.spec.volumes.as_deref().unwrap_or(&[]), HashMap::new())?;
+                self.daemonsets.insert(crate::store::obj_key(&ns, &name), StoredDaemonSet {
                     name: name.clone(),
                     namespace: ns,
-                    container: StoredContainer {
-                        name: c.name.clone(), image: c.image.clone(),
-                        command: c.command.clone(), env, volumes: vec![],
-                env_from_configmaps: vec![], env_from_secrets: vec![],
-                        liveness_probe: None, readiness_probe: None, startup_probe: None,
-                    },
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
                 });
                 Ok(format!("daemonset/{name} applied (runs on every node)"))
             }
 
             "Job" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid Job spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
-                let c = &dep.template.spec.containers[0];
-                let env: Vec<String> = c.env.as_ref()
-                    .map(|vars| vars.iter().filter_map(|e| e.value.as_ref().map(|v| format!("{}={}", e.name, v))).collect())
-                    .unwrap_or_default();
+                let c = dep.template.spec.containers.first().ok_or("Job has no containers")?;
+                let volume_map = pod_volume_map(dep.template.spec.volumes.as_deref().unwrap_or(&[]), HashMap::new())?;
                 let completions = dep.replicas.unwrap_or(1);
 
-                self.jobs.insert(name.clone(), StoredJob {
+                self.jobs.insert(crate::store::obj_key(&ns, &name), StoredJob {
                     name: name.clone(),
                     namespace: ns,
-                    container: StoredContainer {
-                        name: c.name.clone(), image: c.image.clone(),
-                        command: c.command.clone(), env, volumes: vec![],
-                env_from_configmaps: vec![], env_from_secrets: vec![],
-                        liveness_probe: None, readiness_probe: None, startup_probe: None,
-                    },
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
                     completions,
                     status: JobStatus::Pending,
                 });
@@ -1473,28 +1623,25 @@ impl DesiredWorld {
 
             "CronJob" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid CronJob spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
-                let c = &dep.template.spec.containers[0];
-                let env: Vec<String> = c.env.as_ref()
-                    .map(|vars| vars.iter().filter_map(|e| e.value.as_ref().map(|v| format!("{}={}", e.name, v))).collect())
-                    .unwrap_or_default();
+                let c = dep.template.spec.containers.first().ok_or("CronJob has no containers")?;
+                let volume_map = pod_volume_map(dep.template.spec.volumes.as_deref().unwrap_or(&[]), HashMap::new())?;
+                let key = crate::store::obj_key(&ns, &name);
+                // Re-applying keeps the run bookkeeping.
+                let last_run = self.cronjobs.get(&key).and_then(|c| c.last_run);
                 let schedule = resource.spec.as_ref()
                     .and_then(|s| s.get("schedule"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("*/5 * * * *").to_string();
 
-                self.cronjobs.insert(name.clone(), StoredCronJob {
+                self.cronjobs.insert(key, StoredCronJob {
                     name: name.clone(),
                     namespace: ns,
                     schedule: schedule.clone(),
-                    container: StoredContainer {
-                        name: c.name.clone(), image: c.image.clone(),
-                        command: c.command.clone(), env, volumes: vec![],
-                env_from_configmaps: vec![], env_from_secrets: vec![],
-                        liveness_probe: None, readiness_probe: None, startup_probe: None,
-                    },
-                    last_run: None,
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
+                    last_run,
                 });
                 Ok(format!("cronjob/{name} scheduled ({schedule})"))
             }
@@ -1538,7 +1685,7 @@ impl DesiredWorld {
                     Some(c) => format!(", class={c}"),
                     None => String::new(),
                 };
-                self.ingresses.insert(name.clone(), StoredIngress { name: name.clone(), namespace: ns, rules, ingress_class });
+                self.ingresses.insert(crate::store::obj_key(&ns, &name), StoredIngress { name: name.clone(), namespace: ns, rules, ingress_class });
                 Ok(format!("ingress/{name} applied ({rule_count} routes{class_note})"))
             }
 
@@ -1611,7 +1758,8 @@ impl DesiredWorld {
                 let mtls_required = spec.get("mtls").and_then(|v| v.as_bool()).unwrap_or(false);
                 let deny_all = spec.get("denyAll").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                self.network_policies.insert(name.clone(), StoredNetworkPolicy {
+                let key = crate::store::obj_key(&ns, &name);
+                self.network_policies.insert(key.clone(), StoredNetworkPolicy {
                     name: name.clone(), namespace: ns, pod_selector,
                     ingress_allow, egress_allow,
                     ingress_ports, egress_ports,
@@ -1625,9 +1773,9 @@ impl DesiredWorld {
                 let features_str = if features.is_empty() { String::new() } else { format!(" [{}]", features.join(", ")) };
 
                 Ok(format!("networkpolicy/{name} applied (selector: {}, {} ingress, {} egress rules){features_str}",
-                    self.network_policies[&name].pod_selector,
-                    self.network_policies[&name].ingress_allow.len(),
-                    self.network_policies[&name].egress_allow.len()))
+                    self.network_policies[&key].pod_selector,
+                    self.network_policies[&key].ingress_allow.len(),
+                    self.network_policies[&key].egress_allow.len()))
             }
 
             "ResourceQuota" => {
@@ -1682,6 +1830,7 @@ impl DesiredWorld {
 
             "HorizontalPodAutoscaler" | "HPA" => {
                 let name = resource.metadata.name.clone();
+                let ns = crate::store::ns_of(resource);
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
                 let deployment = spec.get("scaleTargetRef")
@@ -1698,14 +1847,18 @@ impl DesiredWorld {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(70.0) as f32;
 
-                self.hpas.insert(name.clone(), StoredHPA {
+                let key = crate::store::obj_key(&ns, &name);
+                let (history, last_scaled) = self.hpas.get(&key)
+                    .map(|h| (h.history.clone(), h.last_scaled)).unwrap_or_default();
+                self.hpas.insert(key, StoredHPA {
                     name: name.clone(),
+                    namespace: ns,
                     deployment: deployment.clone(),
                     min_replicas,
                     max_replicas,
                     target_cpu,
-                    history: Vec::new(),
-                    last_scaled: None,
+                    history,
+                    last_scaled,
                 });
                 Ok(format!("hpa/{name} → {deployment} (min={min_replicas}, max={max_replicas}, cpu={target_cpu}%)"))
             }
@@ -1774,6 +1927,9 @@ impl DesiredWorld {
                         if let Some(w) = &t.webhook { webhook_triggers.push(w.clone()); }
                         if let Some(s) = &t.schedule { schedule_triggers.push(s.clone()); }
                     }
+                }
+                if let Some(bad) = http_triggers.iter().chain(&webhook_triggers).find(|p| !crate::auth::is_function_trigger_path(p)) {
+                    return Err(format!("Function {name}: trigger path {bad} is reserved (it is a Kubernetes, Royak or system endpoint); use e.g. /fn/... or /hooks/..."));
                 }
 
                 let timeout = func_spec.timeout.as_deref()
@@ -1917,45 +2073,68 @@ impl DesiredWorld {
                     .and_then(|r| r.as_sequence())
                     .ok_or("Role needs top-level rules")?;
                 let rules: Vec<RbacRule> = rules_val.iter().map(|r| {
+                    // K8s semantics: a missing list grants nothing (not "*").
                     let get_strings = |key: &str| -> Vec<String> {
                         r.get(key).and_then(|v| v.as_sequence())
                             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                            .unwrap_or_else(|| vec!["*".to_string()])
+                            .unwrap_or_default()
                     };
                     RbacRule {
                         resources: get_strings("resources"),
                         verbs: get_strings("verbs"),
                         namespaces: vec![ns_scope.clone()],
+                        resource_names: get_strings("resourceNames"),
                     }
                 }).collect();
                 let rule_count = rules.len();
-                self.rbac_roles.insert(name.clone(), RbacRole { name: name.clone(), rules });
+                let (key, namespace) = if resource.kind == "ClusterRole" {
+                    (name.clone(), None)
+                } else {
+                    (crate::store::obj_key(&ns_scope, &name), Some(ns_scope.clone()))
+                };
+                self.rbac_roles.insert(key, RbacRole { name: name.clone(), rules, namespace, kind: resource.kind.clone() });
                 Ok(format!("{}/{name} configured ({rule_count} rules, ns={ns_scope})", resource.kind.to_lowercase()))
             }
-            // RoleBinding/ClusterRoleBinding: each subject name becomes an
-            // alias for the referenced role's rules — Royak resolves the
-            // caller's role from its token/header by name.
+            // RoleBinding/ClusterRoleBinding: stored as bindings and resolved at
+            // authorization time (auth::authorize) — subjects are User, Group
+            // or ServiceAccount identities established by authentication.
             "RoleBinding" | "ClusterRoleBinding" => {
                 let name = resource.metadata.name.clone();
-                let role_name = resource.role_ref.as_ref()
-                    .and_then(|r| r.get("name")).and_then(|v| v.as_str())
+                let role_ref = resource.role_ref.as_ref().ok_or("RoleBinding needs roleRef")?;
+                let role_name = role_ref.get("name").and_then(|v| v.as_str())
                     .ok_or("RoleBinding needs roleRef.name")?
                     .to_string();
-                let role = self.rbac_roles.get(&role_name)
-                    .ok_or(format!("roleRef '{role_name}' not found — apply the Role first"))?
-                    .clone();
-                let subjects: Vec<String> = resource.subjects.as_ref()
+                let role_kind = role_ref.get("kind").and_then(|v| v.as_str()).unwrap_or("ClusterRole").to_string();
+                if role_kind != "Role" && role_kind != "ClusterRole" {
+                    return Err(format!("roleRef.kind must be Role or ClusterRole, got {role_kind}"));
+                }
+                if resource.kind == "ClusterRoleBinding" && role_kind != "ClusterRole" {
+                    return Err("ClusterRoleBinding may only reference a ClusterRole".to_string());
+                }
+                let subjects: Vec<RbacSubject> = resource.subjects.as_ref()
                     .and_then(|s| s.as_sequence())
-                    .map(|arr| arr.iter().filter_map(|s| s.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())).collect())
+                    .map(|arr| arr.iter().filter_map(|s| {
+                        let name = s.get("name").and_then(|v| v.as_str())?.to_string();
+                        let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("User").to_string();
+                        let namespace = s.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        Some(RbacSubject { kind, name, namespace })
+                    }).collect())
                     .unwrap_or_default();
                 if subjects.is_empty() {
                     return Err("RoleBinding needs at least one subject".to_string());
                 }
-                let n = subjects.len();
-                for subject in subjects {
-                    self.rbac_roles.insert(subject.clone(), RbacRole { name: subject, rules: role.rules.clone() });
+                if let Some(bad) = subjects.iter().find(|s| !matches!(s.kind.as_str(), "User" | "Group" | "ServiceAccount")) {
+                    return Err(format!("unsupported subject kind {}", bad.kind));
                 }
-                Ok(format!("rolebinding/{name}: {n} subject(s) bound to role '{role_name}'"))
+                let n = subjects.len();
+                let (key, namespace) = if resource.kind == "ClusterRoleBinding" {
+                    (name.clone(), None)
+                } else {
+                    let ns = crate::store::ns_of(resource);
+                    (crate::store::obj_key(&ns, &name), Some(ns))
+                };
+                self.rbac_bindings.insert(key, RbacBinding { name: name.clone(), namespace, role_kind: role_kind.clone(), role_name: role_name.clone(), subjects });
+                Ok(format!("{}/{name}: {n} subject(s) bound to {} '{role_name}'", resource.kind.to_lowercase(), role_kind.to_lowercase()))
             }
             // ServiceAccount: accepted for manifest compatibility. Royak's pod
             // identity (per-pod HMAC tokens + mTLS certs) already covers the
@@ -1983,7 +2162,7 @@ impl DesiredWorld {
                     request_cpu: get("defaultRequest", "cpu"),
                     request_mem: get("defaultRequest", "memory"),
                 };
-                self.limit_ranges.insert(ns.clone(), lr);
+                self.limit_ranges.insert(crate::store::obj_key(&ns, &name), lr);
                 Ok(format!("limitrange/{name} set for namespace {ns}"))
             }
 
@@ -2002,10 +2181,11 @@ impl DesiredWorld {
                         resources: get_strings("resources"),
                         verbs: get_strings("verbs"),
                         namespaces: get_strings("namespaces"),
+                        resource_names: Vec::new(),
                     }
                 }).collect();
                 let rule_count = rules.len();
-                self.rbac_roles.insert(name.clone(), RbacRole { name: name.clone(), rules });
+                self.rbac_roles.insert(name.clone(), RbacRole { name: name.clone(), rules, namespace: None, kind: "RbacRole".to_string() });
                 Ok(format!("rbac/{name} configured ({rule_count} rules)"))
             }
 
@@ -2077,17 +2257,21 @@ impl DesiredWorld {
             "CustomResource" => {
                 let sv = resource.spec.as_ref().ok_or("No spec")?;
                 let name = resource.metadata.name.clone();
-                let cr_kind = resource.metadata.namespace.clone()
-                    .or_else(|| sv.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_default();
-                // Use the actual kind from metadata labels or a "kind" field in spec
+                // The custom kind comes from spec.resourceKind or spec.kind.
                 let actual_kind = sv.get("resourceKind").and_then(|v| v.as_str())
-                    .unwrap_or(&cr_kind).to_string();
+                    .or_else(|| sv.get("kind").and_then(|v| v.as_str()))
+                    .ok_or("CustomResource needs spec.resourceKind")?
+                    .to_string();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let spec_json = serde_json::to_value(sv).unwrap_or(serde_json::json!({}));
-                self.custom_resources.insert(name.clone(), CustomResource {
+                let key = crate::store::obj_key(&ns, &name);
+                // Re-applying an unchanged CR keeps its lifecycle status.
+                let status = self.custom_resources.get(&key)
+                    .filter(|cr| cr.spec == spec_json && cr.kind == actual_kind)
+                    .map(|cr| cr.status.clone()).unwrap_or(CRStatus::Pending);
+                self.custom_resources.insert(key, CustomResource {
                     name: name.clone(), kind: actual_kind.clone(),
-                    namespace: ns, spec: spec_json, status: CRStatus::Pending,
+                    namespace: ns, spec: spec_json, status,
                 });
                 Ok(format!("cr/{actual_kind}/{name} created (pending operator)"))
             }
@@ -2210,62 +2394,396 @@ impl DesiredWorld {
         Ok(())
     }
 
-    /// Delete any resource by name
-    pub fn delete(&mut self, name: &str) -> bool {
-        self.deployments.remove(name).is_some()
+    /// Mark every deployment in `ns` that consumes ConfigMap/Secret `name`
+    /// (envFrom or projected volume) for a rolling restart. Returns the names.
+    pub fn bump_consumers(&mut self, ns: &str, name: &str, is_secret: bool) -> Vec<String> {
+        let vol_ref = if is_secret { format!("sev:{name}") } else { format!("cmv:{name}") };
+        let mut restarted = Vec::new();
+        for dep in self.deployments.values_mut() {
+            if dep.namespace != ns { continue; }
+            let uses = dep.containers.iter().chain(dep.init_containers.iter()).any(|c| {
+                let env_ref = if is_secret { &c.env_from_secrets } else { &c.env_from_configmaps };
+                env_ref.iter().any(|n| n == name) || c.volumes.iter().any(|(h, _)| h == &vol_ref)
+            });
+            if uses {
+                dep.restart_nonce += 1;
+                restarted.push(dep.name.clone());
+            }
+        }
+        restarted.sort();
+        restarted
     }
 
-    /// Delete a resource by type and name
-    pub fn delete_resource(&mut self, resource_type: &str, name: &str) -> bool {
+    /// Delete a namespaced or cluster-scoped object. `ns` is ignored for
+    /// cluster-scoped kinds. Returns None if it did not exist; otherwise the
+    /// host paths that must be removed once the deletion is committed (a PVC
+    /// whose StorageClass reclaim policy is Delete). Never touches the disk or
+    /// Docker itself — the caller does that only after a successful commit,
+    /// and the reconcile loop garbage-collects the containers.
+    pub fn delete_resource(&mut self, resource_type: &str, ns: &str, name: &str) -> Option<Vec<String>> {
+        if self.validate_storage_delete(resource_type,ns,name).is_err() { return None; }
+        let result=self.delete_resource_inner(resource_type,ns,name);
+        if result.is_some() {
+            // A commit validates the resulting identities before publishing;
+            // do not discard old identities to mask a namespace mismatch.
+            let _ = self.synchronize_storage_identities();
+        }
+        result
+    }
+
+    /// Admission must not remove a claimed PV, nor erase arbitrary legacy host
+    /// paths while writers may still be using them. A real driver needs durable
+    /// detach/fencing acknowledgements before honoring Delete. Until that
+    /// lifecycle is implemented, legacy Delete fails explicitly instead of
+    /// acknowledging deletion and removing a directory behind a running pod.
+    pub fn validate_storage_delete(&self, kind: &str, ns: &str, name: &str) -> Result<(),String> {
+        match kind {
+            "persistentvolumes"|"persistentvolume"|"pvs"|"pv" => {
+                if self.pvs.get(name).is_some_and(|v|v.status==PVStatus::Bound)
+                    || self.pvcs.values().any(|c|c.bound_pv.as_deref()==Some(name)) {
+                    return Err("persistentvolume is still claimed; delete/detach the claim before removing PV metadata".into());
+                }
+            },
+            "persistentvolumeclaims"|"persistentvolumeclaim"|"pvcs"|"pvc" => {
+                if let Some(c)=self.pvcs.get(&crate::store::obj_key(ns,name)) {
+                    if let Some(pv)=&c.bound_pv {
+                        if let Some(uid)=self.storage_identities.volumes.get(pv) {
+                            if !self.storage_identities.lifecycle.may_remove_metadata(uid) {
+                                return Err("managed volume needs verified release/detach/fencing before metadata deletion".into());
+                            }
+                        }
+                        let pv=self.pvs.get(pv).ok_or("claim binding is inconsistent; refusing data deletion")?;
+                        if self.storage_classes.get(&pv.storage_class).is_some_and(|sc|sc.provisioner=="royak/host-path" && sc.reclaim_policy=="Delete") {
+                            return Err("legacy host-path Delete reclaim is not qualified: no durable detach/fencing proof; data was NOT removed".into());
+                        }
+                    }
+                }
+            },
+            "storageclasses"|"storageclass" => {
+                if self.pvs.values().filter(|pv|pv.storage_class==name).any(|pv|
+                    self.storage_identities.lifecycle.for_pv(&self.storage_identities,&pv.name)
+                        .is_some_and(|v|!matches!(v.phase(),crate::storage_lifecycle::Phase::Released|crate::storage_lifecycle::Phase::Deleted))) {
+                    return Err("storage class still owns managed volume lifecycle records".into());
+                }
+            },
+            "namespaces"|"namespace"|"ns" => {
+                for c in self.pvcs.values().filter(|c|c.namespace==name) {
+                    self.validate_storage_delete("pvc",name,&c.name)?;
+                }
+            },
+            _=>{},
+        }
+        Ok(())
+    }
+
+    fn delete_resource_inner(&mut self, resource_type: &str, ns: &str, name: &str) -> Option<Vec<String>> {
+        use crate::store::obj_key;
+        let key = obj_key(ns, name);
+        let none = || Some(Vec::new());
         match resource_type {
-            "deployments" => self.deployments.remove(name).is_some(),
-            "daemonsets" => self.daemonsets.remove(name).is_some(),
-            "jobs" => self.jobs.remove(name).is_some(),
-            "cronjobs" => self.cronjobs.remove(name).is_some(),
-            "hpa" | "horizontalpodautoscalers" => self.hpas.remove(name).is_some(),
-            "ingresses" => self.ingresses.remove(name).is_some(),
-            "persistentvolumes" | "pvs" => self.pvs.remove(name).is_some(),
-            "persistentvolumeclaims" | "pvcs" => {
-                if let Some(pvc) = self.pvcs.remove(name) {
-                    // Release bound PV
-                    if let Some(pv_name) = &pvc.bound_pv {
-                        if let Some(pv) = self.pvs.get_mut(pv_name) {
-                            pv.status = PVStatus::Released;
-                            pv.bound_to = None;
-                            // If StorageClass has Delete reclaim policy, remove PV + data
-                            if let Some(sc) = self.storage_classes.get(&pv.storage_class) {
-                                if sc.reclaim_policy == "Delete" {
-                                    std::fs::remove_dir_all(&pv.host_path).ok();
-                                    self.pvs.remove(pv_name);
-                                }
+            "deployments" | "deployment" | "statefulsets" | "statefulset" | "replicasets" | "replicaset" | "pods_deployment" => {
+                let d = self.deployments.remove(&key)?;
+                self.pending_rollouts.remove(&key);
+                for kind in ["Deployment", "StatefulSet", "ReplicaSet", "Pod"] {
+                    self.manifests.remove(&format!("{kind}/{ns}/{name}"));
+                }
+                // HPAs targeting it stay (K8s semantics) but have nothing to scale.
+                let _ = d;
+                none()
+            }
+            "daemonsets" | "daemonset" => self.daemonsets.remove(&key).and_then(|_| none()),
+            "jobs" | "job" => self.jobs.remove(&key).and_then(|_| none()),
+            "cronjobs" | "cronjob" => self.cronjobs.remove(&key).and_then(|_| none()),
+            "hpa" | "horizontalpodautoscalers" | "horizontalpodautoscaler" => self.hpas.remove(&key).and_then(|_| none()),
+            "services" | "service" | "svc" => self.services.remove(&key).and_then(|_| none()),
+            "configmaps" | "configmap" | "cm" => self.configmaps.remove(&key).and_then(|_| none()),
+            "secrets" | "secret" => self.secrets.remove(&key).and_then(|_| none()),
+            "ingresses" | "ingress" | "ing" => self.ingresses.remove(&key).and_then(|_| none()),
+            "networkpolicies" | "networkpolicy" | "netpol" => self.network_policies.remove(&key).and_then(|_| none()),
+            "resourcequotas" | "resourcequota" | "quota" => self.resource_quotas.remove(&key).and_then(|_| none()),
+            "limitranges" | "limitrange" => self.limit_ranges.remove(&key).and_then(|_| none()),
+            "roles" | "role" => self.rbac_roles.remove(&key).and_then(|_| none()),
+            "rolebindings" | "rolebinding" => self.rbac_bindings.remove(&key).and_then(|_| none()),
+            "clusterroles" | "clusterrole" => self.rbac_roles.remove(name).and_then(|_| none()),
+            "clusterrolebindings" | "clusterrolebinding" => self.rbac_bindings.remove(name).and_then(|_| none()),
+            "persistentvolumes" | "persistentvolume" | "pvs" | "pv" => self.pvs.remove(name).and_then(|_| none()),
+            "persistentvolumeclaims" | "persistentvolumeclaim" | "pvcs" | "pvc" => {
+                if let Some(uid)=self.pvcs.get(&key).and_then(|c|c.bound_pv.as_ref())
+                    .and_then(|pv|self.storage_identities.volumes.get(pv)).cloned() {
+                    if self.storage_identities.lifecycle.cancel_unstarted(&uid).is_err() {return None;}
+                }
+                let pvc = self.pvcs.remove(&key)?;
+                let mut cleanup = Vec::new();
+                if let Some(pv_name) = &pvc.bound_pv {
+                    let mut drop_pv = false;
+                    if let Some(pv) = self.pvs.get_mut(pv_name) {
+                        pv.status = PVStatus::Released;
+                        pv.bound_to = None;
+                        // StorageClass reclaim policy Delete → PV and data go.
+                        if let Some(sc) = self.storage_classes.get(&pv.storage_class) {
+                            if sc.reclaim_policy == "Delete" {
+                                if sc.provisioner=="royak/host-path" {cleanup.push(pv.host_path.clone());}
+                                drop_pv = true;
                             }
                         }
                     }
-                    true
-                } else { false }
-            }
-            "functions" => self.functions.remove(name).is_some(),
-            "pipelines" => self.pipelines.remove(name).is_some(),
-            "repositories" => self.repositories.remove(name).is_some(),
-            "guards" => self.guards.remove(name).is_some(),
-            "operators" => self.operators.remove(name).is_some(),
-            "customresources" => {
-                // Cascade-delete (owner-reference GC): removing a CR must clean
-                // up the deployments its operator provisioned. Collect owned
-                // names first (immutable borrow), then drop them — the reconcile
-                // loop tears down their containers on the next cycle.
-                let existed = self.custom_resources.remove(name).is_some();
-                if existed {
-                    for dep_name in deployments_owned_by(self, name) {
-                        self.deployments.remove(&dep_name);
-                    }
+                    if drop_pv { self.pvs.remove(pv_name); }
                 }
-                existed
+                Some(cleanup)
             }
-            "rbacroles" => self.rbac_roles.remove(name).is_some(),
-            _ => false,
+            "storageclasses" | "storageclass" => self.storage_classes.remove(name).and_then(|_| none()),
+            "ingressclasses" | "ingressclass" => if self.ingress_classes.remove(name) { none() } else { None },
+            "validatingwebhookconfigurations" | "validatingwebhookconfiguration" => self.admission_webhooks.remove(name).and_then(|_| none()),
+            "functions" | "function" => self.functions.remove(name).and_then(|_| none()),
+            "pipelines" | "pipeline" => self.pipelines.remove(name).and_then(|_| none()),
+            "repositories" | "repository" | "repo" => self.repositories.remove(name).and_then(|_| none()),
+            "guards" | "guard" => self.guards.remove(name).and_then(|_| none()),
+            "operators" | "operator" => self.operators.remove(name).and_then(|_| none()),
+            "rbacroles" | "rbacrole" => self.rbac_roles.remove(name).and_then(|_| none()),
+            "customresources" | "customresource" | "cr" => {
+                // Cascade-delete (owner-reference GC): removing a CR also removes
+                // the deployments its operator provisioned in the same namespace.
+                self.custom_resources.remove(&key)?;
+                for dep_key in deployments_owned_by(self, ns, name) {
+                    self.deployments.remove(&dep_key);
+                    self.pending_rollouts.remove(&dep_key);
+                }
+                none()
+            }
+            "namespaces" | "namespace" | "ns" => {
+                if name == crate::store::DEFAULT_NS {
+                    return None; // the default namespace cannot be deleted
+                }
+                if !self.namespaces.iter().any(|n| n == name) { return None; }
+                Some(self.delete_namespace(name))
+            }
+            _ => None,
         }
     }
+
+    /// Cascade-delete a namespace and every namespaced object in it. Returns
+    /// host paths to clean up after commit.
+    fn delete_namespace(&mut self, ns: &str) -> Vec<String> {
+        let prefix = format!("{ns}/");
+        let in_ns = |k: &String| k.starts_with(&prefix);
+        let mut cleanup = Vec::new();
+        let pvc_keys: Vec<String> = self.pvcs.keys().filter(|k| in_ns(k)).cloned().collect();
+        for k in pvc_keys {
+            let (_, name) = crate::store::split_key(&k);
+            let name = name.to_string();
+            if let Some(mut c) = self.delete_resource("pvcs", ns, &name) { cleanup.append(&mut c); }
+        }
+        self.deployments.retain(|k, _| !in_ns(k));
+        self.pending_rollouts.retain(|k, _| !in_ns(k));
+        self.daemonsets.retain(|k, _| !in_ns(k));
+        self.jobs.retain(|k, _| !in_ns(k));
+        self.cronjobs.retain(|k, _| !in_ns(k));
+        self.hpas.retain(|k, _| !in_ns(k));
+        self.services.retain(|k, _| !in_ns(k));
+        self.configmaps.retain(|k, _| !in_ns(k));
+        self.secrets.retain(|k, _| !in_ns(k));
+        self.ingresses.retain(|k, _| !in_ns(k));
+        self.network_policies.retain(|k, _| !in_ns(k));
+        self.resource_quotas.retain(|k, _| !in_ns(k));
+        self.limit_ranges.retain(|k, _| !in_ns(k));
+        self.custom_resources.retain(|k, _| !in_ns(k));
+        self.rbac_roles.retain(|k, _| !in_ns(k));
+        self.rbac_bindings.retain(|k, _| !in_ns(k));
+        let manifest_mid = format!("/{ns}/");
+        self.manifests.retain(|k, _| !k.contains(&manifest_mid));
+        self.namespaces.retain(|n| n != ns);
+        cleanup
+    }
+
+    /// Host directories implied by committed desired state that must exist
+    /// before pods can mount them (dynamically provisioned host-path PVs).
+    /// Idempotent; called after commits and by the reconcile loop.
+    pub fn materialize_storage(&self) {
+        for pvc in self.pvcs.values() {
+            let Ok(pv) = crate::storage::bound_volume(self, &pvc.namespace, &pvc.name) else { continue };
+            let provisioner = self.storage_classes.get(&pv.storage_class).map(|sc| sc.provisioner.as_str());
+            if matches!(provisioner, None | Some("royak/host-path")) && crate::host_access::validate_resolved_public_path(&pv.host_path).is_ok() {
+                if let Err(e) = std::fs::create_dir_all(&pv.host_path) {
+                    eprintln!("  ⚠ [storage] cannot create {}: {e}", pv.host_path);
+                }
+            }
+        }
+    }
+}
+
+/// Remove host paths released by a committed deletion (PVC reclaim=Delete).
+pub fn cleanup_paths(paths: &[String]) {
+    for p in paths {
+        if validate_path(p) {
+            if let Err(e) = std::fs::remove_dir_all(p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("  ⚠ [storage] cannot remove {p}: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Map pod-level volume names to the host-side reference stored with each
+/// mount. Host paths are stored as-is; everything resolved at pod creation
+/// uses a prefix: `emptydir:`, `cmv:` (ConfigMap), `sev:` (Secret), `pvc:`,
+/// `vct:` (StatefulSet volumeClaimTemplate).
+fn pod_volume_map(vols: &[spec::VolumeSpec], vct_map: HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+    let mut map = HashMap::new();
+    for v in vols {
+        if !crate::store::is_dns_label(&v.name) || map.contains_key(&v.name) {
+            return Err("volume names must be unique RFC1123 labels".into());
+        }
+        if [v.host_path.is_some(),v.empty_dir.is_some(),v.config_map.is_some(),v.secret.is_some(),v.pvc.is_some()].into_iter().filter(|v|*v).count()!=1 {
+            return Err("volume must define exactly one supported source".into());
+        }
+        if let Some(hp) = &v.host_path {
+            if crate::host_access::validate_public_path(&hp.path).is_err() {
+                return Err(format!("volume {}: unsafe hostPath {:?} rejected", v.name, hp.path));
+            }
+            map.insert(v.name.clone(), hp.path.clone());
+        } else if v.empty_dir.is_some() {
+            map.insert(v.name.clone(), format!("emptydir:{}", v.name));
+        } else if let Some(cm) = &v.config_map {
+            map.insert(v.name.clone(), format!("cmv:{}", cm.name));
+        } else if let Some(sv) = &v.secret {
+            map.insert(v.name.clone(), format!("sev:{}", sv.secret_name));
+        } else if let Some(pvc_ref) = &v.pvc {
+            // Resolved at pod creation against the claim in the pod's own
+            // namespace — never against a same-named claim elsewhere.
+            map.insert(v.name.clone(), format!("pvc:{}", pvc_ref.claim_name));
+        }
+    }
+    map.extend(vct_map);
+    Ok(map)
+}
+
+/// Validate and store a probe. A probe must have exactly one supported
+/// handler — an empty, ambiguous or unsupported probe is rejected here rather
+/// than silently counting as healthy at runtime.
+fn parse_probe(kind: &str, p: &spec::ProbeSpec) -> Result<StoredProbe, String> {
+    if !crate::security::runtime_supported() {
+        return Err(format!("{kind}: health probes require Docker runtime; experimental NeuroPod does not execute them"));
+    }
+    if p.period_seconds == 0 || p.timeout_seconds == 0 || p.failure_threshold == 0 || p.success_threshold == 0 {
+        return Err(format!("{kind}: periodSeconds, timeoutSeconds and thresholds must be positive"));
+    }
+    if [p.period_seconds, p.timeout_seconds, p.initial_delay_seconds, p.failure_threshold as u64, p.success_threshold as u64]
+        .iter().any(|n| *n > i32::MAX as u64) {
+        return Err(format!("{kind}: probe timing/threshold value exceeds int32 range"));
+    }
+    if !kind.ends_with("readinessProbe") && p.success_threshold != 1 {
+        return Err(format!("{kind}: successThreshold must be 1 for startup/liveness"));
+    }
+    let port = |what: &str, port: &spec::ProbePort| -> Result<u16, String> {
+        match port {
+            spec::ProbePort::Number(n) if (1..=65535).contains(n) => Ok(*n as u16),
+            spec::ProbePort::Number(n) => Err(format!("{kind}: {what} port {n} is out of range (1-65535)")),
+            spec::ProbePort::Name(name) => Err(format!(
+                "{kind}: {what} uses named port {name:?}; Royak does not resolve named ports — use the port number")),
+        }
+    };
+    if p.grpc.is_some() {
+        return Err(format!("{kind}: grpc probes are not supported (use httpGet, tcpSocket or exec)"));
+    }
+    let handlers = [p.http_get.is_some(), p.exec.is_some(), p.tcp_socket.is_some()].iter().filter(|h| **h).count();
+    if handlers == 0 {
+        return Err(format!("{kind}: no handler — set exactly one of httpGet, tcpSocket or exec"));
+    }
+    if handlers > 1 {
+        return Err(format!("{kind}: set exactly one of httpGet, tcpSocket or exec"));
+    }
+    let http_get = match &p.http_get {
+        Some(h) => {
+            if h.scheme.as_deref().unwrap_or("HTTP") != "HTTP" {
+                return Err(format!("{kind}: only HTTP probes are supported; HTTPS scheme is not implemented"));
+            }
+            Some((h.path.clone(), port("httpGet", &h.port)?))
+        }
+        None => None,
+    };
+    let exec = match &p.exec {
+        Some(e) if e.command.is_empty() || e.command[0].trim().is_empty() => {
+            return Err(format!("{kind}: exec command is empty"));
+        }
+        Some(e) => Some(e.command.clone()),
+        None => None,
+    };
+    let tcp_socket = match &p.tcp_socket {
+        Some(t) => Some(port("tcpSocket", &t.port)?),
+        None => None,
+    };
+    Ok(StoredProbe {
+        http_get,
+        exec,
+        tcp_socket,
+        initial_delay_seconds: p.initial_delay_seconds,
+        period_seconds: p.period_seconds,
+        failure_threshold: p.failure_threshold,
+        timeout_seconds: p.timeout_seconds,
+        success_threshold: p.success_threshold,
+    })
+}
+
+/// The full stored container contract (shared by every workload kind).
+fn validate_single_container_probe_scope(pod: &spec::PodSpec) -> Result<(), String> {
+    if pod.containers.iter().skip(1).chain(pod.init_containers.iter().flatten()).any(|c|
+        c.liveness_probe.is_some() || c.readiness_probe.is_some() || c.startup_probe.is_some()) {
+        return Err("DaemonSet/Job/CronJob support probes only on their single modelled regular container; additional and init-container probes are unsupported".into());
+    }
+    Ok(())
+}
+
+fn parse_container(c: &spec::ContainerSpec, volume_map: &HashMap<String, String>, pod_security: Option<&crate::security::PodSecurityContext>) -> Result<StoredContainer, String> {
+    if !crate::store::is_dns_label(&c.name){return Err("container name must be an RFC1123 label".into());}
+    let env: Vec<String> = c.env.as_ref()
+        .map(|vars| vars.iter().filter_map(|e| e.value.as_ref().map(|v| format!("{}={}", e.name, v))).collect())
+        .unwrap_or_default();
+    let volumes: Vec<(String, String)> = c.volume_mounts.as_ref()
+        .map(|mounts| mounts.iter().filter_map(|m| {
+            volume_map.get(&m.name).map(|host| (host.clone(), m.mount_path.clone()))
+        }).collect())
+        .unwrap_or_default();
+    let env_refs: Vec<EnvKeyRef> = c.env.as_ref()
+        .map(|vars| vars.iter().filter(|e| e.value.is_none()).filter_map(|e| {
+            let src = e.value_from.as_ref()?;
+            let (r, secret) = match (&src.config_map_key_ref, &src.secret_key_ref) {
+                (Some(r), _) => (r, false),
+                (None, Some(r)) => (r, true),
+                _ => return None,
+            };
+            Some(EnvKeyRef { name: e.name.clone(), secret, object: r.name.clone(), key: r.key.clone(), optional: r.optional })
+        }).collect())
+        .unwrap_or_default();
+    // Kubernetes `args` follow `command`; with no `command` they replace the
+    // image CMD and keep its ENTRYPOINT (Royak's command is the Docker Cmd).
+    let command = match (&c.command, &c.args) {
+        (Some(cmd), Some(args)) => Some(cmd.iter().chain(args.iter()).cloned().collect()),
+        (Some(cmd), None) => Some(cmd.clone()),
+        (None, Some(args)) => Some(args.clone()),
+        (None, None) => None,
+    };
+    let env_from_configmaps: Vec<String> = c.env_from.as_ref()
+        .map(|refs| refs.iter().filter_map(|r| r.config_map_ref.as_ref().map(|cm| cm.name.clone())).collect())
+        .unwrap_or_default();
+    let env_from_secrets: Vec<String> = c.env_from.as_ref()
+        .map(|refs| refs.iter().filter_map(|r| r.secret_ref.as_ref().map(|s| s.name.clone())).collect())
+        .unwrap_or_default();
+    Ok(StoredContainer {
+        host_access: None,
+        security_context: crate::security::SecurityContext::effective(pod_security, c.security_context.as_ref())?,
+        name: c.name.clone(),
+        image: c.image.clone(),
+        command,
+        env,
+        env_from_configmaps,
+        env_from_secrets,
+        env_refs,
+        volumes,
+        liveness_probe: c.liveness_probe.as_ref().map(|p| parse_probe(&format!("container {:?} livenessProbe", c.name), p)).transpose()?,
+        readiness_probe: c.readiness_probe.as_ref().map(|p| parse_probe(&format!("container {:?} readinessProbe", c.name), p)).transpose()?,
+        startup_probe: c.startup_probe.as_ref().map(|p| parse_probe(&format!("container {:?} startupProbe", c.name), p)).transpose()?,
+    })
 }
 
 /// Decide which StatefulSet ordinal (if any) may be created THIS tick, honoring
@@ -2313,1695 +2831,53 @@ pub fn reconcile_once(desired: &mut DesiredWorld, brain: &mut OrinBrain) -> Vec<
 }
 
 pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain, use_neuropod: bool) -> Vec<String> {
+    reconcile_with_observer(desired, brain, use_neuropod, &mut |_| true)
+}
+
+
+/// Pure scheduling observation, not authority for any runtime effect. Both
+/// unsupported entrypoints use this EXACT list for creation/healthy counting.
+fn unsupported_runtime_workloads(desired: &DesiredWorld, runtime: &str) -> (Vec<String>, Vec<String>) {
+    let mut admitted = Vec::new();
+    let mut log = Vec::new();
+    for (key, deployment) in &desired.deployments {
+        match crate::storage::observe_unsupported_runtime_storage(desired, &deployment.namespace,
+            &deployment.init_containers, &deployment.containers) {
+            crate::storage::UnsupportedRuntimeStorage::ProvenLegacy => admitted.push(key.clone()),
+            crate::storage::UnsupportedRuntimeStorage::Managed => log.push(format!(
+                "  [storage] {key}: {runtime} cannot mount managed PVCs; refusing workload without substituting an empty disk")),
+            crate::storage::UnsupportedRuntimeStorage::Unresolved => log.push(format!(
+                "  [storage] {key}: current PVC identity/binding is unresolved; refusing {runtime} fallback")),
+        }
+    }
+    (admitted, log)
+}
+
+fn runtime_docker_available() -> bool {
+    #[cfg(test)]
+    if let Some(available) = unsupported_storage_runtime_tests::docker_ping() { return available; }
+    crate::docker::ping()
+}
+
+fn reconcile_with_observer(desired: &mut DesiredWorld, brain: &mut OrinBrain, use_neuropod: bool,
+    publish_health: &mut dyn FnMut(&DesiredWorld) -> bool) -> Vec<String> {
     // Auto-detect: if NeuroPod requested OR Docker unavailable → NeuroPod mode (EXPERIMENTAL)
-    if use_neuropod || !crate::docker::ping() {
+    if use_neuropod || !runtime_docker_available() {
         return reconcile_neuropod(desired, brain);
     }
     // Docker mode: production-ready, 28/28 tests
-    let mut log = Vec::new();
     let rt_name = desired.config.runtime.clone();
 
     // For non-docker runtimes, delegate to trait-based reconciliation
     if rt_name != "docker" {
         return reconcile_via_trait(desired, brain, &rt_name);
     }
-
-    // ─── Docker path (original, direct calls) ───
-
-    // Initialize Cluster CA for mTLS (once, persisted in state)
-    if desired.cluster_ca.is_none() {
-        match crate::net_security::ClusterCA::generate() {
-            Ok(ca) => {
-                log.push(format!("  [security] Cluster CA generated (fp: {})", ca.fingerprint));
-                desired.cluster_ca = Some(ca);
-            }
-            Err(e) => log.push(format!("  [warn] CA generation failed: {e}")),
-        }
-    }
-
-    // Ensure namespace networks exist (pod isolation + DNS)
-    if let Err(e) = docker::ensure_network() {
-        log.push(format!("  [warn] network: {e}"));
-    }
-    for ns in &desired.namespaces {
-        if let Err(e) = docker::ensure_namespace_network(ns) {
-            log.push(format!("  [warn] network rk-{ns}: {e}"));
-        }
-    }
-    // Always ensure default namespace network
-    docker::ensure_namespace_network("default").ok();
-
-    // mTLS cert lifecycle: check for expired certs, track status
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let mut expired_certs = Vec::new();
-    for (pod_name, cert) in &desired.pod_certs {
-        if cert.revoked { continue; }
-        if now_secs > cert.expires_at {
-            expired_certs.push(pod_name.clone());
-        }
-    }
-    for pod_name in &expired_certs {
-        log.push(format!("  [mtls] ⚠ cert expired: {pod_name} — will re-issue on next reconcile"));
-        if let Some(cert) = desired.pod_certs.get_mut(pod_name) {
-            cert.revoked = true;
-        }
-        desired.record_event("Pod", pod_name, "CertExpired", "mTLS certificate expired, marked for rotation", "Warning");
-    }
-
-    // 1. Get actual containers from Docker
-    let actual = match docker::list_containers(true) {
-        Ok(containers) => containers,
-        Err(e) => {
-            log.push(format!("  [error] Docker: {e}"));
-            return log;
-        }
-    };
-
-    // Filter to royak-managed containers
-    // (In real impl, check labels. For now, check name prefix)
-    let managed: Vec<&docker::DockerContainer> = actual.iter()
-        .filter(|c| c.names.iter().any(|n| n.contains("rk-")))
-        .collect();
-
-    // Deferred events: collect during immutable borrow, apply after
-    let mut pending_events: Vec<(String, String, String, String, String)> = Vec::new();
-
-    // 2. For each deployment: compare desired vs actual
-    for (name, dep) in &desired.deployments {
-        // Skip normal scaling if rolling update is in progress for this deployment
-        if desired.pending_rollouts.contains_key(name.as_str()) {
-            continue;
-        }
-        let prefix = format!("/rk-{name}-");
-        let running: Vec<&&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-            .collect();
-        let stopped: Vec<&&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state != "running")
-            .collect();
-
-        let current = running.len() as u32;
-        let desired_count = dep.replicas;
-
-        if current < desired_count {
-            // Scale UP — check quota first
-            let needed = desired_count - current;
-            if let Err(reason) = desired.check_quota(&dep.namespace, needed) {
-                log.push(format!("  [quota] {name}: BLOCKED — {reason}"));
-                pending_events.push(("Deployment".into(), name.clone(), "QuotaExceeded".into(), reason, "Warning".into()));
-                continue;
-            }
-            log.push(format!("  [scale] {name}: {current} → {desired_count} (+{needed})"));
-            pending_events.push(("Deployment".into(), name.clone(), "ScalingUp".into(), format!("{current} → {desired_count} (+{needed})"), "Normal".into()));
-
-            // Pull all images
-            let mut pulled = std::collections::HashSet::new();
-            for c in &dep.containers {
-                if pulled.insert(c.image.clone()) {
-                    if let Err(e) = docker::pull_image(&c.image) {
-                        log.push(format!("    [warn] pull {}: {e}", c.image));
-                    }
-                }
-            }
-
-            // Collect all existing container names for collision-free naming
-            let all_names: Vec<String> = managed.iter()
-                .flat_map(|c| c.names.iter().map(|n| n.trim_start_matches('/').to_string()))
-                .collect();
-
-            // StatefulSet: ordered startup — at most one new ordinal per tick,
-            // and always the lowest missing one (rk-db-1 is recreated before
-            // rk-db-3 is ever considered). Crucially, honor the real K8s
-            // guarantee: ordinal N+1 is NOT created until ordinal N is Ready.
-            let needed = if dep.stateful { needed.min(1) } else { needed };
-
-            // For a StatefulSet, precompute the single ordinal eligible this
-            // tick (or None → hold). We evaluate readiness of each existing
-            // ordinal from the live container list using the STRONGEST signal
-            // available:
-            //   * if the pod's main container defines a readiness probe, we
-            //     require a passing probe (and, if a startup probe exists, that
-            //     startup has completed);
-            //   * otherwise we treat running + started (startup probe passed,
-            //     or no startup probe) as Ready.
-            // NB: `pod_health.ready` is never persisted and the readiness result
-            // in the §2c health loop is only logged, so we evaluate the probe
-            // live here rather than relying on stored state.
-            // NOTE: stable per-ordinal headless DNS (serviceName-based
-            // rk-<name>-<ord>.<svc> records) is still NOT wired — that is a
-            // separate, larger networking change and out of scope here.
-            let sts_next: Option<u32> = if dep.stateful {
-                let sts_prefix = format!("rk-{name}-");
-                let readiness = dep.containers.first().and_then(|c| c.readiness_probe.as_ref());
-                let startup = dep.containers.first().and_then(|c| c.startup_probe.as_ref());
-                let mut existing_ord: std::collections::HashSet<u32> = std::collections::HashSet::new();
-                let mut ready_ord: std::collections::HashSet<u32> = std::collections::HashSet::new();
-                for c in &managed {
-                    let cname = c.names.iter()
-                        .map(|n| n.trim_start_matches('/'))
-                        .find(|n| n.starts_with(&sts_prefix));
-                    let Some(cname) = cname else { continue };
-                    let Some(ord) = cname.rsplit('-').next().and_then(|s| s.parse::<u32>().ok()) else { continue };
-                    existing_ord.insert(ord);
-                    if c.state != "running" { continue; }
-                    let started = startup.is_none() || desired.startup_ok.contains(cname);
-                    let is_ready = match readiness {
-                        Some(probe) => started && check_probe(&c.id[..12.min(c.id.len())], probe),
-                        None => started,
-                    };
-                    if is_ready { ready_ord.insert(ord); }
-                }
-                let decision = next_statefulset_ordinal(&existing_ord, &ready_ord, desired_count);
-                if decision.is_none() && (existing_ord.len() as u32) < desired_count {
-                    log.push(format!("  [statefulset] {name}: holding — previous ordinal not Ready yet"));
-                }
-                decision
-            } else {
-                None
-            };
-
-            for i in 0..needed {
-                // Find next available name
-                let mut idx = if dep.stateful {
-                    match sts_next {
-                        Some(o) => o,
-                        // Predecessor not Ready (or set complete) → create
-                        // nothing this tick; retry on the next reconcile.
-                        None => break,
-                    }
-                } else {
-                    current + i + 1
-                };
-                loop {
-                    let candidate = format!("rk-{name}-{idx}");
-                    if !all_names.contains(&candidate) { break; }
-                    idx += 1;
-                }
-                let pod_name = format!("rk-{name}-{idx}");
-
-                // Multi-node: pick best node for this pod
-                let target_node = if !desired.nodes.is_empty() {
-                    pick_node(desired)
-                } else {
-                    None
-                };
-                log.push(format!("    [multi-node] {} node(s) known, pick_node({pod_name}) → {:?}",
-                    desired.nodes.len(), target_node));
-                if let Some(ref node_name) = target_node {
-                    if let Some(node) = desired.nodes.get(node_name) {
-                        let is_local = node.address.starts_with("127.0.0.1")
-                            || node.address.starts_with("localhost")
-                            || node.address.is_empty();
-                        if !is_local && !node.address.is_empty() {
-                            // Remote node: send create request via API
-                            let url = format!("http://{}/royak/v1/create-pod", node.address);
-                            let body = serde_json::json!({
-                                "pod": pod_name,
-                                "deployment": name,
-                                "image": dep.containers.first().map(|c| c.image.as_str()).unwrap_or(""),
-                                "replicas": 1
-                            });
-                            log.push(format!("    [multi-node] routing {pod_name} → {node_name} ({url})"));
-                            // Fire-and-forget over the private subnet — but a
-                            // PROPER request. The old hand-rolled HTTP had no Host
-                            // header, which the peer's HTTP server rejects, so no
-                            // pod was ever actually created remotely.
-                            if let Ok(body_str) = serde_json::to_string(&body) {
-                                let (u, p, nn) = (url.clone(), pod_name.clone(), node_name.clone());
-                                std::thread::spawn(move || {
-                                    if let Err(e) = http_post(&u, &body_str, &[("Content-Type", "application/json")]) {
-                                        eprintln!("  ⚠ [multi-node] {p} → {nn} create-pod failed: {e}");
-                                    }
-                                });
-                            }
-                            // Update node pod count
-                            if let Some(n) = desired.nodes.get_mut(node_name) {
-                                n.pod_count += 1;
-                            }
-                            continue; // skip local creation
-                        }
-                    }
-                }
-                let mut _main_container_id: Option<String> = None;
-
-                // Run init containers first (must complete before main starts)
-                let mut init_ok = true;
-                for init in &dep.init_containers {
-                    let init_name = format!("{pod_name}-init-{}", init.name);
-                    log.push(format!("    [init] {init_name} starting..."));
-                    docker::pull_image(&init.image).ok();
-                    let cmd_refs: Vec<&str> = init.command.as_ref()
-                        .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-                    let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-                    let labels = vec![(MANAGED_LABEL, "true"), ("royak.init", "true"), ("royak.pod", pod_name.as_str())];
-                    match docker::create_container(&init_name, &init.image, cmd, &init.env, &labels) {
-                        Ok(id) => {
-                            docker::start_container(&id).ok();
-                            // Wait for init container to complete (max 60s)
-                            let start = Instant::now();
-                            loop {
-                                if start.elapsed() > Duration::from_secs(60) {
-                                    log.push(format!("    [init] {init_name} TIMEOUT"));
-                                    init_ok = false;
-                                    break;
-                                }
-                                if let Ok(containers) = docker::list_containers(true) {
-                                    if let Some(c) = containers.iter().find(|c| c.names.iter().any(|n| n.trim_start_matches('/') == init_name)) {
-                                        if c.state == "exited" {
-                                            log.push(format!("    [init] {init_name} completed ✓"));
-                                            docker::remove_container(&id, true).ok();
-                                            break;
-                                        }
-                                    }
-                                }
-                                std::thread::sleep(Duration::from_millis(500));
-                            }
-                        }
-                        Err(e) => {
-                            log.push(format!("    [init] {init_name} failed: {e}"));
-                            init_ok = false;
-                        }
-                    }
-                    if !init_ok { break; }
-                }
-
-                if !init_ok {
-                    log.push(format!("    [error] {pod_name}: init container failed, skipping pod"));
-                    continue;
-                }
-
-                for (ci, container) in dep.containers.iter().enumerate() {
-                    let is_main = ci == 0;
-                    let container_name = if is_main {
-                        pod_name.clone()
-                    } else {
-                        format!("{pod_name}-{}", container.name)
-                    };
-
-                    // Merge env: container env + envFrom ConfigMaps/Secrets + metadata
-                    let mut full_env = container.env.clone();
-                    for cm_name in &container.env_from_configmaps {
-                        if let Some(cm) = desired.configmaps.get(cm_name) {
-                            for (k, v) in &cm.data {
-                                full_env.push(format!("{k}={v}"));
-                            }
-                        }
-                    }
-                    for secret_name in &container.env_from_secrets {
-                        if let Some(secret) = desired.secrets.get(secret_name) {
-                            for (k, v) in &secret.data {
-                                full_env.push(format!("{k}={v}"));
-                            }
-                        }
-                    }
-                    full_env.push(format!("ROYAK_POD_NAME={pod_name}"));
-                    full_env.push(format!("ROYAK_CONTAINER={}", container.name));
-                    full_env.push(format!("ROYAK_NAMESPACE={}", dep.namespace));
-                    full_env.push(format!("ROYAK_DEPLOYMENT={name}"));
-
-                    // v0.2: Pod identity + mTLS certificates
-                    if let Some(ref mut ca) = desired.cluster_ca {
-                        match ca.issue_pod_cert(&pod_name, &dep.namespace) {
-                            Ok(identity) => {
-                                full_env.extend(identity.env_vars());
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                desired.pod_certs.insert(pod_name.clone(), PodCertStatus {
-                                    pod_name: pod_name.clone(),
-                                    namespace: dep.namespace.clone(),
-                                    issued_at: now,
-                                    expires_at: now + 90 * 86400, // 90 days
-                                    fingerprint: format!("{:x}", ca.issued_count),
-                                    revoked: false,
-                                });
-                                log.push(format!("    [mtls] {pod_name} cert issued (CA: {}, expires: 90d)", ca.fingerprint));
-                            }
-                            Err(e) => {
-                                // Fallback: just inject a token without cert
-                                let token = crate::net_security::generate_pod_token(&pod_name, &dep.namespace, "cluster");
-                                full_env.push(format!("ROYAK_POD_TOKEN={token}"));
-                                log.push(format!("    [warn] mtls cert failed: {e}, token-only"));
-                            }
-                        }
-                    } else {
-                        // No CA — generate pod token only
-                        let token = crate::net_security::generate_pod_token(&pod_name, &dep.namespace, "cluster");
-                        full_env.push(format!("ROYAK_POD_TOKEN={token}"));
-                    }
-
-                    let cmd_refs: Vec<&str> = container.command.as_ref()
-                        .map(|c| c.iter().map(|s| s.as_str()).collect())
-                        .unwrap_or_default();
-                    let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-
-                    let labels = vec![
-                        (MANAGED_LABEL, "true"),
-                        ("royak.deployment", name.as_str()),
-                        ("royak.namespace", dep.namespace.as_str()),
-                        ("royak.pod", pod_name.as_str()),
-                        if is_main { ("royak.role", "main") } else { ("royak.role", "sidecar") },
-                    ];
-
-                    let cpu_lim = dep.resource_limits.as_ref().and_then(|r| r.cpu_limit);
-                    let mem_lim = dep.resource_limits.as_ref().and_then(|r| r.mem_limit);
-
-                    // Resolve PVC volumes: find bound PVs and add their host paths
-                    let mut all_volumes = container.volumes.clone();
-                    for (host_or_pvc, container_path) in &container.volumes {
-                        // ConfigMap/Secret projected as files: materialise each
-                        // key as a file in a host dir and bind-mount it.
-                        // (K8s projects these via kubelet; we use the same
-                        // mechanism as our other volumes. Updates land when the
-                        // pod is recreated — CM hot-reload triggers that.)
-                        if let Some(src_name) = host_or_pvc.strip_prefix("cmv:").map(|n| (n, false))
-                            .or_else(|| host_or_pvc.strip_prefix("sev:").map(|n| (n, true)))
-                        {
-                            let (obj_name, is_secret) = src_name;
-                            let kind_dir = if is_secret { "secret" } else { "configmap" };
-                            let dir = format!("{}/volumes/{}/{kind_dir}-{obj_name}", royak_data_dir(), dep.namespace);
-                            std::fs::create_dir_all(&dir).ok();
-                            let data: Option<Vec<(String, String)>> = if is_secret {
-                                desired.secrets.get(obj_name).map(|s| s.data.clone().into_iter().collect())
-                            } else {
-                                desired.configmaps.get(obj_name).map(|c| c.data.clone().into_iter().collect())
-                            };
-                            if let Some(entries) = data {
-                                for (k, val) in entries {
-                                    let file = format!("{dir}/{k}");
-                                    let _ = std::fs::write(&file, val);
-                                    #[cfg(unix)]
-                                    if is_secret {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
-                                    }
-                                }
-                                all_volumes.retain(|(h, _)| h != host_or_pvc);
-                                all_volumes.push((dir.clone(), container_path.clone()));
-                                log.push(format!("    [volume] {kind_dir}/{obj_name} projected → {container_path}"));
-                            } else {
-                                log.push(format!("    [warn] volume references missing {kind_dir}/{obj_name}"));
-                            }
-                            continue;
-                        }
-                        // StatefulSet volumeClaimTemplate: per-ordinal host dir
-                        // (vct:name → /tmp/royak-pvc/{ns}/{dep}-{name}-{ordinal})
-                        if let Some(tpl_name) = host_or_pvc.strip_prefix("vct:") {
-                            let dir = format!("{}/pvc/{}/{}-{}-{}", royak_data_dir(), dep.namespace, name, tpl_name, idx);
-                            std::fs::create_dir_all(&dir).ok();
-                            all_volumes.retain(|(h, _)| h != host_or_pvc);
-                            all_volumes.push((dir.clone(), container_path.clone()));
-                            log.push(format!("    [volume] {tpl_name} (ordinal {idx}) → {dir}"));
-                            continue;
-                        }
-                        // Check if this is a PVC reference (pvc:name format)
-                        if let Some(pvc_name) = host_or_pvc.strip_prefix("pvc:") {
-                            if let Some(pvc) = desired.pvcs.get(pvc_name) {
-                                if let Some(pv_name) = &pvc.bound_pv {
-                                    if let Some(pv) = desired.pvs.get(pv_name) {
-                                        // Replace pvc: reference with actual host path
-                                        all_volumes.retain(|(h, _)| h != host_or_pvc);
-                                        all_volumes.push((pv.host_path.clone(), container_path.clone()));
-                                        log.push(format!("    [volume] {pvc_name} → {}", pv.host_path));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let publish = if is_main { desired.nodeport_publish_ports(name) } else { Vec::new() };
-                    match docker::create_container_full(&container_name, &container.image, cmd, &full_env, &labels, &all_volumes, cpu_lim, mem_lim, &publish) {
-                        Ok(id) => {
-                            let short = &id[..12.min(id.len())];
-                            let role = if is_main { "main" } else { "sidecar" };
-                            log.push(format!("    [create] {container_name} ({role}) → {short}"));
-
-                            match docker::start_container(&id) {
-                                Ok(_) => {
-                                    log.push(format!("    [start] {container_name} ✓"));
-                                    pending_events.push(("Pod".into(), container_name.clone(), "Created".into(), format!("Container started: {}", container.image), "Normal".into()));
-                                    if is_main {
-                                        _main_container_id = Some(id.clone());
-                                        // Collect all DNS aliases in a single vec: pod name, deployment name,
-                                        // and any matching service names in the same namespace. Docker
-                                        // ignores aliases added to an already-connected container, so
-                                        // all of them must be passed on the first connect call.
-                                        let mut alias_strs: Vec<String> = vec![pod_name.clone(), name.to_string()];
-                                        for svc in desired.services.values() {
-                                            if svc.namespace == dep.namespace
-                                                && svc.selector.get("app").map(|s| s.as_str()) == Some(name)
-                                            {
-                                                alias_strs.push(svc.name.clone());
-                                            }
-                                        }
-                                        let aliases: Vec<&str> = alias_strs.iter().map(|s| s.as_str()).collect();
-                                        let ns_net = format!("rk-{}", dep.namespace);
-                                        match docker::connect_to_network(&id, &ns_net, &aliases) {
-                                            Ok(_) => log.push(format!("    [net] {pod_name} → {ns_net} ({name})")),
-                                            Err(_) => {
-                                                // Fallback to global network with same aliases
-                                                docker::connect_network(&id, &aliases).ok();
-                                                log.push(format!("    [net] {pod_name} → royak (fallback)"));
-                                            }
-                                        }
-                                        // Log service alias bindings (for diagnostics)
-                                        for svc in desired.services.values() {
-                                            if svc.namespace == dep.namespace
-                                                && svc.selector.get("app").map(|s| s.as_str()) == Some(name)
-                                            {
-                                                log.push(format!("    [svc] {pod_name} → dns:{}", svc.name));
-                                            }
-                                        }
-                                    } else {
-                                        let aliases = vec![container_name.as_str()];
-                                        let ns_net = format!("rk-{}", dep.namespace);
-                                        docker::connect_to_network(&id, &ns_net, &aliases).ok();
-                                        log.push(format!("    [sidecar] {container_name} joined {ns_net}"));
-                                    }
-                                }
-                                Err(e) => {
-                                    log.push(format!("    [error] start {container_name}: {e}"));
-                                    pending_events.push(("Pod".into(), container_name.clone(), "StartFailed".into(), format!("{e}"), "Warning".into()));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log.push(format!("    [error] create {container_name}: {e}"));
-                            pending_events.push(("Pod".into(), container_name.clone(), "CreateFailed".into(), format!("{e}"), "Warning".into()));
-                        }
-                    }
-                } // end container loop
-            } // end pod loop
-        } else if current > desired_count {
-            // Scale DOWN
-            let excess = current - desired_count;
-            log.push(format!("  [scale] {name}: {current} → {desired_count} (-{excess})"));
-            pending_events.push(("Deployment".into(), name.clone(), "ScalingDown".into(), format!("{current} → {desired_count} (-{excess})"), "Normal".into()));
-
-            // StatefulSet scale-down removes the highest ordinal first
-            // (K8s semantics); plain deployments keep Docker's order.
-            let victims: Vec<&crate::docker::DockerContainer> = if dep.stateful {
-                let ordinal = |c: &crate::docker::DockerContainer| -> u32 {
-                    c.names.first()
-                        .and_then(|n| n.rsplit('-').next())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0)
-                };
-                let mut sorted: Vec<&crate::docker::DockerContainer> =
-                    running.iter().map(|c| **c).collect();
-                sorted.sort_by_key(|c| std::cmp::Reverse(ordinal(c)));
-                sorted.into_iter().take(excess as usize).collect()
-            } else {
-                running.iter().rev().take(excess as usize).map(|c| **c).collect()
-            };
-            for container in victims {
-                let id = &container.id;
-                let cname = container.names.first().map(|s| s.as_str()).unwrap_or("?");
-                if let Err(e) = docker::stop_container(id) {
-                    log.push(format!("    [warn] stop {cname}: {e}"));
-                }
-                if let Err(e) = docker::remove_container(id, true) {
-                    log.push(format!("    [warn] rm {cname}: {e}"));
-                } else {
-                    log.push(format!("    [remove] {cname} ✓"));
-                }
-            }
-        } else {
-            // All good — reset crash counters for healthy pods
-            let prefix = format!("rk-{name}-");
-            desired.restart_count.retain(|k, _| !k.starts_with(&prefix));
-            log.push(format!("  [ok] {name}: {current}/{desired_count} running"));
-        }
-
-        // Clean up stopped/failed containers — with CrashLoopBackOff detection
-        for container in &stopped {
-            let id = &container.id;
-            let cname = container.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-            if container.state == "exited" || container.state == "dead" {
-                // Track restart count
-                let count = desired.restart_count.entry(cname.to_string()).or_insert(0);
-                *count += 1;
-                if *count >= 5 {
-                    log.push(format!("  [CrashLoopBackOff] {cname}: restarted {} times — stopping", count));
-                    pending_events.push(("Pod".into(), cname.to_string(), "CrashLoopBackOff".into(),
-                        format!("Container has restarted {} times", count), "Warning".into()));
-                    docker::remove_container(id, true).ok();
-                    // Don't recreate — the deployment loop will see fewer running pods
-                    // but we mark it so it stops trying
-                } else {
-                    docker::remove_container(id, true).ok();
-                    log.push(format!("  [cleanup] removed {cname} ({}), restart #{}", container.state, count));
-                }
-            }
-        }
-    }
-
-    // 2b. Rolling updates — zero-downtime image changes (maxSurge=1, maxUnavailable=0)
-    let rollout_names: Vec<String> = desired.pending_rollouts.keys().cloned().collect();
-    for dep_name in &rollout_names {
-        let rollout = match desired.pending_rollouts.get(dep_name) {
-            Some(r) => r,
-            None => continue,
-        };
-        let dep = match desired.deployments.get(dep_name.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        log.push(format!("  [rollout] {dep_name}: {} → {} ({}/{} done)",
-            rollout.old_image, rollout.new_image, rollout.new_pods_created, rollout.total_replicas));
-
-        // Find old pods (running with old image) — exact image match
-        let prefix = format!("/rk-{dep_name}-");
-        let old_norm = normalize_image(&rollout.old_image);
-        let new_norm = normalize_image(&rollout.new_image);
-
-        let old_pods: Vec<&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix))
-                && c.state == "running"
-                && normalize_image(&c.image) == old_norm)
-            .copied()
-            .collect();
-
-        let new_pods: Vec<&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix))
-                && c.state == "running"
-                && normalize_image(&c.image) == new_norm)
-            .copied()
-            .collect();
-
-        let new_running = new_pods.len() as u32;
-
-        if new_running >= rollout.total_replicas {
-            // Rollout complete — remove any remaining old pods
-            for old in &old_pods {
-                let cname = old.names.first().map(|s| s.as_str()).unwrap_or("?");
-                docker::stop_container(&old.id).ok();
-                docker::remove_container(&old.id, true).ok();
-                log.push(format!("    [rollout] removed old {cname} ✓"));
-            }
-            log.push(format!("  [rollout] {dep_name}: COMPLETE ✓ ({} pods on {})",
-                rollout.total_replicas, rollout.new_image));
-            desired.record_event("Deployment", dep_name, "RolloutComplete", &format!("{} → {} ({} pods)", rollout.old_image, rollout.new_image, rollout.total_replicas), "Normal");
-        } else if new_running + 1 > old_pods.len() as u32 + rollout.total_replicas {
-            // maxSurge exceeded, wait for readiness of existing new pods
-            log.push(format!("  [rollout] {dep_name}: waiting for new pods to become ready..."));
-        } else {
-            // Step 1: create one new pod (maxSurge=1)
-            // Find next available name by checking ALL containers (including non-running)
-            let all_names: Vec<String> = managed.iter()
-                .flat_map(|c| c.names.iter().map(|n| n.trim_start_matches('/').to_string()))
-                .collect();
-            let mut next_idx = 1u32;
-            loop {
-                let candidate = format!("rk-{dep_name}-{next_idx}");
-                if !all_names.iter().any(|n| n == &candidate) {
-                    break;
-                }
-                next_idx += 1;
-                if next_idx > 100 { break; } // safety limit
-            }
-            let pod_name = format!("rk-{dep_name}-{next_idx}");
-
-            let container = &dep.containers[0];
-            log.push(format!("    [rollout] creating {pod_name} ({})...", rollout.new_image));
-
-            // Pull new image
-            if let Err(e) = docker::pull_image(&rollout.new_image) {
-                log.push(format!("    [rollout] pull failed: {e}"));
-            }
-
-            let mut full_env = container.env.clone();
-            full_env.push(format!("ROYAK_POD_NAME={pod_name}"));
-            full_env.push(format!("ROYAK_DEPLOYMENT={dep_name}"));
-
-            let cmd_refs: Vec<&str> = container.command.as_ref()
-                .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-            let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-            let labels = vec![
-                (MANAGED_LABEL, "true"),
-                ("royak.deployment", dep_name.as_str()),
-                ("royak.pod", pod_name.as_str()),
-                ("royak.role", "main"),
-            ];
-
-            let cpu_lim = dep.resource_limits.as_ref().and_then(|r| r.cpu_limit);
-            let mem_lim = dep.resource_limits.as_ref().and_then(|r| r.mem_limit);
-            let publish = desired.nodeport_publish_ports(dep_name);
-            match docker::create_container_full(&pod_name, &container.image, cmd, &full_env, &labels, &container.volumes, cpu_lim, mem_lim, &publish) {
-                Ok(id) => {
-                    if docker::start_container(&id).is_ok() {
-                        let aliases = vec![pod_name.as_str(), dep_name.as_str()];
-                        let ns_net = format!("rk-{}", dep.namespace);
-                        docker::connect_to_network(&id, &ns_net, &aliases)
-                            .or_else(|_| docker::connect_network(&id, &aliases)).ok();
-                        log.push(format!("    [rollout] {pod_name} started ✓"));
-
-                        // Check readiness if probe exists — retry a few times
-                        let ready = if let Some(probe) = &container.readiness_probe {
-                            std::thread::sleep(Duration::from_secs(probe.initial_delay_seconds.max(2)));
-                            let mut ok = false;
-                            for _ in 0..3 {
-                                if check_probe(&id[..12.min(id.len())], probe) {
-                                    ok = true;
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_secs(2));
-                            }
-                            ok
-                        } else {
-                            // No probe = assume ready after 3s
-                            std::thread::sleep(Duration::from_secs(3));
-                            true
-                        };
-
-                        if ready {
-                            // Step 2: kill one old pod (maxUnavailable=0 — new is ready first)
-                            if let Some(old) = old_pods.first() {
-                                let old_name = old.names.first().map(|s| s.as_str()).unwrap_or("?");
-                                docker::stop_container(&old.id).ok();
-                                docker::remove_container(&old.id, true).ok();
-                                log.push(format!("    [rollout] replaced {old_name} → {pod_name} ✓"));
-                            }
-                        } else {
-                            log.push(format!("    [rollout] {pod_name} not ready yet, will retry next tick"));
-                        }
-                    }
-                }
-                Err(e) => log.push(format!("    [rollout] error creating {pod_name}: {e}")),
-            }
-        }
-    }
-
-    // Remove completed rollouts
-    desired.pending_rollouts.retain(|name, rollout| {
-        let prefix = format!("/rk-{name}-");
-        let new_norm = normalize_image(&rollout.new_image);
-        let new_running = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix))
-                && c.state == "running"
-                && normalize_image(&c.image) == new_norm)
-            .count() as u32;
-        new_running < rollout.total_replicas
-    });
-
-    // 2b+. Canary and Blue-Green deployment strategies
-    let dep_names: Vec<String> = desired.deployments.keys().cloned().collect();
-    for dep_name in &dep_names {
-        let strategy = desired.deployments.get(dep_name.as_str()).and_then(|d| d.strategy.clone());
-        match strategy {
-            Some(DeployStrategy::Canary { weight, steps }) => {
-                // Canary: run `weight`% of pods with new image, rest with old
-                if let Some(rollout) = desired.pending_rollouts.get(dep_name.as_str()) {
-                    let total = rollout.total_replicas;
-                    // Current step weight (use weight field, advance through steps)
-                    let current_weight = if steps.is_empty() { weight } else {
-                        let new_running = managed.iter()
-                            .filter(|c| c.names.iter().any(|n| n.contains(&format!("rk-{dep_name}-")))
-                                && c.state == "running"
-                                && normalize_image(&c.image) == normalize_image(&rollout.new_image))
-                            .count() as u32;
-                        let current_pct = if total > 0 { (new_running * 100) / total } else { 0 };
-                        // Find next step to reach
-                        steps.iter().find(|s| s.weight > current_pct)
-                            .map(|s| s.weight).unwrap_or(100)
-                    };
-                    let canary_count = (total * current_weight / 100).max(1);
-                    log.push(format!("  [canary] {dep_name}: {current_weight}% traffic → {canary_count}/{total} pods with new image"));
-                }
-            }
-            Some(DeployStrategy::BlueGreen { ref active }) => {
-                // Blue-Green: maintain two full sets, switch `active` label
-                if let Some(rollout) = desired.pending_rollouts.get(dep_name.as_str()) {
-                    let prefix = format!("rk-{dep_name}-");
-                    let new_norm = normalize_image(&rollout.new_image);
-                    let new_ready: Vec<&docker::DockerContainer> = managed.iter()
-                        .filter(|c| c.names.iter().any(|n| n.contains(&prefix))
-                            && c.state == "running"
-                            && normalize_image(&c.image) == new_norm)
-                        .copied()
-                        .collect();
-
-                    if new_ready.len() as u32 >= rollout.total_replicas {
-                        // Green set is fully ready — switch traffic
-                        if active == "green" || active == "new" {
-                            // Kill old (blue) pods
-                            let old_norm = normalize_image(&rollout.old_image);
-                            let old_pods: Vec<&docker::DockerContainer> = managed.iter()
-                                .filter(|c| c.names.iter().any(|n| n.contains(&prefix))
-                                    && normalize_image(&c.image) == old_norm)
-                                .copied()
-                                .collect();
-                            for old in &old_pods {
-                                let cname = old.names.first().map(|s| s.as_str()).unwrap_or("?");
-                                docker::stop_container(&old.id).ok();
-                                docker::remove_container(&old.id, true).ok();
-                                log.push(format!("    [blue-green] removed old {cname}"));
-                            }
-                            log.push(format!("  [blue-green] {dep_name}: switched to green ✓ ({} pods)", rollout.total_replicas));
-                        } else {
-                            log.push(format!("  [blue-green] {dep_name}: green ready ({} pods), waiting for switch command", new_ready.len()));
-                        }
-                    } else {
-                        log.push(format!("  [blue-green] {dep_name}: green {}/{} ready, blue still active",
-                            new_ready.len(), rollout.total_replicas));
-                    }
-                }
-            }
-            _ => {} // RollingUpdate handled above, None = default rolling
-        }
-    }
-
-    // 2c. Health checks — startup, liveness and readiness probes for running pods
-    let mut startup_passed: Vec<String> = Vec::new();
-    let mut startup_restart: Vec<String> = Vec::new();
-    for (name, dep) in &desired.deployments {
-        let main_container = dep.containers.first();
-        let liveness = main_container.and_then(|c| c.liveness_probe.as_ref());
-        let readiness = main_container.and_then(|c| c.readiness_probe.as_ref());
-        let startup = main_container.and_then(|c| c.startup_probe.as_ref());
-
-        if liveness.is_none() && readiness.is_none() && startup.is_none() {
-            continue;
-        }
-
-        let prefix = format!("/rk-{name}-");
-        let running_pods: Vec<&&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-            .collect();
-
-        for container in &running_pods {
-            let pod_name = container.names.first()
-                .map(|s| s.trim_start_matches('/').to_string())
-                .unwrap_or_default();
-            let short_id = &container.id[..12.min(container.id.len())];
-
-            // Startup probe gates liveness: until it passes, the pod is
-            // "starting" and liveness failures must not restart it (K8s
-            // semantics — slow starters get failureThreshold × period grace).
-            let started = startup.is_none() || desired.startup_ok.contains(&pod_name);
-            if !started {
-                let probe = startup.unwrap();
-                if check_probe(short_id, probe) {
-                    startup_passed.push(pod_name.clone());
-                    log.push(format!("  [startup] {pod_name}: started ✓"));
-                } else {
-                    let key = format!("startup:{pod_name}");
-                    let count = desired.restart_count.get(&key).copied().unwrap_or(0) + 1;
-                    startup_restart.push(key.clone());
-                    if count >= probe.failure_threshold {
-                        log.push(format!("  [startup] {pod_name}: FAILED {count}x — restarting"));
-                        pending_events.push(("Pod".into(), pod_name.clone(), "Unhealthy".into(), "Startup probe failed — restarting".into(), "Warning".into()));
-                        docker::stop_container(&container.id).ok();
-                        docker::start_container(&container.id).ok();
-                    } else {
-                        log.push(format!("  [startup] {pod_name}: not started yet ({count}/{})", probe.failure_threshold));
-                    }
-                }
-                continue; // liveness/readiness wait for startup
-            }
-
-            // Liveness probe — restart if failed too many times
-            if let Some(probe) = liveness {
-                let healthy = check_probe(short_id, probe);
-                if !healthy {
-                    log.push(format!("  [health] {pod_name}: liveness FAILED — restarting"));
-                    pending_events.push(("Pod".into(), pod_name.clone(), "Unhealthy".into(), "Liveness probe failed — restarting".into(), "Warning".into()));
-                    docker::stop_container(&container.id).ok();
-                    docker::start_container(&container.id).ok();
-                } else {
-                    log.push(format!("  [health] {pod_name}: liveness ok ✓"));
-                }
-            }
-
-            // Readiness probe — just report (affects rolling updates)
-            if let Some(probe) = readiness {
-                let ready = check_probe(short_id, probe);
-                if ready {
-                    log.push(format!("  [ready] {pod_name}: ready ✓"));
-                } else {
-                    log.push(format!("  [ready] {pod_name}: NOT ready"));
-                }
-            }
-        }
-    }
-
-    // Apply startup-probe bookkeeping collected during the borrow above.
-    for pod in startup_passed {
-        desired.restart_count.remove(&format!("startup:{pod}"));
-        desired.startup_ok.insert(pod);
-    }
-    for key in startup_restart {
-        *desired.restart_count.entry(key).or_insert(0) += 1;
-    }
-
-    // 2d. Node health — check heartbeats, mark dead nodes
-    let node_logs = check_node_health(desired);
-    for line in &node_logs { log.push(line.clone()); }
-
-    // Update local node metrics (match ANY registered node on localhost)
-    let pod_count = managed.iter().filter(|c| c.state == "running").count() as u32;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_secs();
-    // Refresh OUR OWN node entry every tick so we never mark ourselves NotReady.
-    // Match by our node name first (works even with a real advertise address);
-    // fall back to a loopback address, then the first node.
-    let me = local_node_name();
-    let local_name = desired.nodes.get(&me).map(|_| me.clone())
-        .or_else(|| desired.nodes.iter().find(|(_, n)| n.address.contains("127.0.0.1")).map(|(n, _)| n.clone()))
-        .or_else(|| desired.nodes.keys().next().cloned());
-    if let Some(name) = local_name {
-        if let Some(local) = desired.nodes.get_mut(&name) {
-            local.last_heartbeat = now;
-            local.pod_count = pod_count;
-            // We are, by definition, alive here — never leave ourselves NotReady
-            // (check_node_health only demotes; the endpoint promotes peers).
-            local.status = NodeStatus::Ready;
-        }
-    }
-
-    // 2e. ANOMALY — neural container monitoring (learn patterns, detect deviations)
-    // Docker's /stats samples ~1-2s per call; fetching serially over N containers
-    // stalled the whole reconcile (which holds the world lock, blocking the API).
-    // Fetch all containers' stats in PARALLEL, then feed the brain serially.
-    let stat_targets: Vec<(String, String)> = managed.iter()
-        .filter(|c| c.state == "running")
-        .map(|c| {
-            let name = c.names.first().map(|s| s.trim_start_matches('/').to_string()).unwrap_or_default();
-            (name, c.id[..12.min(c.id.len())].to_string())
-        })
-        .collect();
-    let stat_handles: Vec<_> = stat_targets.into_iter()
-        .map(|(name, short)| std::thread::spawn(move || (name, docker::container_stats_peek(&short))))
-        .collect();
-    for h in stat_handles {
-        // Skip on failure — don't poison baselines with 0.0.
-        if let Ok((name, Ok((cpu, mem)))) = h.join() {
-            brain.observe(&name, cpu, mem, 0);
-        }
-    }
-
-    // Check for anomalies + auto-alert via webhooks
-    let anomalies = brain.detect_anomalies();
-    for (pod, anomaly_type, value, threshold) in &anomalies {
-        let msg = match anomaly_type.as_str() {
-            "CPU" => format!("⚠ {pod}: CPU {value:.1}% exceeds baseline ({threshold:.1}%)"),
-            "MEM" => format!("⚠ {pod}: MEM {value:.0}MB exceeds baseline ({threshold:.0}MB)"),
-            "RESTART" => format!("⚠ {pod}: unexpected restart (was {threshold:.0}, now {value:.0})"),
-            _ => format!("⚠ {pod}: {anomaly_type} ({value:.1} vs {threshold:.1})"),
-        };
-        log.push(format!("  [ANOMALY] {msg}"));
-
-        // Auto-invoke alert webhook functions
-        let alert_functions: Vec<String> = desired.functions.values()
-            .filter(|f| f.webhook_triggers.iter().any(|t| t.contains("alert") || t.contains("notify")))
-            .map(|f| f.name.clone())
-            .collect();
-        for func_name in &alert_functions {
-            match invoke_function(desired, func_name) {
-                Ok(result) => log.push(format!("    [alert] → {func_name}: {result}")),
-                Err(e) => log.push(format!("    [alert] → {func_name} failed: {e}")),
-            }
-        }
-
-        // Neural Guards: brain detected anomaly → guard acts
-        let matching_ops: Vec<(String, String)> = desired.guards.values()
-            .flat_map(|op| op.rules.iter()
-                .filter(|r| match r.when.as_str() {
-                    "anomaly" | "high_cpu" => anomaly_type == "CPU",
-                    "high_memory" => anomaly_type == "MEM",
-                    "pod_crash" => anomaly_type == "RESTART",
-                    _ => r.when == *anomaly_type,
-                })
-                .map(|r| (op.name.clone(), r.action.clone())))
-            .collect();
-        for (op_name, action) in &matching_ops {
-            log.push(format!("    [operator/{op_name}] → {action} on {pod}"));
-            match action.as_str() {
-                "restart" => {
-                    if let Some(cid) = managed.iter().find(|c| c.names.iter().any(|n| n.contains(pod))) {
-                        docker::stop_container(&cid.id).ok();
-                        docker::start_container(&cid.id).ok();
-                        log.push(format!("    [operator/{op_name}] restarted {pod} ✓"));
-                    }
-                }
-                "scale_up" => {
-                    let dep_name = pod.split('-').take(2).collect::<Vec<_>>().join("-").trim_start_matches("rk-").to_string();
-                    if let Some(dep) = desired.deployments.get_mut(&dep_name) {
-                        dep.replicas += 1;
-                        log.push(format!("    [operator/{op_name}] scaled {dep_name} to {} ✓", dep.replicas));
-                    }
-                }
-                _ => {
-                    // Check hooks
-                    if let Some(op) = desired.guards.get(op_name) {
-                        if let Some(hook_cmd) = op.hooks.get(&action.to_string()) {
-                            let output = safe_exec_hook(hook_cmd);
-                            log.push(format!("    [guard/{op_name}] hook: {output}"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2f. OPERATORS — reconcile custom resources (CRD → provision → lifecycle)
-    reconcile_operators(desired, &mut log);
-
-    // 2g. PAUSE — Neural scale-to-zero for idle pods
-    let dep_names: Vec<String> = desired.deployments.keys().cloned().collect();
-    for dep_name in &dep_names {
-        let dep = match desired.deployments.get(dep_name) {
-            Some(d) => d,
-            None => continue,
-        };
-        let pause_threshold = match dep.pause_after_idle {
-            Some(t) if t > 0 => t,
-            _ => continue,
-        };
-
-        let prefix = format!("/rk-{dep_name}-");
-        let running_pods: Vec<&docker::DockerContainer> = managed.iter()
-            .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-            .copied()
-            .collect();
-
-        if dep.paused {
-            // Already paused — nothing to do (wake-up handled by external traffic/watch)
-            log.push(format!("  [pause] {dep_name}: hibernated 💤 ({} pods stopped)", dep.replicas));
-            continue;
-        }
-
-        // Check if all pods are idle (CPU < 1%)
-        let all_idle = !running_pods.is_empty() && running_pods.iter().all(|c| {
-            let short_id = &c.id[..12.min(c.id.len())];
-            docker::container_stats_peek(short_id)
-                .map(|(cpu, _)| cpu < 1.0)
-                .unwrap_or(false)
-        });
-
-        if all_idle {
-            let idle_ticks = dep.idle_since.unwrap_or(brain.ticks);
-            let idle_duration = (brain.ticks - idle_ticks) * 5; // assume 5s per tick
-
-            if let Some(dep_mut) = desired.deployments.get_mut(dep_name) {
-                if dep_mut.idle_since.is_none() {
-                    dep_mut.idle_since = Some(brain.ticks);
-                }
-            }
-
-            if idle_duration >= pause_threshold {
-                // Hibernate! Stop all pods but keep state
-                log.push(format!("  [pause] {dep_name}: idle for {idle_duration}s — HIBERNATING"));
-                for pod in &running_pods {
-                    docker::stop_container(&pod.id).ok();
-                    let cname = pod.names.first().map(|s| s.as_str()).unwrap_or("?");
-                    log.push(format!("    [pause] stopped {cname} 💤"));
-                }
-                if let Some(dep_mut) = desired.deployments.get_mut(dep_name) {
-                    dep_mut.paused = true;
-                }
-            } else {
-                let remaining = pause_threshold - idle_duration;
-                log.push(format!("  [pause] {dep_name}: idle ({remaining}s until hibernate)"));
-            }
-        } else {
-            // Not idle — reset counter
-            if let Some(dep_mut) = desired.deployments.get_mut(dep_name) {
-                dep_mut.idle_since = None;
-            }
-        }
-    }
-
-    // 3. DaemonSets — ensure one pod per "node" (single-node for now = 1 pod)
-    for (name, ds) in &desired.daemonsets {
-        let prefix = format!("/rk-ds-{name}");
-        let running = managed.iter().any(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running");
-
-        if !running {
-            let pod_name = format!("rk-ds-{name}");
-            log.push(format!("  [daemonset] {name}: deploying to node"));
-            docker::pull_image(&ds.container.image).ok();
-            let cmd_refs: Vec<&str> = ds.container.command.as_ref()
-                .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-            let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-            let labels = vec![(MANAGED_LABEL, "true"), ("royak.daemonset", name.as_str())];
-            if let Ok(id) = docker::create_container(&pod_name, &ds.container.image, cmd, &ds.container.env, &labels) {
-                docker::start_container(&id).ok();
-                let ns_net = format!("rk-{}", ds.namespace);
-                docker::connect_to_network(&id, &ns_net, &[pod_name.as_str(), name.as_str()])
-                    .or_else(|_| docker::connect_network(&id, &[pod_name.as_str(), name.as_str()])).ok();
-                log.push(format!("    [start] {pod_name} ✓"));
-            }
-        } else {
-            log.push(format!("  [ok] daemonset/{name}: running"));
-        }
-    }
-
-    // 4. Jobs — run to completion
-    for (name, job) in &desired.jobs {
-        let prefix = format!("/rk-job-{name}");
-        let exists = managed.iter().any(|c| c.names.iter().any(|n| n.starts_with(&prefix)));
-        let completed = managed.iter().any(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "exited");
-
-        if !exists {
-            let pod_name = format!("rk-job-{name}");
-            log.push(format!("  [job] {name}: starting"));
-            docker::pull_image(&job.container.image).ok();
-            let cmd_refs: Vec<&str> = job.container.command.as_ref()
-                .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-            let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-            let labels = vec![(MANAGED_LABEL, "true"), ("royak.job", name.as_str())];
-            if let Ok(id) = docker::create_container(&pod_name, &job.container.image, cmd, &job.container.env, &labels) {
-                docker::start_container(&id).ok();
-                log.push(format!("    [start] {pod_name} ✓"));
-            }
-        } else if completed {
-            log.push(format!("  [ok] job/{name}: completed"));
-        } else {
-            log.push(format!("  [ok] job/{name}: running"));
-        }
-    }
-
-    // 5. HPA — PREDICTIVE auto-scaling (not just reactive)
-    let hpa_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let mut hpa_scale_actions: Vec<(String, u32)> = Vec::new();
-    let mut hpa_scaled_names: Vec<String> = Vec::new();
-    for (hpa_key, hpa) in desired.hpas.iter() {
-        if let Some(dep) = desired.deployments.get(&hpa.deployment) {
-            let prefix = format!("/rk-{}-", hpa.deployment);
-            let running_count = managed.iter()
-                .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-                .count() as u32;
-
-            // Get REAL average CPU across deployment pods
-            let avg_cpu = if running_count > 0 {
-                let total: f32 = managed.iter()
-                    .filter(|c| c.names.iter().any(|n| n.starts_with(&prefix)) && c.state == "running")
-                    .filter_map(|c| docker::container_stats_peek(&c.id[..12.min(c.id.len())]).ok())
-                    .map(|(cpu, _)| cpu)
-                    .sum();
-                total / running_count as f32
-            } else {
-                0.0
-            };
-            let simulated_cpu = avg_cpu; // renamed for compatibility
-
-            // Record for brain learning
-            brain.record_load(&hpa.deployment, simulated_cpu, dep.replicas);
-
-            let current = dep.replicas;
-            let trend = brain.trend(&hpa.deployment);
-
-            // PREDICT: check if brain predicts future load spike
-            if let Some((predicted_cpu, confidence, suggested)) = brain.predict_load(&hpa.deployment, hpa.target_cpu, hpa.max_replicas) {
-                if confidence > 0.3 && suggested != current {
-                    log.push(format!("  [PREDICT] {}: trend {trend}, predicted CPU {predicted_cpu:.0}% (conf: {confidence:.0}%), suggest {current} → {suggested}",
-                        hpa.deployment));
-                }
-            }
-
-            // Reactive scaling (immediate need), guarded by a stabilization
-            // window so CPU crossing the threshold on consecutive ticks can't
-            // thrash the deployment up and down.
-            let secs_since_scale = hpa.last_scaled
-                .map(|t| hpa_now.saturating_sub(t))
-                .unwrap_or(u64::MAX);
-            let decision = hpa_decision(
-                current, simulated_cpu, hpa.target_cpu,
-                hpa.min_replicas, hpa.max_replicas,
-                secs_since_scale, HPA_STABILIZATION_SECS,
-            );
-            match decision {
-                Some(target) if target > current => {
-                    log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% > {:.0}% target → scale {current} → {target} (trend: {trend})",
-                        hpa.deployment, hpa.target_cpu));
-                    hpa_scale_actions.push((hpa.deployment.clone(), target));
-                    hpa_scaled_names.push(hpa_key.clone());
-                }
-                Some(target) => {
-                    log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% < {:.0}% → scale down {current} → {target} (trend: {trend})",
-                        hpa.deployment, hpa.target_cpu * 0.5));
-                    hpa_scale_actions.push((hpa.deployment.clone(), target));
-                    hpa_scaled_names.push(hpa_key.clone());
-                }
-                None => {
-                    // Distinguish "held by cooldown" from "nothing to do" for clarity.
-                    let would_change = (simulated_cpu > hpa.target_cpu && current < hpa.max_replicas)
-                        || (simulated_cpu < hpa.target_cpu * 0.5 && current > hpa.min_replicas);
-                    if would_change && secs_since_scale < HPA_STABILIZATION_SECS {
-                        log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% — holding {current} replicas ({}s into {HPA_STABILIZATION_SECS}s stabilization window)",
-                            hpa.deployment, secs_since_scale));
-                    } else {
-                        log.push(format!("  [hpa] {}: CPU {simulated_cpu:.0}% — {current} replicas ok (trend: {trend})", hpa.deployment));
-                    }
-                }
-            }
-        }
-    }
-    // Apply deferred HPA scale actions
-    for (dep_name, target) in hpa_scale_actions {
-        if let Some(dep) = desired.deployments.get_mut(&dep_name) {
-            dep.replicas = target;
-        }
-    }
-    // Stamp last_scaled so the stabilization window starts now (deferred to
-    // avoid a mutable borrow while iterating hpas above).
-    for hpa_key in hpa_scaled_names {
-        if let Some(hpa) = desired.hpas.get_mut(&hpa_key) {
-            hpa.last_scaled = Some(hpa_now);
-        }
-    }
-
-    // 6. CronJobs — check schedule (simple minute-based check)
-    let mut cronjob_runs: Vec<String> = Vec::new();
-    for (name, cron) in &desired.cronjobs {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        let should_run = if let Some(last) = cron.last_run {
-            let interval_mins: u64 = cron.schedule.split_whitespace().next()
-                .and_then(|s| s.trim_start_matches("*/").parse().ok())
-                .unwrap_or(5);
-            now - last > interval_mins * 60
-        } else {
-            true
-        };
-
-        if should_run {
-            let run_id = (now % 10000) as u32;
-            let pod_name = format!("rk-cron-{name}-{run_id}");
-            log.push(format!("  [cronjob] {name}: triggering ({}) ", cron.schedule));
-            docker::pull_image(&cron.container.image).ok();
-            let cmd_refs: Vec<&str> = cron.container.command.as_ref()
-                .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-            let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-            let labels = vec![(MANAGED_LABEL, "true"), ("royak.cronjob", name.as_str())];
-            if let Ok(id) = docker::create_container(&pod_name, &cron.container.image, cmd, &cron.container.env, &labels) {
-                docker::start_container(&id).ok();
-                log.push(format!("    [start] {pod_name} ✓"));
-            }
-            cronjob_runs.push(name.clone());
-        }
-    }
-    // Update last_run timestamps (deferred to avoid borrow conflict)
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    for name in cronjob_runs {
-        if let Some(cron) = desired.cronjobs.get_mut(&name) {
-            cron.last_run = Some(now);
-        }
-    }
-
-    // 7. Git repo watching — detect new commits, auto-trigger pipelines
-    let repo_triggers: Vec<(String, String)> = desired.repositories.iter()
-        .filter_map(|(name, repo)| {
-            repo.pipeline.as_ref().map(|p| (name.clone(), p.clone()))
-        })
-        .collect();
-
-    for (repo_name, pipeline_name) in &repo_triggers {
-        if let Some(repo) = desired.repositories.get(repo_name) {
-            if let Some(path) = &repo.path {
-                // Local repo — check git HEAD
-                let head = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .current_dir(path)
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string());
-
-                if let Some(commit) = head {
-                    let changed = repo.last_commit.as_ref().map(|lc| lc != &commit).unwrap_or(true);
-                    if changed {
-                        log.push(format!("  [repo] {repo_name}: new commit {}", &commit[..8.min(commit.len())]));
-                        // Update last_commit
-                        if let Some(repo_mut) = desired.repositories.get_mut(repo_name) {
-                            repo_mut.last_commit = Some(commit);
-                        }
-                        // Auto-trigger pipeline
-                        if desired.pipelines.contains_key(pipeline_name.as_str()) {
-                            match start_pipeline(desired, pipeline_name) {
-                                Ok(run_id) => log.push(format!("  [repo] triggered pipeline/{pipeline_name} (run #{run_id})")),
-                                Err(e) => log.push(format!("  [repo] trigger failed: {e}")),
-                            }
-                        }
-                    }
-                }
-            } else if let Some(url) = &repo.url {
-                // Remote repo — git ls-remote
-                let head = std::process::Command::new("git")
-                    .args(["ls-remote", url, &format!("refs/heads/{}", repo.branch)])
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .and_then(|s| s.split_whitespace().next().map(|h| h.to_string()));
-
-                if let Some(commit) = head {
-                    let changed = repo.last_commit.as_ref().map(|lc| lc != &commit).unwrap_or(true);
-                    if changed {
-                        log.push(format!("  [repo] {repo_name}: remote commit {}", &commit[..8.min(commit.len())]));
-                        if let Some(repo_mut) = desired.repositories.get_mut(repo_name) {
-                            repo_mut.last_commit = Some(commit);
-                        }
-                        if desired.pipelines.contains_key(pipeline_name.as_str()) {
-                            match start_pipeline(desired, pipeline_name) {
-                                Ok(run_id) => log.push(format!("  [repo] triggered pipeline/{pipeline_name} (run #{run_id})")),
-                                Err(e) => log.push(format!("  [repo] trigger failed: {e}")),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 8. Pipeline runs — execute stages as Jobs in DAG order
-
-    // Pre-pass: advance in-flight background BUILD stages. Builds run off-thread
-    // (not as containers), so the container-based completion detection never
-    // fires for them — poll the build registry directly and update their status.
-    {
-        let mut updates: Vec<(usize, String, StageStatus, String)> = Vec::new();
-        for (ri, run) in desired.pipeline_runs.iter().enumerate() {
-            let pipeline = match desired.pipelines.get(&run.pipeline) { Some(p) => p, None => continue };
-            for s in pipeline.stages.iter().filter(|s| s.action.as_deref() == Some("build")) {
-                let running = run.stage_status.iter().any(|(n, st)| n == &s.name && *st == StageStatus::Running);
-                if !running { continue; }
-                let tag = s.tag.clone().unwrap_or_else(|| format!("royak-{}:{}", run.pipeline, run.run_id));
-                let job = format!("rk-build-{}-{}-{}", run.pipeline, run.run_id, s.name);
-                match docker::poll_build(&job) {
-                    docker::BuildPoll::Done(Ok(_)) => {
-                        docker::clear_build(&job);
-                        updates.push((ri, s.name.clone(), StageStatus::Succeeded,
-                            format!("  [pipeline] {}#{}: stage '{}' built {tag} ✓", run.pipeline, run.run_id, s.name)));
-                    }
-                    docker::BuildPoll::Done(Err(e)) => {
-                        docker::clear_build(&job);
-                        let short: String = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(&e).chars().take(200).collect();
-                        updates.push((ri, s.name.clone(), StageStatus::Failed,
-                            format!("  [pipeline] {}#{}: stage '{}' ✗ build failed: {short}", run.pipeline, run.run_id, s.name)));
-                    }
-                    docker::BuildPoll::NotStarted => {
-                        // Process restarted mid-build; the in-memory job is gone.
-                        // Reset to Pending so the stage rebuilds (crash-safety).
-                        updates.push((ri, s.name.clone(), StageStatus::Pending,
-                            format!("  [pipeline] {}#{}: stage '{}' build lost (restart) → retrying", run.pipeline, run.run_id, s.name)));
-                    }
-                    docker::BuildPoll::Running => {}
-                }
-            }
-        }
-        for (ri, sname, st, msg) in updates {
-            if let Some(run_mut) = desired.pipeline_runs.get_mut(ri) {
-                for (n, s) in run_mut.stage_status.iter_mut() { if n == &sname { *s = st.clone(); } }
-            }
-            log.push(msg);
-        }
-    }
-
-    let mut run_idx = 0;
-    while run_idx < desired.pipeline_runs.len() {
-        let run = &desired.pipeline_runs[run_idx];
-        let pipeline_name = run.pipeline.clone();
-        let run_id = run.run_id;
-
-        let pipeline = match desired.pipelines.get(&pipeline_name) {
-            Some(p) => p,
-            None => { run_idx += 1; continue; }
-        };
-
-        if run.is_complete() {
-            let all_ok = run.stage_status.iter().all(|(_, s)| matches!(s, StageStatus::Succeeded | StageStatus::Skipped));
-            let status = if all_ok { "SUCCEEDED" } else { "FAILED" };
-            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: {status} ✓"));
-            run_idx += 1;
-            continue;
-        }
-
-        // Find next runnable stage
-        let next_stage_name = run.next_runnable();
-        if let Some(stage_name) = next_stage_name {
-            // Check if dependencies are met
-            let stage_def = pipeline.stages.iter().find(|s| s.name == stage_name);
-            let deps_met = if let Some(sd) = stage_def {
-                if let Some(dep) = &sd.depends_on {
-                    run.stage_status.iter().any(|(n, s)| n == dep && *s == StageStatus::Succeeded)
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
-
-            // Check if dependency FAILED → skip this stage
-            let dep_failed = if let Some(sd) = stage_def {
-                if let Some(dep) = &sd.depends_on {
-                    run.stage_status.iter().any(|(n, s)| n == dep && *s == StageStatus::Failed)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if dep_failed {
-                // Mark as skipped
-                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                    for (n, s) in run_mut.stage_status.iter_mut() {
-                        if n == &stage_name { *s = StageStatus::Skipped; }
-                    }
-                }
-                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' SKIPPED (dependency failed)"));
-                continue; // check next stage in same tick
-            }
-
-            if !deps_met {
-                // Check if the dependency is currently running as a container
-                let dep_name = stage_def.and_then(|s| s.depends_on.as_ref()).unwrap();
-                let job_name = format!("rk-pipe-{pipeline_name}-{run_id}-{dep_name}");
-                let dep_running = managed.iter().any(|c|
-                    c.names.iter().any(|n| n.trim_start_matches('/') == job_name) && c.state == "running");
-                let dep_exited = managed.iter().find(|c|
-                    c.names.iter().any(|n| n.trim_start_matches('/') == job_name) && c.state == "exited");
-
-                if let Some(exited) = dep_exited {
-                    // Dep finished — check exit code via logs heuristic (exited = succeeded for now)
-                    let _ = exited;
-                    if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                        for (n, s) in run_mut.stage_status.iter_mut() {
-                            if n == dep_name { *s = StageStatus::Succeeded; }
-                        }
-                    }
-                    log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{dep_name}' completed ✓"));
-                    continue; // re-evaluate this run
-                } else if dep_running {
-                    log.push(format!("  [pipeline] {pipeline_name}#{run_id}: waiting for '{dep_name}'..."));
-                }
-                run_idx += 1;
-                continue;
-            }
-
-            // Check conditional (if:)
-            if let Some(sd) = stage_def {
-                if let Some(cond) = &sd.if_condition {
-                    let skip = match cond.as_str() {
-                        "always" => false,
-                        "failure" => {
-                            // Only run on prior failure
-                            !run.stage_status.iter().any(|(_, s)| *s == StageStatus::Failed)
-                        }
-                        c if c.starts_with("branch") => {
-                            // Simple branch check: "branch == main"
-                            // Look up repo branch from any linked repository
-                            let target_branch = c.split("==").nth(1).map(|s| s.trim()).unwrap_or("main");
-                            let current_branch = desired.repositories.values()
-                                .next().map(|r| r.branch.as_str()).unwrap_or("main");
-                            current_branch != target_branch
-                        }
-                        _ => false,
-                    };
-                    if skip {
-                        if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                            for (n, s) in run_mut.stage_status.iter_mut() {
-                                if n == &stage_name { *s = StageStatus::Skipped; }
-                            }
-                        }
-                        log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' SKIPPED (condition: {cond})"));
-                        continue;
-                    }
-                }
-            }
-
-            // Execute the stage (with matrix expansion)
-            if let Some(sd) = stage_def {
-                if let Some(action) = &sd.action {
-                    // Action stage (e.g., "apply")
-                    if action == "apply" {
-                        if let Some(file) = &sd.file {
-                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' → apply {file}"));
-                            match spec::parse_file(file) {
-                                Ok(resources) => {
-                                    for r in &resources {
-                                        match desired.apply(&r) {
-                                            Ok(msg) => log.push(format!("    ✓ {msg}")),
-                                            Err(e) => log.push(format!("    ✗ {e}")),
-                                        }
-                                    }
-                                    if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                        for (n, s) in run_mut.stage_status.iter_mut() {
-                                            if n == &stage_name { *s = StageStatus::Succeeded; }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log.push(format!("    ✗ apply failed: {e}"));
-                                    if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                        for (n, s) in run_mut.stage_status.iter_mut() {
-                                            if n == &stage_name { *s = StageStatus::Failed; }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if action == "build" {
-                        // Build an image from a git context (PaaS: source → image).
-                        // The build runs on a background thread so it never blocks
-                        // the reconcile loop; we poll it across ticks like a Job.
-                        let job = format!("rk-build-{pipeline_name}-{run_id}-{stage_name}");
-                        let ctx_name = sd.context.clone();
-                        let dockerfile = sd.dockerfile.clone().unwrap_or_else(|| "Dockerfile".to_string());
-                        let tag = sd.tag.clone().unwrap_or_else(|| format!("royak-{pipeline_name}:{run_id}"));
-                        let build_args = sd.build_args.clone();
-                        // `sd` / `pipeline` are not used past this point in this arm.
-                        match docker::poll_build(&job) {
-                            docker::BuildPoll::NotStarted => {
-                                let branch = desired.repositories.values().next()
-                                    .map(|r| r.branch.clone()).unwrap_or_else(|| "main".to_string());
-                                // Default context = the pipeline's first linked repo.
-                                let ctx = ctx_name.or_else(|| desired.repositories.keys().next().cloned());
-                                match ctx {
-                                    None => {
-                                        log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build: no context (set stage.context or register a repo)"));
-                                        if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                            for (n, s) in run_mut.stage_status.iter_mut() {
-                                                if n == &stage_name { *s = StageStatus::Failed; }
-                                            }
-                                        }
-                                    }
-                                    Some(cn) => match resolve_build_context(desired, &cn, &branch) {
-                                        Ok(dir) => {
-                                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' → build {tag} from {dir} ({dockerfile})"));
-                                            docker::start_build(&job, dir, dockerfile, tag, build_args);
-                                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                                for (n, s) in run_mut.stage_status.iter_mut() {
-                                                    if n == &stage_name { *s = StageStatus::Running; }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build context: {e}"));
-                                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                                for (n, s) in run_mut.stage_status.iter_mut() {
-                                                    if n == &stage_name { *s = StageStatus::Failed; }
-                                                }
-                                            }
-                                        }
-                                    },
-                                }
-                            }
-                            docker::BuildPoll::Running => {
-                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: building '{stage_name}'..."));
-                            }
-                            docker::BuildPoll::Done(Ok(_)) => {
-                                docker::clear_build(&job);
-                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' built {tag} ✓"));
-                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                    for (n, s) in run_mut.stage_status.iter_mut() {
-                                        if n == &stage_name { *s = StageStatus::Succeeded; }
-                                    }
-                                }
-                            }
-                            docker::BuildPoll::Done(Err(e)) => {
-                                docker::clear_build(&job);
-                                let short: String = e.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(&e).chars().take(200).collect();
-                                log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ✗ build failed: {short}"));
-                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                    for (n, s) in run_mut.stage_status.iter_mut() {
-                                        if n == &stage_name { *s = StageStatus::Failed; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if sd.image.is_some() || !sd.matrix_images.is_empty() {
-                    // Container stage — run as Job(s), with matrix expansion
-                    let images: Vec<String> = if !sd.matrix_images.is_empty() {
-                        sd.matrix_images.clone()
-                    } else {
-                        vec![sd.image.clone().unwrap_or_default()]
-                    };
-                    let is_matrix = images.len() > 1;
-                    let mut all_done = true;
-                    let any_failed = false;
-
-                    for (mi, image) in images.iter().enumerate() {
-                    let job_name = if is_matrix {
-                        format!("rk-pipe-{pipeline_name}-{run_id}-{stage_name}-m{mi}")
-                    } else {
-                        format!("rk-pipe-{pipeline_name}-{run_id}-{stage_name}")
-                    };
-
-                    // Check if already running/completed
-                    let exists = managed.iter().any(|c|
-                        c.names.iter().any(|n| n.trim_start_matches('/') == job_name));
-
-                    if !exists {
-                        log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' → {image}"));
-                        docker::pull_image(image).ok();
-                        let cmd_refs: Vec<&str> = sd.command.as_ref()
-                            .map(|c| c.iter().map(|s| s.as_str()).collect()).unwrap_or_default();
-                        let cmd = if cmd_refs.is_empty() { None } else { Some(cmd_refs.as_slice()) };
-                        let labels = vec![
-                            (MANAGED_LABEL, "true"),
-                            ("royak.pipeline", pipeline_name.as_str()),
-                            ("royak.stage", stage_name.as_str()),
-                        ];
-                        // Inject ALL secrets into pipeline stages (like GitHub Actions secrets)
-                        let mut full_env = sd.env.clone();
-                        for secret in desired.secrets.values() {
-                            for (k, v) in &secret.data {
-                                full_env.push(format!("{k}={v}"));
-                            }
-                        }
-                        full_env.push(format!("ROYAK_PIPELINE={pipeline_name}"));
-                        full_env.push(format!("ROYAK_STAGE={stage_name}"));
-                        full_env.push(format!("ROYAK_RUN_ID={run_id}"));
-                        match docker::create_container(&job_name, image, cmd, &full_env, &labels) {
-                            Ok(id) => {
-                                docker::start_container(&id).ok();
-                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                    for (n, s) in run_mut.stage_status.iter_mut() {
-                                        if n == &stage_name { *s = StageStatus::Running; }
-                                    }
-                                }
-                                log.push(format!("    [start] {job_name} ✓"));
-                            }
-                            Err(e) => {
-                                log.push(format!("    [error] {job_name}: {e}"));
-                                if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                    for (n, s) in run_mut.stage_status.iter_mut() {
-                                        if n == &stage_name { *s = StageStatus::Failed; }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // Check completion
-                        let exited = managed.iter().any(|c|
-                            c.names.iter().any(|n| n.trim_start_matches('/') == job_name) && c.state == "exited");
-                        let still_running = managed.iter().any(|c|
-                            c.names.iter().any(|n| n.trim_start_matches('/') == job_name) && c.state == "running");
-                        if exited {
-                            log.push(format!("    [matrix] {job_name} completed ✓"));
-                        } else if still_running {
-                            all_done = false;
-                        } else {
-                            all_done = false;
-                        }
-                    }
-                    } // end matrix loop
-
-                    // Update stage status based on matrix results
-                    if is_matrix {
-                        if all_done && !any_failed {
-                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                for (n, s) in run_mut.stage_status.iter_mut() {
-                                    if n == &stage_name { *s = StageStatus::Succeeded; }
-                                }
-                            }
-                            log.push(format!("  [pipeline] {pipeline_name}#{run_id}: stage '{stage_name}' ALL matrix jobs completed ✓"));
-                        } else if any_failed {
-                            if let Some(run_mut) = desired.pipeline_runs.get_mut(run_idx) {
-                                for (n, s) in run_mut.stage_status.iter_mut() {
-                                    if n == &stage_name { *s = StageStatus::Failed; }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        run_idx += 1;
-    }
-
-    // Clean up completed pipeline runs (keep last 10)
-    desired.pipeline_runs.retain(|r| !r.is_complete());
-
-    // Flush deferred events
-    for (kind, object, reason, message, event_type) in pending_events {
-        desired.record_event(&kind, &object, &reason, &message, &event_type);
-    }
-
-    // ─── NetworkPolicy enforcement + neural threat detection ───
-    if !desired.network_policies.is_empty() {
-        let managed_refs: Vec<&docker::DockerContainer> = managed.iter().map(|c| *c).collect();
-        enforce_network_policies(desired, &managed_refs, &mut log);
-    }
-
-    // ─── Brain training: learn from this tick's decisions ───
-    {
-        // Build cluster state snapshot for training
-        let pods: Vec<crate::brain::PodState> = managed.iter()
-            .filter(|c| c.state == "running")
-            .map(|c| {
-                let name = c.names.first().map(|s| s.trim_start_matches('/')).unwrap_or("?");
-                let short_id = &c.id[..12.min(c.id.len())];
-                let (cpu, mem) = docker::container_stats_peek(short_id).unwrap_or((0.0, 0.0));
-                crate::brain::PodState {
-                    id: short_id.to_string(), name: name.to_string(),
-                    node: "local".to_string(), status: crate::brain::PodStatus::Running,
-                    cpu_pct: cpu, mem_mb: mem, restarts: 0, age_secs: 0,
-                    image: c.image.clone(),
-                }
-            })
-            .collect();
-
-        let desired_states: Vec<crate::brain::DesiredState> = desired.deployments.values()
-            .map(|d| crate::brain::DesiredState {
-                name: d.name.clone(), replicas: d.replicas,
-                image: d.image.clone(),
-                cpu_limit: d.resource_limits.as_ref().and_then(|r| r.cpu_limit).unwrap_or(1.0),
-                mem_limit: d.resource_limits.as_ref().and_then(|r| r.mem_limit).unwrap_or(512) as f32,
-            })
-            .collect();
-
-        if !pods.is_empty() {
-            let cluster_state = crate::brain::ClusterState {
-                pods, nodes: vec![], desired: desired_states,
-            };
-
-            // Get what rules decided this tick
-            let decision = brain.tick(&cluster_state);
-            let target = brain.decisions_to_target(&cluster_state, &decision.actions);
-
-            // Train one step
-            let loss = brain.train_step(&cluster_state, &target, 0.001);
-            if brain.train_steps % 10 == 0 {
-                log.push(format!("  [brain] trained: step={}, loss={loss:.4}", brain.train_steps));
-            }
-        }
-    }
-
-    // Save brain weights periodically
-    if brain.train_steps > 0 && brain.train_steps % 50 == 0 {
-        if brain.save_weights(".royak-brain.bin").is_ok() {
-            log.push(format!("  [brain] weights saved (step={}, loss={:.4})", brain.train_steps, brain.last_loss));
-        }
-    }
-
-    log
+    docker_tick::reconcile_docker(desired, brain, publish_health)
 }
+
+#[path = "reconcile_docker.rs"]
+mod docker_tick;
+pub use docker_tick::{local_views, node_get, node_post, our_containers, remote_delete_pod};
 
 /// Split an iptables rule string into an argv vector.
 fn sh(rule: &str) -> Vec<String> {
@@ -4031,8 +2907,16 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
         let target_ns = &policy.namespace;
         let selector = &policy.pod_selector;
 
+        // A restored/out-of-band policy can bypass ordinary admission. Do
+        // not attempt even namespace-network setup for an ambiguous native
+        // selection, nor call this a network revocation/fencing proof.
+        if crate::workload::managed::require_supported_policy_admission(desired,target_ns,selector).is_err(){
+            log.push(format!("  [netpol] {}: UNKNOWN unsupported native selection; no policy effects/enforced claim",policy.name));
+            continue;
+        }
+
         // Find containers matching the policy selector in this namespace
-        let matching: Vec<&&docker::DockerContainer> = managed.iter()
+        let selected: Vec<&&docker::DockerContainer> = managed.iter()
             .filter(|c| {
                 let in_ns = c.labels.get("royak.namespace").map(|s| s.as_str()) == Some(target_ns.as_str())
                     || (target_ns == "default" && !c.labels.contains_key("royak.namespace"));
@@ -4045,6 +2929,23 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
                 in_ns && matches_selector
             })
             .collect();
+
+        // Native policy is NOT implemented by legacy namespace membership or
+        // a NET_ADMIN helper. Restored/out-of-band unsupported policy is an
+        // explicit UNKNOWN, never a false `enforced` audit/marker/count.
+        let mut unsupported_native=false;
+        let matching:Vec<_>=selected.into_iter().filter(|c|{
+            let native=crate::docker::managed::registered_target(&c.id)
+                ||[crate::workload::managed::LABEL_WRITER,crate::workload::managed::LABEL_OPERATION,
+                    crate::workload::managed::LABEL_NONCE].iter().any(|key|c.labels.contains_key(*key))
+                ||c.names.iter().any(|name|desired.storage_identities.lifecycle.contains_writer_pod(
+                    target_ns,name.trim_start_matches('/')))
+                ||c.labels.get("royak.pod").is_some_and(|pod|
+                    desired.storage_identities.lifecycle.contains_writer_pod(target_ns,pod));
+            if native{unsupported_native=true;log.push(format!("  [netpol] {}: UNKNOWN unsupported native policy for {}; no legacy network/helper effect",
+                policy.name,c.id));}
+            !native
+        }).collect();
 
         if matching.is_empty() { continue; }
 
@@ -4165,8 +3066,8 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
             }
         }
 
-        log.push(format!("  [netpol] {}: enforced on {} pods (ns={target_ns}, selector={selector}{}{}{})",
-            policy.name, matching.len(),
+        log.push(format!("  [netpol] {}: {} on {} legacy pods (ns={target_ns}, selector={selector}{}{}{})",
+            policy.name, if unsupported_native{"legacy-only processing; native UNKNOWN"}else{"enforced"},matching.len(),
             if policy.internal { ", internal" } else { "" },
             if policy.mtls_required { ", mTLS" } else { "" },
             if policy.deny_all { ", deny-all" } else { "" },
@@ -4192,7 +3093,38 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
 /// Reconcile loop for NeuroPod runtime — no Docker daemon needed.
 /// Creates/manages pods as isolated Linux processes with OverlayFS + namespaces.
 pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) -> Vec<String> {
-    let mut log = Vec::new();
+    let (admitted, mut log) = unsupported_runtime_workloads(desired, "NeuroPod");
+    if admitted.is_empty() && !log.is_empty() { return log; }
+    // Test-only trap is at the last edge before any filesystem/GC/bridge/disk
+    // effect. Production has no override or substitute runtime capability.
+    #[cfg(test)]
+    if let Some(rows) = unsupported_storage_runtime_tests::before_effect("neuropod", &admitted) {
+        log.extend(rows); return log;
+    }
+    let pods_root=dirs_or_home().join(".royak/pods");
+    let scope=crate::neuropod_gc::Owner::current(desired,"default","scope");
+    let records=crate::neuropod_gc::inventory(&pods_root);
+    for record in &records {
+        if !record.owner.same_scope(&scope) || record.owner.generation>desired.generation {continue;}
+        let record_key=crate::store::obj_key(&record.owner.namespace,&record.owner.deployment);
+        let dep=desired.deployments.get(&record_key);
+        // Current blocked workloads retain their old experimental resources;
+        // they are neither counted healthy nor reclaimed as a fallback effect.
+        if dep.is_some() && !admitted.contains(&record_key) { continue; }
+        let wanted=dep.map(|d|(1..=d.replicas).any(|i|record.name==format!("{}-{i}",crate::store::pod_stem(&d.namespace,&d.name)))).unwrap_or(false);
+        if !wanted {
+            match crate::neuropod_gc::reclaim(record,&scope) {
+                Ok(archive)=>log.push(format!("  [neuropod-gc] {} reclaimed; data retained at {}",record.name,archive.display())),
+                Err(error)=>log.push(format!("  [neuropod-gc] {} cleanup deferred: {error}",record.name)),
+            }
+        }
+    }
+    if crate::security::world_has_constraints(desired) {
+        log.push("  [security] NeuroPod cannot enforce securityContext; refusing pod creation".into());return log;
+    }
+    if crate::probes::world_has_probes(desired) {
+        log.push("  [probe] NeuroPod does not execute health probes; refusing silent unenforced startup".into());return log;
+    }
 
     // Initialize Cluster CA
     if desired.cluster_ca.is_none() {
@@ -4212,19 +3144,22 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
     let existing_names: std::collections::HashSet<String> = existing.iter()
         .map(|(name, _, _, _, _)| name.clone()).collect();
 
-    let mut pod_index: u32 = existing.len() as u32;
+    let mut used_ips:std::collections::HashSet<String>=existing.iter().filter_map(|(name,_,_,_,_)|
+        crate::neuropod_gc::read_meta(&pods_root.join(name)).ok().and_then(|m|m["network"]["ip"].as_str().map(str::to_string))).collect();
 
-    // For each deployment: create NeuroPods if needed
-    for (name, dep) in &desired.deployments {
+    // Only the exact admitted legacy keys can reach this runtime's effects.
+    for name in &admitted {
+        let dep = &desired.deployments[name];
         let mut running = 0u32;
         for i in 1..=dep.replicas {
-            let pod_name = format!("rk-{name}-{i}");
+            // Same per-namespace stem as Docker pods ("ns/name" keys must never
+            // reach a pod, directory or netns name).
+            let pod_name = format!("{}-{i}", crate::store::pod_stem(&dep.namespace, &dep.name));
             if existing_names.contains(&pod_name) {
-                // Check if actually running
-                let meta_path = dirs_or_home().join(".royak").join("pods").join(&pod_name).join("meta.json");
-                if meta_path.exists() {
-                    running += 1;
-                }
+                let meta=crate::neuropod_gc::read_meta(&pods_root.join(&pod_name));
+                let owned=meta.as_ref().ok().and_then(|m|serde_json::from_value::<crate::neuropod_gc::Owner>(m["owner"].clone()).ok()).map(|o|o.same_scope(&scope)&&o.namespace==dep.namespace&&o.deployment==dep.name).unwrap_or(false);
+                if owned && meta.as_ref().map(crate::neuropod_gc::process_running).unwrap_or(false){running+=1;}
+                else{log.push(format!("  [neuropod] {pod_name}: occupied or cleanup pending; not adopted"));}
                 continue;
             }
 
@@ -4240,7 +3175,10 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
                 .unwrap_or(512); // default 512MB disk
             let mount_path = "/data";
 
-            match crate::runtime::NeuroPod::create(&pod_name, &dep.image, disk_mb, mount_path) {
+            if pods_root.join(&pod_name).symlink_metadata().is_ok(){log.push(format!("  [neuropod] {pod_name}: unmanaged path collision; creation refused"));continue;}
+            let owner=crate::neuropod_gc::Owner::current(desired,&dep.namespace,&dep.name);
+            let Some(pod_index)=crate::runtime::next_pod_network_index(&used_ips) else {log.push(format!("  [neuropod] {pod_name}: pod network address capacity reached"));continue;};
+            match crate::runtime::NeuroPod::create_owned(&pod_name, &dep.image, disk_mb, mount_path,owner) {
                 Ok(mut pod) => {
                     // Collect env
                     let mut env = dep.env.clone();
@@ -4249,7 +3187,7 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
                     }
                     env.push(format!("ROYAK_POD_NAME={pod_name}"));
                     env.push(format!("ROYAK_NAMESPACE={}", dep.namespace));
-                    env.push(format!("ROYAK_DEPLOYMENT={name}"));
+                    env.push(format!("ROYAK_DEPLOYMENT={}", dep.name));
 
                     // Pod identity (mTLS cert + token)
                     if let Some(ref mut ca) = desired.cluster_ca {
@@ -4260,14 +3198,15 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
                     }
 
                     // Set up network
-                    pod_index += 1;
                     let ports: Vec<(u16, u16)> = Vec::new(); // TODO: parse from spec
                     match crate::runtime::create_pod_network(&pod_name, pod_index, &ports) {
                         Ok(net) => {
+                            used_ips.insert(net.ip.clone());
                             env.push(format!("NEUROPOD_IP={}", net.ip));
                             log.push(format!("    [net] {pod_name} → {} (bridge)", net.ip));
+                            if let Err(error)=pod.set_network(net.clone()){crate::runtime::destroy_pod_network(&net);log.push(format!("  [neuropod] {pod_name}: network metadata failed: {error}"));continue;}
                         }
-                        Err(e) => log.push(format!("    [net] {pod_name}: {e} (host networking)")),
+                        Err(e) => {log.push(format!("    [net] {pod_name}: {e}; managed startup refused"));continue;},
                     }
 
                     // Start
@@ -4369,52 +3308,275 @@ pub fn start_pipeline(desired: &mut DesiredWorld, pipeline_name: &str) -> Result
 
 /// Run reconcile loop continuously with auto-persistence
 #[allow(dead_code)]
-pub fn run_loop(desired: &mut DesiredWorld, brain: &mut OrinBrain, interval_secs: u64) {
-    println!("  Reconcile loop started (every {interval_secs}s)");
-    println!("  Nodes: {} | Heartbeat: every 3 ticks\n", desired.nodes.len());
-
-    loop {
-        let start = Instant::now();
-        let log = reconcile_once(desired, brain);
-        brain.ticks += 1;
-        let elapsed = start.elapsed();
-
-        brain.set("cluster.last_tick".to_string(), brain.ticks.to_string());
-        brain.set("cluster.last_reconcile_ms".to_string(), format!("{:.1}", elapsed.as_secs_f64() * 1000.0));
-
-        println!("  ── tick {} ({:.1}ms) ──", brain.ticks, elapsed.as_secs_f64() * 1000.0);
-        for line in &log {
-            println!("{line}");
-            // Surface the interesting decisions to the demo's live activity feed.
-            let l = line.trim();
-            if l.starts_with("[scale]") || l.starts_with("[multi-node]") || l.starts_with("[create]")
-                || l.starts_with("[quota]") || l.contains("chaos") || l.contains("recovered")
-                || l.contains("healing") || l.contains("pod lost") || l.contains("reconciling")
-                || l.contains("rolling update") {
-                crate::api::push_activity(l);
-            }
+/// Lines worth surfacing in the demo's live activity feed.
+fn push_interesting(log: &[String]) {
+    for line in log {
+        println!("{line}");
+        let l = line.trim();
+        if l.starts_with("[scale]") || l.starts_with("[multi-node]") || l.starts_with("[create]")
+            || l.starts_with("[quota]") || l.contains("chaos") || l.contains("recovered")
+            || l.contains("healing") || l.contains("pod lost") || l.contains("reconciling")
+            || l.contains("rollout") || l.starts_with("[cleanup]") {
+            crate::api::push_activity(l);
         }
-
-        // Node health + heartbeat every 3 ticks (~15s)
-        if brain.ticks % 3 == 0 && desired.nodes.len() > 1 {
-            let health_log = check_node_health(desired);
-            for line in &health_log { println!("{line}"); }
-            send_heartbeats(desired, brain);
-        }
-
-        std::thread::sleep(Duration::from_secs(interval_secs));
     }
 }
 
-/// Shared version of run_loop — API server and reconcile use the SAME DesiredWorld
-#[allow(dead_code)]
-pub fn run_loop_shared(
-    world: std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
+/// The state-file owner lock of this process (single-node mode). Held for the
+/// life of the process; a second `watch` on the same state stays in standby
+/// until this one exits (the kernel releases the flock on any exit, SIGKILL
+/// included — no TTL, no clock, no two writers).
+static OWNER_LOCK: std::sync::Mutex<Option<crate::persist::OwnerLock>> = std::sync::Mutex::new(None);
+
+/// Try to become the owner of `state_path`. On success, (re)load the state the
+/// previous owner left and install it, so a standby never acts on stale state.
+pub fn try_take_ownership(world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>>, state_path: &str) -> Result<bool, String> {
+    if crate::store::owns_state() {
+        return Ok(true);
+    }
+    let Some(lock) = crate::persist::try_own(state_path)? else { return Ok(false) };
+    let loaded = crate::persist::load(state_path)?;
+    if loaded.fresh {
+        // A new cluster's identity (cluster id → container ownership) is
+        // durable from the first second, not from the first write.
+        crate::persist::save(state_path, &loaded.state, &[])?;
+    }
+    if let Some(v) = loaded.migrated_from {
+        // Persist the migrated form now (original kept as .v1.bak) so the
+        // on-disk file and the served state are the same thing from tick one.
+        crate::persist::backup_before_migration(state_path, v)?;
+        crate::persist::save(state_path, &loaded.state, &[])?;
+        println!("  [migrate] {state_path}: schema v{v} → v{} written (backup: {state_path}.v{}.bak)", crate::persist::SCHEMA_VERSION, v.max(1));
+    }
+    {
+        let mut w = world.write().unwrap_or_else(|e| e.into_inner());
+        w.install_state(loaded.state);
+    }
+    *OWNER_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+    crate::store::set_owns_state(true);
+    Ok(true)
+}
+
+/// One reconcile tick with the commit contract applied to the loop itself.
+///
+/// Slow Docker/peer operations run on a detached snapshot. Committed desired
+/// state stays readable during graceful stops; only runtime observations merge
+/// back, and desired mutations still pass through the durable CAS commit.
+/// `commit_lock` retains the existing ordering against local API writes.
+pub fn reconcile_tick(
+    world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
     brain: &mut OrinBrain,
-    interval_secs: u64,
-    state_path: &str,
-) {
-    run_loop_shared_with_runtime(world, brain, interval_secs, state_path, false);
+    use_neuropod: bool,
+) -> Vec<String> {
+    reconcile_tick_with(world, |working, publish| reconcile_with_observer(working, brain, use_neuropod, publish))
+}
+
+fn merge_tick_health(live: &mut DesiredWorld, base: &DesiredWorld, observed: &DesiredWorld) -> bool {
+    if live.generation != base.generation || live.cluster_id != base.cluster_id { return false; }
+    live.restart_count = observed.restart_count.clone();
+    live.startup_ok = observed.startup_ok.clone();
+    live.pod_ready = observed.pod_ready.clone();
+    live.pod_health = observed.pod_health.clone();
+    true
+}
+
+fn merge_tick_observations(live: &mut DesiredWorld, base: &DesiredWorld, observed: &DesiredWorld) -> bool {
+    if !merge_tick_health(live, base, observed) { return false; }
+    live.netpol_applied = observed.netpol_applied.clone();
+    live.cluster_ca = observed.cluster_ca.clone();
+    live.pod_certs = observed.pod_certs.clone();
+    live.network_audit = observed.network_audit.clone();
+    live.net_tracker = observed.net_tracker.clone();
+    let me = local_node_name();
+    if let Some(local) = observed.nodes.get(&me) { live.nodes.insert(me.clone(), local.clone()); }
+    // Heartbeats continue while the tick does I/O. Never replace a fresh peer
+    // address/stats/heartbeat with its older snapshot or demote a fresh peer.
+    for (name, node) in &observed.nodes {
+        if name == &me { continue; }
+        if let (Some(before), Some(current)) = (base.nodes.get(name), live.nodes.get_mut(name)) {
+            if current.last_heartbeat == before.last_heartbeat && current.address == before.address {
+                current.status = node.status.clone();
+            }
+        }
+    }
+    // Runtime API events may arrive without a desired-state commit. Merge only
+    // this tick's count delta, preserving concurrent events and their messages.
+    for event in &observed.events {
+        let same = |e: &&ClusterEvent| e.namespace == event.namespace && e.object == event.object && e.reason == event.reason;
+        let old = base.events.iter().find(same).map(|e| e.count).unwrap_or(0);
+        let delta = event.count.saturating_sub(old);
+        if delta == 0 { continue; }
+        if let Some(current) = live.events.iter_mut().find(|e| e.namespace == event.namespace && e.object == event.object && e.reason == event.reason) {
+            if current.count == old || current.last_seen < event.last_seen {
+                current.last_seen = event.last_seen.clone(); current.message = event.message.clone();
+            }
+            current.count = current.count.saturating_add(delta);
+        } else {
+            let mut added = event.clone(); added.count = delta; live.events.push(added);
+        }
+    }
+    if live.events.len() > 200 { live.events.drain(..live.events.len() - 200); }
+    // A pipeline may also be triggered through the runtime API during I/O.
+    for run in &observed.pipeline_runs {
+        let same = |r: &&PipelineRun| r.pipeline == run.pipeline && r.run_id == run.run_id && r.started_at == run.started_at;
+        let before = base.pipeline_runs.iter().find(same);
+        if let Some(current) = live.pipeline_runs.iter_mut().find(|r| r.pipeline == run.pipeline && r.run_id == run.run_id && r.started_at == run.started_at) {
+            for (name, status) in &run.stage_status {
+                let old = before.and_then(|b| b.stage_status.iter().find(|(n, _)| n == name)).map(|(_, s)| s);
+                if let Some((_, current_status)) = current.stage_status.iter_mut().find(|(n, _)| n == name) {
+                    if old == Some(&*current_status) && old != Some(status) { *current_status = status.clone(); }
+                }
+            }
+        } else if before.is_none() { live.pipeline_runs.push(run.clone()); }
+    }
+    true
+}
+
+fn reconcile_tick_with(
+    world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
+    run: impl FnOnce(&mut DesiredWorld, &mut dyn FnMut(&DesiredWorld) -> bool) -> Vec<String>,
+) -> Vec<String> {
+    let _serial = crate::store::commit_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let before = world.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let base = before.to_state();
+    let mut working = before.clone();
+    let mut publish = |observed: &DesiredWorld| merge_tick_health(
+        &mut world.write().unwrap_or_else(|e| e.into_inner()), &before, observed);
+    let mut log = run(&mut working, &mut publish);
+    let after = working.to_state();
+    if !merge_tick_observations(&mut world.write().unwrap_or_else(|e| e.into_inner()), &before, &working) {
+        log.push("  [warn] reconcile snapshot superseded by committed state; observations discarded".into());
+        return log;
+    }
+    if after.same_content(&base) {
+        return log;
+    }
+    if !crate::raft_node::is_cluster_scheduler() {
+        return log; // followers never write desired state
+    }
+    let mut next = after;
+    next.generation = base.generation + 1;
+    match crate::store::commit_state(world, base.generation, next) {
+        Ok(()) => {}
+        Err(e) => log.push(format!("  [warn] reconcile bookkeeping not committed (will retry): {e:?}")),
+    }
+    log
+}
+
+#[cfg(test)]
+mod tick_snapshot_tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn replacement_readiness_is_visible_before_slow_retirement_without_desired_leak() {
+        let world = Arc::new(RwLock::new(DesiredWorld::new()));
+        let worker_world = world.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || reconcile_tick_with(&worker_world, |working, publish| {
+            working.pod_ready.insert("replacement".into());
+            working.namespaces.push("not-committed".into());
+            assert!(publish(working));
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200)); // old pod retirement
+            working.namespaces.pop();
+            Vec::new()
+        }));
+        rx.recv().unwrap();
+        let live = world.try_read().expect("retirement I/O must not block readers");
+        assert!(live.pod_ready.contains("replacement"));
+        assert!(!live.namespaces.iter().any(|n| n == "not-committed"));
+        drop(live);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn slow_tick_keeps_committed_state_readable() {
+        let world = Arc::new(RwLock::new(DesiredWorld::new()));
+        let worker_world = world.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || reconcile_tick_with(&worker_world, |working, _| {
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            working.pod_ready.insert("observed-pod".into());
+            Vec::new()
+        }));
+        rx.recv().unwrap();
+        assert!(world.try_read().is_ok(), "slow container operations must not monopolize committed-state readers");
+        worker.join().unwrap();
+        assert!(world.read().unwrap().pod_ready.contains("observed-pod"));
+    }
+
+    #[test]
+    fn publishing_observations_cannot_publish_desired_mutations() {
+        let mut live = DesiredWorld::new();
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.namespaces.push("not-committed".into());
+        observed.pod_ready.insert("actual-pod".into());
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.to_state().same_content(&base.to_state()));
+        assert!(live.pod_ready.contains("actual-pod"));
+    }
+
+    #[test]
+    fn stale_tick_cannot_overwrite_newer_committed_state_or_observations() {
+        let mut live = DesiredWorld::new();
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.pod_ready.insert("obsolete".into());
+        live.generation += 1;
+        live.pod_ready.insert("fresh".into());
+        assert!(!merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.pod_ready.contains("fresh"));
+        assert!(!live.pod_ready.contains("obsolete"));
+    }
+
+    #[test]
+    fn runtime_event_merge_preserves_concurrent_api_events_and_counts() {
+        let mut live = DesiredWorld::new();
+        live.record_event("Pod", "a", "Created", "base", "Normal");
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.record_event("Pod", "a", "Created", "tick", "Normal");
+        live.record_event("Pod", "a", "Created", "api", "Normal");
+        live.record_event("Pipeline", "b", "Triggered", "api-only", "Normal");
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert_eq!(live.events.iter().find(|e| e.object == "a").unwrap().count, 3);
+        assert!(live.events.iter().any(|e| e.object == "b" && e.message == "api-only"));
+    }
+
+    #[test]
+    fn runtime_pipeline_merge_preserves_concurrent_triggers_and_stage_updates() {
+        let mut live = DesiredWorld::new();
+        live.pipeline_runs.push(PipelineRun { pipeline: "build".into(), run_id: 1,
+            stage_status: vec![("test".into(), StageStatus::Pending)], started_at: Instant::now() });
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.pipeline_runs[0].stage_status[0].1 = StageStatus::Succeeded;
+        live.pipeline_runs.push(PipelineRun { pipeline: "build".into(), run_id: 2,
+            stage_status: vec![], started_at: Instant::now() });
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert_eq!(live.pipeline_runs.len(), 2);
+        assert!(live.pipeline_runs[0].stage_status[0].1 == StageStatus::Succeeded);
+    }
+
+    #[test]
+    fn runtime_merge_cannot_demote_a_peer_with_a_fresh_heartbeat() {
+        let mut live = DesiredWorld::new();
+        let peer = format!("peer-other-than-{}", local_node_name());
+        record_peer(&mut live, &NodeHello { node: peer.clone(), address: "10.0.0.2:6443".into(),
+            cpu_used: 1.0, mem_used: 1.0, mem_capacity: 100.0, pod_count: 1 });
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.nodes.get_mut(&peer).unwrap().status = NodeStatus::NotReady;
+        let fresh = live.nodes.get_mut(&peer).unwrap();
+        fresh.last_heartbeat += 1;
+        fresh.address = "10.0.0.3:6443".into();
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.nodes[&peer].status == NodeStatus::Ready);
+        assert_eq!(live.nodes[&peer].address, "10.0.0.3:6443");
+    }
 }
 
 pub fn run_loop_shared_with_runtime(
@@ -4424,184 +3586,84 @@ pub fn run_loop_shared_with_runtime(
     state_path: &str,
     use_neuropod: bool,
 ) {
-    // Graceful shutdown: catch SIGTERM/SIGINT
     install_shutdown_handler();
-
-    // Leader election: derive a stable node id per process so lease
-    // renewal and takeover can distinguish instances.
-    let our_node_id = format!(
-        "{}-{}",
-        std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST")).unwrap_or_else(|_| "local".to_string()),
-        std::process::id()
-    );
-
+    let clustered = crate::raft_node::is_clustered();
     {
-        let w = world.read().unwrap();
-        println!("  Reconcile loop started (every {interval_secs}s, shared state)");
-        println!("  Node id:   {our_node_id}");
-        println!("  Nodes: {} | Heartbeat: every 3 ticks\n", w.nodes.len());
+        let w = world.read().unwrap_or_else(|e| e.into_inner());
+        println!("  Reconcile loop started (every {interval_secs}s, {} mode)", if clustered { "Raft cluster" } else { "single-node" });
+        println!("  Node: {} | cluster id: {}\n", local_node_name(), w.cluster_id);
     }
 
-    let mut was_leader = false;
+    let mut announced_standby = false;
     loop {
-        // Check for shutdown signal
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("\n  [shutdown] signal received — saving state...");
-            let w = world.read().unwrap();
-            // Full atomic save (schemaVersion + .nrns + flock) — export_state is the
-            // node-sync wire format and is NOT loadable by load_state.
-            crate::save_state(state_path, &w);
-            // Save brain weights
+            // Nothing to flush: every desired-state change was durable before
+            // it became visible. Containers keep running.
             brain.save_weights(".royak-brain.bin").ok();
-            // Release our lease so another instance can take over immediately.
-            if was_leader {
-                release_lease(state_path, &our_node_id);
-            }
-            eprintln!("  [shutdown] state + brain saved to {state_path}");
-            eprintln!("  [shutdown] containers preserved (will resume on restart)");
+            eprintln!("\n  [shutdown] state is already durable; containers preserved");
             break;
         }
 
-        // Try to acquire or renew the leader lease. Followers skip mutations
-        // and check again next tick (automatic failover on leader crash).
-        let is_leader = try_acquire_lease(state_path, &our_node_id);
-        if is_leader != was_leader {
-            if is_leader {
-                println!("  [lease] ★ became leader ({our_node_id})");
-            } else {
-                println!("  [lease] ← lost leadership; entering standby");
-            }
-            was_leader = is_leader;
-        }
-        if !is_leader {
-            println!("  ── [standby] another instance holds the lease ──");
-            std::thread::sleep(Duration::from_secs(interval_secs));
+        if clustered && !crate::raft_node::RAFT_READY.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(500));
             continue;
+        }
+        if !clustered {
+            match try_take_ownership(&world, state_path) {
+                Ok(true) => {
+                    if announced_standby {
+                        println!("  [owner] ★ acquired state ownership of {state_path} — reloaded state");
+                        announced_standby = false;
+                    }
+                }
+                Ok(false) => {
+                    if !announced_standby {
+                        println!("  ── [standby] another process owns {state_path}; waiting ──");
+                        announced_standby = true;
+                    }
+                    sleep_unless_shutdown(Duration::from_secs(interval_secs));
+                    continue;
+                }
+                Err(e) => {
+                    // Unreadable / corrupt state: never act on a guess.
+                    eprintln!("  ✗ [owner] cannot take ownership of {state_path}: {e}");
+                    sleep_unless_shutdown(Duration::from_secs(interval_secs));
+                    continue;
+                }
+            }
         }
 
         let start = Instant::now();
-
-        // Lock world briefly for reconciliation
-        let log = {
-            let mut w = world.write().unwrap();
-            reconcile_with_runtime(&mut w, brain, use_neuropod)
-        };
-
-        // Publish the lock-free read-model snapshots AFTER releasing the write
-        // lock, so ingress requests and the demo dashboard never block on the
-        // reconcile lock. One read guard feeds both.
+        let log = reconcile_tick(&world, brain, use_neuropod);
         {
-            let w = world.read().unwrap();
+            let w = world.read().unwrap_or_else(|e| e.into_inner());
             crate::api::publish_ingress_snapshot(&w);
             crate::api::publish_demo_state(&w);
         }
-
         brain.ticks += 1;
         let elapsed = start.elapsed();
         brain.set("cluster.last_tick".to_string(), brain.ticks.to_string());
         brain.set("cluster.last_reconcile_ms".to_string(), format!("{:.1}", elapsed.as_secs_f64() * 1000.0));
-
         println!("  ── tick {} ({:.1}ms) ──", brain.ticks, elapsed.as_secs_f64() * 1000.0);
-        for line in &log {
-            println!("{line}");
-            // Surface the interesting decisions to the demo's live activity feed.
-            let l = line.trim();
-            if l.starts_with("[scale]") || l.starts_with("[multi-node]") || l.starts_with("[create]")
-                || l.starts_with("[quota]") || l.contains("chaos") || l.contains("recovered")
-                || l.contains("healing") || l.contains("pod lost") || l.contains("reconciling")
-                || l.contains("rolling update") {
-                crate::api::push_activity(l);
-            }
-        }
+        push_interesting(&log);
 
-        // Node health + heartbeat every 3 ticks (~15s)
-        if brain.ticks % 3 == 0 {
-            let node_count = { world.read().unwrap().nodes.len() };
-            if node_count > 1 {
-                // Health check (quick, needs write lock)
-                {
-                    let mut w = world.write().unwrap();
-                    let health_log = check_node_health(&mut w);
-                    for line in &health_log { println!("{line}"); }
-                }
-                // Heartbeats in background thread (non-blocking)
-                let hb_world = std::sync::Arc::clone(&world);
-                let hb_brain_identity = brain.neural_identity(
-                    &std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST")).unwrap_or_default()
-                );
-                std::thread::spawn(move || {
-                    // Snapshot what we need under a BRIEF read lock, then do the
-                    // network POSTs with NO lock held. Holding world.write() across
-                    // http_post stalled the whole reconcile + ingress (site down)
-                    // whenever a peer was slow — a 37s tick and 502s.
-                    let token_b64 = OrinBrain::identity_base64(&hb_brain_identity);
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    let (body, peers) = {
-                        let w = hb_world.read().unwrap();
-                        let local_hostname = local_node_name();
-                        let local = w.nodes.get(&local_hostname);
-                        let cpu = local.map(|n| n.cpu_used).unwrap_or(0.0);
-                        let mem = local.map(|n| n.mem_used).unwrap_or(0.0);
-                        let pods = local.map(|n| n.pod_count).unwrap_or(0);
-                        let body = serde_json::json!({"node": local_hostname, "cpu_used": cpu, "mem_used": mem, "pod_count": pods, "timestamp": now}).to_string();
-                        let peers: Vec<(String, String)> = w.nodes.iter()
-                            .filter(|(name, _)| **name != local_hostname)
-                            .map(|(name, n)| (name.clone(), n.address.clone())).collect();
-                        (body, peers)
-                    };
-                    // Network I/O — lock-free
-                    let mut reached = Vec::new();
-                    for (name, addr) in &peers {
-                        if http_post(&format!("http://{addr}/royak/v1/heartbeat"), &body,
-                            &[("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")]).is_ok() {
-                            reached.push(name.clone());
-                        }
-                    }
-                    // Brief write lock only to apply the results.
-                    if !reached.is_empty() {
-                        let mut w = hb_world.write().unwrap();
-                        for name in reached {
-                            if let Some(node) = w.nodes.get_mut(&name) {
-                                node.last_heartbeat = now;
-                                node.status = NodeStatus::Ready; // reached it → alive
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        sleep_unless_shutdown(Duration::from_secs(interval_secs));
+    }
+}
 
-        // Persist state every tick — full atomic save (schemaVersion + .nrns +
-        // flock + 0600). Two historical bugs live here: (1) the loop used to write
-        // export_state(), the node-sync wire format load_state cannot parse, so
-        // watch-time mutations were silently lost on restart; (2) it saved every
-        // 5 ticks, and with slow Docker a tick can take ~10s — a 40-50s loss
-        // window on hard kill. A save costs milliseconds next to a reconcile
-        // tick, so just save every time. Both fixed in v0.4.0-beta.1.
-        {
-            let w = world.read().unwrap();
-            crate::save_state(state_path, &w);
-        }
-
-        std::thread::sleep(Duration::from_secs(interval_secs));
+/// Sleep up to `d`, waking early when a shutdown signal arrives (so SIGTERM
+/// is honoured within ~100 ms, not after a whole reconcile interval).
+fn sleep_unless_shutdown(d: Duration) {
+    let end = Instant::now() + d;
+    while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= end { break; }
+        std::thread::sleep((end - now).min(Duration::from_millis(100)));
     }
 }
 
 /// Global shutdown flag — set by signal handler, checked by reconcile loop
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Check if shutdown was requested
-#[allow(dead_code)]
-pub fn is_shutdown_requested() -> bool {
-    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Public wrapper for installing shutdown handler
-#[allow(dead_code)]
-pub fn install_shutdown_handler_pub() {
-    install_shutdown_handler();
-}
 
 /// Install signal handlers for graceful shutdown
 fn install_shutdown_handler() {
@@ -4613,73 +3675,6 @@ fn install_shutdown_handler() {
         libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
     }
-}
-
-// ─── Leader Lease (best-effort HA) ───────────────────────────────────────
-//
-// A tiny file-based lease. All instances pointed at the same state_path
-// compete for the file {state_path}.leader. One becomes leader and performs
-// reconcile mutations; the rest are standby. If the leader crashes, its
-// lease goes stale after LEASE_TTL and the next tick from any standby
-// claims it. Not a Raft/Paxos replacement — meant for single-host or
-// shared-filesystem setups where "exactly one mutator" is the useful
-// guarantee. Real multi-master HA is planned post-v0.3.
-
-const LEASE_TTL_SECS: u64 = 15;
-
-/// Try to acquire or renew the leader lease.
-/// Returns true iff the caller is the leader after this call.
-pub fn try_acquire_lease(state_path: &str, our_id: &str) -> bool {
-    let lease_path = format!("{state_path}.leader");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_secs();
-
-    // Read existing lease, if any.
-    if let Ok(content) = std::fs::read_to_string(&lease_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-            let leader = v["leader"].as_str().unwrap_or("");
-            let acquired = v["acquired_at"].as_u64().unwrap_or(0);
-            let age = now.saturating_sub(acquired);
-
-            if leader == our_id {
-                // Renew our own lease.
-                return write_lease_atomic(&lease_path, our_id, now);
-            }
-            if age < LEASE_TTL_SECS && !leader.is_empty() {
-                // Fresh lease held by someone else — stand by.
-                return false;
-            }
-            // Stale lease — fall through and take over.
-        }
-    }
-    // File missing, unreadable, or stale → claim it.
-    write_lease_atomic(&lease_path, our_id, now)
-}
-
-/// Explicitly release the lease (used on graceful shutdown).
-pub fn release_lease(state_path: &str, our_id: &str) {
-    let lease_path = format!("{state_path}.leader");
-    if let Ok(content) = std::fs::read_to_string(&lease_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-            if v["leader"].as_str() == Some(our_id) {
-                let _ = std::fs::remove_file(&lease_path);
-            }
-        }
-    }
-}
-
-fn write_lease_atomic(lease_path: &str, our_id: &str, now: u64) -> bool {
-    let tmp = format!("{lease_path}.tmp");
-    let body = serde_json::json!({
-        "leader": our_id,
-        "acquired_at": now,
-        "ttl_secs": LEASE_TTL_SECS,
-    }).to_string();
-    if std::fs::write(&tmp, &body).is_err() {
-        return false;
-    }
-    std::fs::rename(&tmp, lease_path).is_ok()
 }
 
 #[cfg(test)]
@@ -4750,105 +3745,6 @@ mod statefulset_ordering_tests {
     #[test]
     fn zero_desired_creates_nothing() {
         assert_eq!(next_statefulset_ordinal(&set(&[]), &set(&[]), 0), None);
-    }
-}
-
-#[cfg(test)]
-mod lease_tests {
-    use super::*;
-
-    fn tmp(tag: &str) -> String {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        format!("/tmp/rk-lease-{pid}-{nanos}-{tag}")
-    }
-
-    fn cleanup(path: &str) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(format!("{path}.leader"));
-        let _ = std::fs::remove_file(format!("{path}.leader.tmp"));
-    }
-
-    #[test]
-    fn first_acquirer_becomes_leader() {
-        let path = tmp("first");
-        cleanup(&path);
-        assert!(try_acquire_lease(&path, "node-a"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn base64_decodes_standard_and_falls_back() {
-        assert_eq!(super::base64_decode("aGVsbG8=").as_deref(), Some("hello"));
-        assert_eq!(super::base64_decode("cGFzc3dvcmQxMjM=").as_deref(), Some("password123"));
-        assert_eq!(super::base64_decode("").as_deref(), Some(""));
-        // whitespace inside the value is tolerated (kubectl wraps long secrets)
-        assert_eq!(super::base64_decode("aGVs\nbG8=").as_deref(), Some("hello"));
-        // invalid input → None so the caller keeps the raw string
-        assert_eq!(super::base64_decode("not valid!!"), None);
-    }
-
-    #[test]
-    fn holder_can_renew() {
-        let path = tmp("renew");
-        cleanup(&path);
-        assert!(try_acquire_lease(&path, "node-a"));
-        // Same id → renewal
-        assert!(try_acquire_lease(&path, "node-a"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn other_node_becomes_follower() {
-        let path = tmp("follower");
-        cleanup(&path);
-        assert!(try_acquire_lease(&path, "node-a"));
-        // B arrives while A's lease is fresh → B is follower
-        assert!(!try_acquire_lease(&path, "node-b"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn stale_lease_is_taken_over() {
-        let path = tmp("stale");
-        cleanup(&path);
-        // Write a lease held by node-a with acquired_at far in the past.
-        let ancient = 1000u64; // 1970-epoch-adjacent
-        let body = serde_json::json!({
-            "leader": "node-a",
-            "acquired_at": ancient,
-            "ttl_secs": LEASE_TTL_SECS,
-        }).to_string();
-        std::fs::write(format!("{path}.leader"), body).unwrap();
-        // node-b sees the stale lease and takes over
-        assert!(try_acquire_lease(&path, "node-b"));
-        // Now node-b holds the lease — re-check
-        let content = std::fs::read_to_string(format!("{path}.leader")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["leader"].as_str(), Some("node-b"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn release_lease_clears_when_owner() {
-        let path = tmp("release");
-        cleanup(&path);
-        assert!(try_acquire_lease(&path, "node-a"));
-        release_lease(&path, "node-a");
-        assert!(!std::path::Path::new(&format!("{path}.leader")).exists());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn release_lease_noop_when_not_owner() {
-        let path = tmp("release-other");
-        cleanup(&path);
-        assert!(try_acquire_lease(&path, "node-a"));
-        // node-b asks to release — should be ignored (a is still leader)
-        release_lease(&path, "node-b");
-        assert!(std::path::Path::new(&format!("{path}.leader")).exists());
-        cleanup(&path);
     }
 }
 
@@ -4936,6 +3832,7 @@ mod cascade_delete_tests {
             idle_since: None,
             stateful: false,
             owner_ref: owner.map(|s| s.to_string()),
+            restart_nonce: 0,
         }
     }
 
@@ -4971,12 +3868,12 @@ mod cascade_delete_tests {
     fn provisioning_stamps_owner_ref() {
         let mut world = DesiredWorld::new();
         world.operators.insert("pg-op".into(), operator("pg-op", "PostgresCluster"));
-        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
+        world.custom_resources.insert("default/db".into(), custom_resource("db", "PostgresCluster"));
 
         let mut log = Vec::new();
         reconcile_operators(&mut world, &mut log);
 
-        let provisioned = world.deployments.get("db-primary")
+        let provisioned = world.deployments.get("default/db-primary")
             .expect("operator should provision db-primary");
         assert_eq!(provisioned.owner_ref.as_deref(), Some("db"),
             "provisioned deployment must carry the owning CR as its owner ref");
@@ -4985,37 +3882,37 @@ mod cascade_delete_tests {
     #[test]
     fn selection_picks_only_owned_deployments() {
         let mut world = DesiredWorld::new();
-        world.deployments.insert("db-primary".into(), dep("db-primary", Some("db")));
-        world.deployments.insert("db-replica".into(), dep("db-replica", Some("db")));
-        world.deployments.insert("cache-primary".into(), dep("cache-primary", Some("cache")));
-        world.deployments.insert("web".into(), dep("web", None));
+        world.deployments.insert("default/db-primary".into(), dep("db-primary", Some("db")));
+        world.deployments.insert("default/db-replica".into(), dep("db-replica", Some("db")));
+        world.deployments.insert("default/cache-primary".into(), dep("cache-primary", Some("cache")));
+        world.deployments.insert("default/web".into(), dep("web", None));
 
-        let mut owned = deployments_owned_by(&world, "db");
+        let mut owned = deployments_owned_by(&world, "default", "db");
         owned.sort();
-        assert_eq!(owned, vec!["db-primary".to_string(), "db-replica".to_string()]);
+        assert_eq!(owned, vec!["default/db-primary".to_string(), "default/db-replica".to_string()]);
     }
 
     #[test]
     fn deleting_cr_removes_exactly_its_owned_deployments() {
         let mut world = DesiredWorld::new();
-        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
-        world.deployments.insert("db-primary".into(), dep("db-primary", Some("db")));
-        world.deployments.insert("db-replica".into(), dep("db-replica", Some("db")));
-        world.deployments.insert("cache-primary".into(), dep("cache-primary", Some("cache")));
-        world.deployments.insert("web".into(), dep("web", None));
+        world.custom_resources.insert("default/db".into(), custom_resource("db", "PostgresCluster"));
+        world.deployments.insert("default/db-primary".into(), dep("db-primary", Some("db")));
+        world.deployments.insert("default/db-replica".into(), dep("db-replica", Some("db")));
+        world.deployments.insert("default/cache-primary".into(), dep("cache-primary", Some("cache")));
+        world.deployments.insert("default/web".into(), dep("web", None));
 
-        let deleted = world.delete_resource("customresources", "db");
-        assert!(deleted, "CR delete should report success");
+        let deleted = world.delete_resource("customresources", "default", "db");
+        assert!(deleted.is_some(), "CR delete should report success");
 
         // Owned deployments are gone.
-        assert!(!world.deployments.contains_key("db-primary"));
-        assert!(!world.deployments.contains_key("db-replica"));
+        assert!(!world.deployments.contains_key("default/db-primary"));
+        assert!(!world.deployments.contains_key("default/db-replica"));
         // Another CR's deployment and the user-owned one are untouched.
-        assert!(world.deployments.contains_key("cache-primary"));
-        assert!(world.deployments.contains_key("web"));
+        assert!(world.deployments.contains_key("default/cache-primary"));
+        assert!(world.deployments.contains_key("default/web"));
         assert_eq!(world.deployments.len(), 2);
         // CR itself removed.
-        assert!(!world.custom_resources.contains_key("db"));
+        assert!(!world.custom_resources.contains_key("default/db"));
     }
 
     #[test]
@@ -5023,60 +3920,106 @@ mod cascade_delete_tests {
         let mut world = DesiredWorld::new();
         // A CR named "db" exists, and a user deployment happens to be "db"-ish
         // but has no owner ref — it must survive the cascade.
-        world.custom_resources.insert("db".into(), custom_resource("db", "PostgresCluster"));
-        world.deployments.insert("db".into(), dep("db", None));
+        world.custom_resources.insert("default/db".into(), custom_resource("db", "PostgresCluster"));
+        world.deployments.insert("default/db".into(), dep("db", None));
 
-        world.delete_resource("customresources", "db");
+        world.delete_resource("customresources", "default", "db");
 
-        assert!(world.deployments.contains_key("db"),
+        assert!(world.deployments.contains_key("default/db"),
             "a deployment with no owner ref must never be garbage-collected");
     }
 
     #[test]
     fn deleting_missing_cr_touches_nothing() {
         let mut world = DesiredWorld::new();
-        world.deployments.insert("web".into(), dep("web", Some("ghost")));
+        world.deployments.insert("default/web".into(), dep("web", Some("ghost")));
 
-        let deleted = world.delete_resource("customresources", "ghost");
-        assert!(!deleted, "deleting a non-existent CR returns false");
+        let deleted = world.delete_resource("customresources", "default", "ghost");
+        assert!(deleted.is_none(), "deleting a non-existent CR returns None");
         // The CR never existed, so no cascade runs — the orphan stays put.
-        assert!(world.deployments.contains_key("web"));
+        assert!(world.deployments.contains_key("default/web"));
+    }
+
+    fn node(name: &str, addr: &str) -> ClusterNode {
+        ClusterNode {
+            name: name.into(), address: addr.into(),
+            cpu_capacity: 100.0, mem_capacity: 8.0, cpu_used: 0.0, mem_used: 0.0,
+            pod_count: 0, status: NodeStatus::Ready, last_heartbeat: 0,
+            neural_token: vec![], joined_at: 0,
+        }
+    }
+
+    // A verified heartbeat adds the peer to the census with its advertised
+    // address (the scheduler dispatches to that address), refreshes it, and
+    // never registers ourselves as a peer.
+    #[test]
+    fn verified_hello_federates_census_with_address() {
+        let mut local = DesiredWorld::new();
+        local.nodes.insert(local_node_name(), node(&local_node_name(), "192.168.5.1:6443"));
+        let hello = NodeHello { node: "node2-test".into(), address: "192.168.5.3:6443".into(),
+            cpu_used: 1.0, mem_used: 2.0, mem_capacity: 8.0, pod_count: 3 };
+        record_peer(&mut local, &hello);
+        assert_eq!(local.nodes.len(), 2, "census federated to both nodes");
+        let n2 = local.nodes.get("node2-test").expect("node2 present");
+        assert_eq!(n2.address, "192.168.5.3:6443");
+        assert_eq!(n2.pod_count, 3);
+        record_peer(&mut local, &hello);
+        assert_eq!(local.nodes.len(), 2, "re-federation stays at two nodes");
+        let me = NodeHello { node: local_node_name(), address: "1.2.3.4:1".into(),
+            cpu_used: 0.0, mem_used: 0.0, mem_capacity: 0.0, pod_count: 0 };
+        record_peer(&mut local, &me);
+        assert_eq!(local.nodes[&local_node_name()].address, "192.168.5.1:6443", "a peer cannot rewrite our own entry");
+    }
+
+    #[test]
+    fn stale_peer_goes_not_ready() {
+        let mut w = DesiredWorld::new();
+        w.nodes.insert("old-peer".into(), node("old-peer", "10.0.0.9:1"));
+        let log = check_node_health(&mut w);
+        assert_eq!(w.nodes["old-peer"].status, NodeStatus::NotReady, "{log:?}");
+    }
+
+    // Single-node (the demo) must be completely unaffected: with CLUSTER_MODE
+    // off (its default) the reconcile loop always schedules, exactly as before
+    // Raft existed. If this ever flips, single-node deployments stop scaling.
+    #[test]
+    fn single_node_always_schedules() {
+        assert!(crate::raft_node::is_cluster_scheduler(),
+            "single-node must always be the scheduler (no Raft gate)");
     }
 }
 
 // ─── UDP Autodiscovery: nodes find each other on the network ───
 //
-// Protocol:
-//   1. Broadcast UDP packet every 10s on port 9443
-//   2. Packet = JSON: {"service":"royak","node":"name","api":"host:port","token":"base64"}
-//   3. Listener picks up broadcasts from other nodes
-//   4. If new node → HTTP state sync automatically
-//
-// Works on: local network (WiFi, Docker bridge, LAN)
-// No external dependencies. Just UDP.
+// Opt-in (`watch --discover`) and only with a cluster secret. Every
+// DISCOVERY_INTERVAL a node broadcasts {"service":"royak","node","api"} on UDP
+// 9443. A broadcast is only a hint: the listener then sends a SIGNED heartbeat
+// to the announced address, and the peer enters the census only if it answers
+// a signed request (i.e. it holds the cluster secret). Desired state is never
+// exchanged — it lives in Raft.
 
 const DISCOVERY_PORT: u16 = 9443;
 const DISCOVERY_INTERVAL: u64 = 10;
 
 pub fn autodiscovery(
     world: std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
-    brain: &OrinBrain,
     api_port: u16,
 ) {
     use std::net::UdpSocket;
 
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&hostname));
-
-    // Get our IP (best effort — use first non-loopback)
-    let local_ip = get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-    let api_addr = format!("{local_ip}:{api_port}");
-
+    if crate::auth::cluster_secret().is_none() {
+        eprintln!("  ⚠ autodiscovery disabled: ROYAK_CLUSTER_SECRET is required to verify peers");
+        return;
+    }
+    let hostname = local_node_name();
+    let api_addr = {
+        let adv = advertised_address(api_port);
+        if adv.starts_with("127.0.0.1") {
+            format!("{}:{api_port}", get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string()))
+        } else { adv }
+    };
     println!("  ✓ autodiscovery started: {hostname} @ {api_addr}");
 
-    // Bind listener
     let listener = match UdpSocket::bind(format!("0.0.0.0:{DISCOVERY_PORT}")) {
         Ok(s) => {
             s.set_broadcast(true).ok();
@@ -5088,86 +4031,35 @@ pub fn autodiscovery(
             return;
         }
     };
-
-    // Separate socket for broadcasting (can't broadcast and listen on same socket easily)
     let broadcaster = UdpSocket::bind("0.0.0.0:0").ok();
-    if let Some(ref b) = broadcaster {
-        b.set_broadcast(true).ok();
-    }
-
-    let mut known_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    known_nodes.insert(hostname.clone());
+    if let Some(ref b) = broadcaster { b.set_broadcast(true).ok(); }
 
     loop {
-        // Broadcast our presence
         if let Some(ref b) = broadcaster {
-            let announce = serde_json::json!({
-                "service": "royak",
-                "version": "0.1",
-                "node": hostname,
-                "api": api_addr,
-                "token": token_b64,
-            }).to_string();
+            let announce = serde_json::json!({"service": "royak", "node": hostname, "api": api_addr}).to_string();
             b.send_to(announce.as_bytes(), format!("255.255.255.255:{DISCOVERY_PORT}")).ok();
         }
-
-        // Listen for other nodes
         let mut buf = [0u8; 2048];
-        match listener.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                if let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
-                    if msg["service"].as_str() == Some("royak") {
-                        let peer_node = msg["node"].as_str().unwrap_or("?").to_string();
-                        let peer_api = msg["api"].as_str().unwrap_or("").to_string();
-
-                        // Security: verify source IP matches claimed API address
-                        let src_ip = src.ip().to_string();
-                        let claimed_ip = peer_api.split(':').next().unwrap_or("");
-                        let ip_match = src_ip == claimed_ip || claimed_ip == "0.0.0.0";
-
-                        if peer_node != hostname && !known_nodes.contains(&peer_node) && ip_match {
-                            println!("  ✦ discovered: {peer_node} @ {peer_api} (from {src}, verified)");
-                            known_nodes.insert(peer_node.clone());
-
-                            // Auto-join: sync state with the new node
-                            let headers = [("X-Royak-Token", token_b64.as_str())];
-                            match http_get(&format!("http://{peer_api}/royak/v1/state"), &headers) {
-                                Ok(body) => {
-                                    if let Ok(remote) = serde_json::from_str::<serde_json::Value>(&body) {
-                                        let mut w = world.write().unwrap();
-                                        let merged = merge_state(&mut w, &remote);
-                                        if !merged.is_empty() {
-                                            println!("  ✓ auto-synced from {peer_node}: {} items", merged.len());
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("  ⚠ sync from {peer_node}: {e}"),
-                            }
-
-                            // Push our state too
-                            let our_state = {
-                                let w = world.read().unwrap();
-                                export_state(&w).to_string()
-                            };
-                            http_post(&format!("http://{peer_api}/royak/v1/state"), &our_state,
-                                &[("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")]).ok();
-
-                            // Register the peer node locally
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                            let mut w = world.write().unwrap();
-                            w.nodes.entry(peer_node.clone()).or_insert(ClusterNode {
-                                name: peer_node, address: peer_api,
-                                cpu_capacity: 100.0, mem_capacity: 0.0,
-                                cpu_used: 0.0, mem_used: 0.0, pod_count: 0,
-                                status: NodeStatus::Ready, last_heartbeat: now,
-                                neural_token: vec![], joined_at: now,
-                            });
-                        }
-                    }
+        if let Ok((len, src)) = listener.recv_from(&mut buf) {
+            let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) else { continue };
+            if msg["service"].as_str() != Some("royak") { continue; }
+            let peer_node = msg["node"].as_str().unwrap_or("").to_string();
+            let peer_api = msg["api"].as_str().unwrap_or("").to_string();
+            let claimed_ip = peer_api.split(':').next().unwrap_or("");
+            if peer_node.is_empty() || peer_node == hostname || claimed_ip != src.ip().to_string() { continue; }
+            if world.read().unwrap_or_else(|e| e.into_inner()).nodes.contains_key(&peer_node) { continue; }
+            let hello = { local_hello(&world.read().unwrap_or_else(|e| e.into_inner())) };
+            let body = serde_json::to_string(&hello).unwrap_or_default();
+            match node_post(&peer_api, "/royak/v1/heartbeat", &body, Duration::from_secs(3))
+                .and_then(|b| serde_json::from_str::<NodeHello>(&b).map_err(|e| e.to_string())) {
+                Ok(mut peer) if peer.node == peer_node => {
+                    if peer.address.is_empty() { peer.address = peer_api.clone(); }
+                    println!("  ✦ discovered: {peer_node} @ {peer_api} (verified by signed heartbeat)");
+                    record_peer(&mut world.write().unwrap_or_else(|e| e.into_inner()), &peer);
                 }
+                Ok(_) => eprintln!("  ⚠ discovery: {peer_api} answered with a different node name — ignored"),
+                Err(e) => eprintln!("  ⚠ discovery: {peer_node} @ {peer_api} not verified: {e}"),
             }
-            Err(_) => {} // timeout — just loop and broadcast again
         }
     }
 }
@@ -5215,173 +4107,85 @@ pub fn validate_path(path: &str) -> bool {
 
 // ─── Generic Reconciliation via ContainerRuntime trait ───
 
+/// Reconcile for the experimental non-Docker runtimes ("light", "cri").
+///
+/// Local, single-node only: these runtimes cannot list container labels, so
+/// ownership is by exact pod name (`<stem>-<n>` of a deployment that exists in
+/// desired state) — never by a loose `rk-` prefix — and nothing else is ever
+/// stopped or removed. Cluster placement, probes, rollouts and the unified
+/// workload contract are Docker-only.
 fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_name: &str) -> Vec<String> {
+    let (admitted, mut log) = unsupported_runtime_workloads(desired, rt_name);
+    if admitted.is_empty() && !log.is_empty() { return log; }
+    // Even the legacy runtime factory can create directories. Never construct
+    // it for blocked-only work; the test trap is BEFORE that first effect.
+    #[cfg(test)]
+    if let Some(rows) = unsupported_storage_runtime_tests::before_effect(rt_name, &admitted) {
+        log.extend(rows); return log;
+    }
     use crate::runtime::{self, ContainerState};
     let rt = runtime::get_runtime(rt_name);
-    let mut log = Vec::new();
-
+    if crate::raft_node::is_clustered() {
+        log.push(format!("  [error] runtime {rt_name} is single-node only; cluster mode requires the docker runtime"));
+        return log;
+    }
     if !rt.ping() {
         log.push(format!("  [error] {} runtime not available", rt.name()));
         return log;
     }
-
     rt.ensure_network().ok();
-
-    // Get actual containers from runtime
     let actual = match rt.list(true) {
         Ok(cs) => cs,
         Err(e) => { log.push(format!("  [error] {}: {e}", rt.name())); return log; }
     };
-
-    let managed: Vec<&runtime::Container> = actual.iter()
-        .filter(|c| c.name.contains("rk-"))
-        .collect();
-
-    // Reflect THIS node's real pod count so pick_node penalises us correctly.
-    // Without it our pod_count stays 0, we always win our own scheduling, and
-    // nothing ever routes to a peer.
+    let owned_by = |c: &runtime::Container, stem: &str| -> bool {
+        c.name.strip_prefix(stem).and_then(|r| r.strip_prefix('-')).map(|n| !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit())).unwrap_or(false)
+    };
     let me_name = local_node_name();
-    let local_pods = managed.iter().filter(|c| c.state == ContainerState::Running).count() as u32;
-    if let Some(n) = desired.nodes.get_mut(&me_name) { n.pod_count = local_pods; }
-
-    // Cluster-wide pod census: ask each READY peer for its running pods, so a
-    // deployment's replicas are counted across ALL nodes (not just local) and
-    // pod names stay globally unique. NotReady peers are skipped (unreachable →
-    // would stall under the world lock); they re-count once they heartbeat back.
-    let mut remote_pods: Vec<String> = Vec::new();
-    let mut peer_pod_pairs: Vec<(String, String)> = Vec::new();
-    let peer_addrs: Vec<String> = desired.nodes.iter()
-        .filter(|(n, node)| **n != me_name && node.status == crate::reconcile::NodeStatus::Ready)
-        .map(|(_, node)| node.address.clone())
-        .collect();
-    for addr in &peer_addrs {
-        match http_get(&format!("http://{addr}/royak/v1/pods"), &[]) {
-            Ok(body) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(arr) = v["pods"].as_array() {
-                        for p in arr.iter().filter_map(|p| p.as_str()) {
-                            remote_pods.push(p.to_string());
-                            peer_pod_pairs.push((addr.clone(), p.to_string()));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                // Unreachable peer: demote to NotReady so we STOP probing it under
-                // the world write-lock every tick. `http_get` is now connect-bounded
-                // (2s), but even 2s/tick of a dead peer stalls the ingress — so we
-                // drop it from the Ready set after ONE failed probe. It re-counts the
-                // moment it heartbeats back (check_node_health / heartbeat → Ready).
-                if let Some((name, node)) = desired.nodes.iter_mut()
-                    .find(|(_, nd)| nd.address == *addr)
-                {
-                    if node.status == crate::reconcile::NodeStatus::Ready {
-                        node.status = crate::reconcile::NodeStatus::NotReady;
-                        log.push(format!("  ⚠ [census] peer {name} unreachable ({e}) — marked NotReady"));
-                    }
-                }
-            }
-        }
-    }
-    // Publish the peer census to the ingress so it can round-robin onto pods
-    // that live on other nodes (reached via that node's mesh proxy).
-    crate::api::set_peer_pods(peer_pod_pairs.clone());
-
-    for (name, dep) in &desired.deployments {
-        let prefix = format!("rk-{name}-");
-        let running: Vec<&&runtime::Container> = managed.iter()
-            .filter(|c| c.name.starts_with(&prefix) && c.state == ContainerState::Running)
-            .collect();
-        let remote_running = remote_pods.iter().filter(|p| p.starts_with(&prefix)).count() as u32;
-
-        let current = running.len() as u32 + remote_running;
-        let target = dep.replicas;
-
+    let mut local_pods = 0u32;
+    for key in admitted {
+        let dep = desired.deployments[&key].clone();
+        let stem = crate::store::pod_stem(&dep.namespace, &dep.name);
+        let running: Vec<&runtime::Container> = actual.iter()
+            .filter(|c| owned_by(c, &stem) && c.state == ContainerState::Running).collect();
+        local_pods += running.len() as u32;
+        let (current, target) = (running.len() as u32, dep.replicas);
         if current < target {
-            let to_create = target - current;
-            log.push(format!("  [scale] {name}: {current} → {target} (+{to_create}) [{} local + {remote_running} remote]", running.len()));
-            let image = &dep.containers.first().map(|c| c.image.as_str()).unwrap_or(&dep.image);
-
-            if let Err(e) = rt.pull(image) {
-                log.push(format!("    [warn] pull {image}: {e}"));
-            }
-
-            // Reserve globally-unique names across local AND remote pods.
-            let mut taken: Vec<String> = managed.iter().map(|c| c.name.clone()).collect();
-            taken.extend(remote_pods.iter().cloned());
-
-            // Per-deployment load balancer: place each new pod on the node running
-            // the FEWEST of THIS deployment's pods (self + ready peers), tracking a
-            // running tally so a batch spreads evenly instead of all landing on one.
-            // (addr, is_local, count-of-this-deployment's-pods)
-            let mut node_load: Vec<(String, bool, u32)> = Vec::new();
-            node_load.push((String::new(), true, running.len() as u32));
-            for (n, node) in desired.nodes.iter() {
-                if *n != me_name && node.status == NodeStatus::Ready
-                    && !node.address.is_empty() && !node.address.starts_with("127.0.0.1") {
-                    let cnt = peer_pod_pairs.iter()
-                        .filter(|(a, p)| a == &node.address && p.starts_with(&prefix)).count() as u32;
-                    node_load.push((node.address.clone(), false, cnt));
-                }
-            }
-
-            for _ in 0..to_create {
+            log.push(format!("  [scale] {key}: {current} → {target} (+{})", target - current));
+            let image = dep.containers.first().map(|c| c.image.clone()).unwrap_or_else(|| dep.image.clone());
+            if let Err(e) = rt.pull(&image) { log.push(format!("    [warn] pull {image}: {e}")); }
+            let mut taken: Vec<String> = actual.iter().map(|c| c.name.clone()).collect();
+            for _ in current..target {
                 let mut idx = 1u32;
                 let pod_name = loop {
-                    let cand = format!("rk-{name}-{idx}");
-                    if !taken.iter().any(|n| n == &cand) { break cand; }
+                    let cand = format!("{stem}-{idx}");
+                    if !taken.contains(&cand) { break cand; }
                     idx += 1;
                 };
                 taken.push(pod_name.clone());
-
-                // Pick the least-loaded node for this pod, then bump its tally.
-                let pick = node_load.iter().enumerate()
-                    .min_by_key(|(_, (_, _, c))| *c).map(|(i, _)| i).unwrap_or(0);
-                node_load[pick].2 += 1;
-                let (addr, is_local, _) = node_load[pick].clone();
-
-                if !is_local {
-                    // Route to the peer's /royak/v1/create-pod (runs it on its Docker).
-                    let url = format!("http://{addr}/royak/v1/create-pod");
-                    let body = serde_json::json!({
-                        "pod": pod_name, "deployment": name.as_str(),
-                        "image": *image, "replicas": 1
-                    }).to_string();
-                    log.push(format!("    [multi-node] {pod_name} → {addr}"));
-                    let (pn, ad) = (pod_name.clone(), addr.clone());
-                    std::thread::spawn(move || {
-                        if let Err(e) = http_post(&url, &body, &[("Content-Type", "application/json")]) {
-                            eprintln!("  ⚠ [multi-node] {pn} → {ad} create-pod failed: {e}");
-                        }
-                    });
-                    continue; // routed to a peer — skip local create
-                }
-
-                let labels = [("app", name.as_str()), ("managed-by", "royak")];
-                let cmd_opt: Option<&[&str]> = None;
-                match rt.create(&pod_name, image, cmd_opt, &dep.env, &labels) {
-                    Ok(id) => {
-                        if let Err(e) = rt.start(&id) {
-                            log.push(format!("    [error] start {pod_name}: {e}"));
-                        } else {
+                let labels = [(crate::store::LABEL_MANAGED, "true"), (crate::store::LABEL_NAMESPACE, dep.namespace.as_str()), (crate::store::LABEL_DEPLOYMENT, dep.name.as_str())];
+                let env = dep.containers.first().map(|c| c.env.clone()).unwrap_or_default();
+                match rt.create(&pod_name, &image, None, &env, &labels) {
+                    Ok(id) => match rt.start(&id) {
+                        Ok(()) => {
                             log.push(format!("    [create] {pod_name} ✓"));
-                            rt.connect_network(&id, &[pod_name.as_str(), name.as_str()]).ok();
+                            rt.connect_network(&id, &[pod_name.as_str()]).ok();
                         }
-                    }
+                        Err(e) => log.push(format!("    [error] start {pod_name}: {e}")),
+                    },
                     Err(e) => log.push(format!("    [error] create {pod_name}: {e}")),
                 }
             }
         } else if current > target {
-            let to_remove = current - target;
-            log.push(format!("  [scale] {name}: {current} → {target} (-{to_remove})"));
-            for c in running.iter().rev().take(to_remove as usize) {
+            log.push(format!("  [scale] {key}: {current} → {target} (-{})", current - target));
+            for c in running.iter().rev().take((current - target) as usize) {
                 rt.stop(&c.id).ok();
                 rt.remove(&c.id, true).ok();
                 log.push(format!("    [remove] {} ✓", c.name));
             }
         }
     }
-
+    if let Some(n) = desired.nodes.get_mut(&me_name) { n.pod_count = local_pods; }
     log
 }
 
@@ -5399,24 +4203,27 @@ fn normalize_image(image: &str) -> String {
     }
 }
 
-fn check_probe(container_id: &str, probe: &StoredProbe) -> bool {
-    if let Some((path, port)) = &probe.http_get {
-        // HTTP GET probe
-        match docker::http_check_container(container_id, path, *port) {
-            Ok(healthy) => return healthy,
-            Err(_) => return false,
-        }
-    }
-    if let Some(cmd) = &probe.exec {
-        // Exec probe
+/// Run one probe. Only a handler that actually ran and passed counts as
+/// healthy: errors, timeouts, missing tools and handler-less probes all fail.
+fn check_probe(container_id: &str, probe: &StoredProbe) -> Option<bool> {
+    let timeout = std::time::Duration::from_secs(probe.timeout_seconds.max(1));
+    let result = if let Some((path, port)) = &probe.http_get {
+        docker::http_check_container(container_id, path, *port, timeout)
+    } else if let Some(port) = probe.tcp_socket {
+        docker::tcp_check_container(container_id, port, timeout)
+    } else if let Some(cmd) = &probe.exec {
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        match docker::exec_in_container(container_id, &cmd_refs) {
-            Ok((exit_code, _)) => return exit_code == 0,
-            Err(_) => return false,
+        docker::probe_exec(container_id, &cmd_refs, timeout).map(|code| code == 0)
+    } else {
+        Err("probe has no handler".to_string())
+    };
+    match result {
+        Ok(healthy) => Some(healthy),
+        Err(e) => {
+            eprintln!("  [probe] {container_id}: {e}");
+            if docker::exec_admission_unknown(&e) { None } else { Some(false) }
         }
     }
-    // No probe configured = healthy
-    true
 }
 
 // ─── Multi-Node Cluster ───
@@ -5427,6 +4234,9 @@ fn check_probe(container_id: &str, probe: &StoredProbe) -> bool {
 /// metric update, or heartbeats won't match by name and every node flaps to
 /// NotReady after 30s (which disables multi-node scheduling entirely).
 pub fn local_node_name() -> String {
+    if let Ok(n) = std::env::var("ROYAK_NODE_NAME") {
+        if !n.trim().is_empty() { return n.trim().to_string(); }
+    }
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .ok()
@@ -5479,53 +4289,163 @@ pub fn register_local_node(world: &mut DesiredWorld, brain: &OrinBrain, api_port
     });
 }
 
-/// Join a remote node to the cluster with REAL networking
-pub fn join_cluster(world: &mut DesiredWorld, brain: &OrinBrain, peer_address: &str, local_port: u16) -> Result<String, String> {
-    let hostname = local_node_name();
+// ─── Cluster census (signed node-to-node) ──────────────────────────────────
+//
+// Nodes find each other through the static `--peers` list (and, opt-in, UDP
+// autodiscovery) and then talk ONLY through HMAC-signed requests
+// (`auth::node_headers` / `auth::verify_node`). Two exchanges, every
+// CENSUS_INTERVAL:
+//   * POST /royak/v1/heartbeat  — "I am <node> at <address>", answered with the
+//     peer's own hello. Keeps `world.nodes` (runtime census, never replicated
+//     state) fresh.
+//   * GET  /royak/v1/pods       — the peer's pods as `placement::PodView`s,
+//     stored in the placement census the scheduler counts from.
+// Desired state is never exchanged here: it travels only through Raft.
 
-    let our_token = brain.neural_identity(&hostname);
-    let token_b64 = OrinBrain::identity_base64(&our_token);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_secs();
+const CENSUS_INTERVAL: Duration = Duration::from_secs(2);
+/// A peer not heard from for this long is NotReady (no new placements; its
+/// census report is dropped so its pods are re-created elsewhere).
+pub const NODE_TIMEOUT_SECS: u64 = 20;
 
-    // 1. Register ourselves locally
-    world.nodes.insert(hostname.clone(), ClusterNode {
-        name: hostname.clone(),
-        address: advertised_address(local_port),
-        cpu_capacity: 100.0,
-        mem_capacity: get_system_mem(),
+/// What a node says about itself on every heartbeat.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NodeHello {
+    pub node: String,
+    pub address: String,
+    #[serde(default)]
+    pub cpu_used: f32,
+    #[serde(default)]
+    pub mem_used: f32,
+    #[serde(default)]
+    pub mem_capacity: f32,
+    #[serde(default)]
+    pub pod_count: u32,
+}
+
+pub fn local_hello(world: &DesiredWorld) -> NodeHello {
+    let me = local_node_name();
+    let n = world.nodes.get(&me);
+    NodeHello {
+        node: me,
+        address: n.map(|n| n.address.clone()).unwrap_or_default(),
+        cpu_used: n.map(|n| n.cpu_used).unwrap_or(0.0),
+        mem_used: n.map(|n| n.mem_used).unwrap_or(0.0),
+        mem_capacity: n.map(|n| n.mem_capacity).unwrap_or(0.0),
+        pod_count: n.map(|n| n.pod_count).unwrap_or(0),
+    }
+}
+
+/// Record a verified peer in the census (it just proved cluster membership).
+pub fn record_peer(world: &mut DesiredWorld, hello: &NodeHello) {
+    if hello.node == local_node_name() || hello.node.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let n = world.nodes.entry(hello.node.clone()).or_insert_with(|| ClusterNode {
+        name: hello.node.clone(), address: hello.address.clone(),
+        cpu_capacity: 100.0, mem_capacity: hello.mem_capacity,
         cpu_used: 0.0, mem_used: 0.0, pod_count: 0,
-        status: NodeStatus::Ready,
-        last_heartbeat: now,
-        neural_token: our_token,
-        joined_at: now,
+        status: NodeStatus::Ready, last_heartbeat: now,
+        neural_token: vec![], joined_at: now,
     });
+    if !hello.address.is_empty() { n.address = hello.address.clone(); }
+    n.cpu_used = hello.cpu_used;
+    n.mem_used = hello.mem_used;
+    n.mem_capacity = hello.mem_capacity;
+    n.pod_count = hello.pod_count;
+    n.last_heartbeat = now;
+    if n.status == NodeStatus::NotReady { n.status = NodeStatus::Ready; }
+}
 
-    // 2. Fetch peer's state via HTTP
-    let headers = [("X-Royak-Token", token_b64.as_str())];
-    match http_get(&format!("http://{peer_address}/royak/v1/state"), &headers) {
-        Ok(body) => {
-            if let Ok(remote) = serde_json::from_str::<serde_json::Value>(&body) {
-                let merged = merge_state(world, &remote);
-                eprintln!("  ✓ state synced from peer: {} items merged", merged.len());
+/// Background census: heartbeat every known peer and pull its pod list. All
+/// network I/O happens without the world lock.
+pub fn spawn_cluster_census(world: std::sync::Arc<std::sync::RwLock<DesiredWorld>>, seed_peers: Vec<String>) {
+    crate::placement::set_expected_peers(&seed_peers);
+    std::thread::spawn(move || loop {
+        let me = local_node_name();
+        let (hello, mut targets) = {
+            let w = world.read().unwrap_or_else(|e| e.into_inner());
+            let targets: Vec<String> = w.nodes.iter()
+                .filter(|(n, node)| **n != me && !node.address.is_empty())
+                .map(|(_, node)| node.address.clone()).collect();
+            (local_hello(&w), targets)
+        };
+        for p in &seed_peers {
+            if !targets.contains(p) { targets.push(p.clone()); }
+        }
+        let body = serde_json::to_string(&hello).unwrap_or_default();
+        for addr in targets {
+            let peer = match node_post(&addr, "/royak/v1/heartbeat", &body, Duration::from_secs(3))
+                .and_then(|b| serde_json::from_str::<NodeHello>(&b).map_err(|e| format!("bad hello: {e}"))) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if peer.node == me { continue; }
+            {
+                let mut w = world.write().unwrap_or_else(|e| e.into_inner());
+                let mut peer = peer.clone();
+                if peer.address.is_empty() { peer.address = addr.clone(); }
+                record_peer(&mut w, &peer);
+            }
+            if let Ok(b) = node_get(&addr, "/royak/v1/pods", Duration::from_secs(5)) {
+                if let Ok(pods) = serde_json::from_str::<Vec<crate::placement::PodView>>(&b) {
+                    crate::placement::set_peer_report(&peer.node, &addr, pods);
+                }
             }
         }
-        Err(e) => eprintln!("  ⚠ could not fetch peer state: {e} (peer may not be running API)"),
-    }
+        {
+            let mut w = world.write().unwrap_or_else(|e| e.into_inner());
+            for line in check_node_health(&mut w) { println!("{line}"); }
+            for (name, node) in w.nodes.iter() {
+                if node.status != NodeStatus::Ready { crate::placement::drop_peer_report(name); }
+            }
+        }
+        std::thread::sleep(CENSUS_INTERVAL);
+    });
+}
 
-    // 3. Push our state to the peer
-    let our_state = export_state(world);
-    match http_post(
-        &format!("http://{peer_address}/royak/v1/state"),
-        &our_state.to_string(),
-        &[("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")],
-    ) {
-        Ok(_) => eprintln!("  ✓ our state pushed to peer"),
-        Err(e) => eprintln!("  ⚠ could not push state to peer: {e}"),
+/// CLI helper: every peer's pods as `(node, pod)` via signed `GET /royak/v1/pods`.
+/// Needs the cluster secret; without it peers are skipped.
+pub fn peer_pod_inventory(world: &DesiredWorld) -> Vec<(String, String)> {
+    let me = local_node_name();
+    let mut out = Vec::new();
+    for (nname, node) in &world.nodes {
+        if *nname == me || node.address.is_empty() { continue; }
+        if let Ok(b) = node_get(&node.address, "/royak/v1/pods", Duration::from_secs(5)) {
+            if let Ok(pods) = serde_json::from_str::<Vec<crate::placement::PodView>>(&b) {
+                out.extend(pods.into_iter().map(|p| (nname.clone(), p.pod)));
+            }
+        }
     }
+    out
+}
 
-    Ok(format!("{hostname} joined cluster via {peer_address} ({} nodes)", world.nodes.len()))
+/// CLI helper: which peer runs `pod_name`? `(node, address)`, or None.
+pub fn find_pod_node(world: &DesiredWorld, pod_name: &str) -> Option<(String, String, String)> {
+    let me = local_node_name();
+    let want = pod_name.trim_start_matches('/');
+    for (nname, node) in &world.nodes {
+        if *nname == me || node.address.is_empty() { continue; }
+        if let Ok(b) = node_get(&node.address, "/royak/v1/pods", Duration::from_secs(5)) {
+            if let Ok(pods) = serde_json::from_str::<Vec<crate::placement::PodView>>(&b) {
+                if let Some(p) = pods.into_iter().find(|p| p.pod == want) {
+                    return Some((nname.clone(), node.address.clone(), p.namespace));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Trusted local node operator (already has the private state/cluster key).
+/// HTTP users never call this helper: their verified identity is forwarded.
+pub fn fetch_remote_logs(world:&DesiredWorld,peer_addr:&str,ns:&str,pod_name:&str)->Result<String,String>{
+    let namespace_uid=world.storage_identities.namespaces.get(ns).cloned().ok_or("namespace identity missing")?;
+    let request=crate::pod_access::LogRequest{namespace:ns.into(),namespace_uid,pod:pod_name.into(),container:None,tail:200,
+        user:format!("node-operator:{}",crate::store::node_name()),groups:vec![crate::auth::MASTERS_GROUP.into()]};
+    let raw=node_post(peer_addr,"/royak/v2/pod-logs",&serde_json::to_string(&request).map_err(|e|e.to_string())?,Duration::from_secs(15))?;
+    let (status,body):(u16,String)=serde_json::from_str(&raw).map_err(|_|"invalid caller-bound log response")?;
+    if status==200 {Ok(body)}else{Err(format!("peer logs HTTP {status}: {body}"))}
 }
 
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).
@@ -5559,86 +4479,8 @@ fn base64_decode(s: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-// ─── HTTP Client (raw TCP, same philosophy as docker.rs) ───
-
-/// Connect with a bounded timeout. `std::net::TcpStream::connect` has NO connect
-/// timeout — a dead peer (silently-dropped SYNs, e.g. a powered-off cloud VM)
-/// blocks the caller for the OS SYN timeout (~10-20s). Every peer HTTP call here
-/// runs inside the reconcile tick, under the world write-lock, so an unbounded
-/// connect freezes the whole reconcile + ingress (the survivor node goes dark
-/// while its dead peer is probed). Bound it hard.
-fn connect_with_timeout(addr: &str, timeout: std::time::Duration) -> Result<std::net::TcpStream, String> {
-    use std::net::ToSocketAddrs;
-    let mut last = format!("no address for {addr}");
-    for sa in addr.to_socket_addrs().map_err(|e| format!("resolve {addr}: {e}"))? {
-        match std::net::TcpStream::connect_timeout(&sa, timeout) {
-            Ok(s) => return Ok(s),
-            Err(e) => last = format!("connect {addr}: {e}"),
-        }
-    }
-    Err(last)
-}
-
-fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<String, String> {
-    let (host, port, path) = parse_url(url)?;
-    let addr = format!("{host}:{port}");
-    let mut stream = connect_with_timeout(&addr, std::time::Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
-
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
-    for (k, v) in headers { req.push_str(&format!("{k}: {v}\r\n")); }
-    req.push_str("\r\n");
-
-    use std::io::{Write, Read};
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf).map_err(|e| format!("read: {e}"))?;
-
-    // Extract body after \r\n\r\n
-    buf.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .ok_or_else(|| "no HTTP body".to_string())
-}
-
-fn http_post(url: &str, body: &str, headers: &[(&str, &str)]) -> Result<String, String> {
-    let (host, port, path) = parse_url(url)?;
-    let addr = format!("{host}:{port}");
-    let mut stream = connect_with_timeout(&addr, std::time::Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
-
-    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
-    for (k, v) in headers { req.push_str(&format!("{k}: {v}\r\n")); }
-    req.push_str("\r\n");
-    req.push_str(body);
-
-    use std::io::{Write, Read};
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf).map_err(|e| format!("read: {e}"))?;
-
-    buf.split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .ok_or_else(|| "no HTTP body".to_string())
-}
-
-fn parse_url(url: &str) -> Result<(String, u16, String), String> {
-    let stripped = url.strip_prefix("http://").unwrap_or(url);
-    let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, ""));
-    let path = format!("/{path}");
-    let (host, port) = if host_port.contains(':') {
-        let (h, p) = host_port.split_once(':').unwrap();
-        (h.to_string(), p.parse::<u16>().map_err(|e| format!("bad port: {e}"))?)
-    } else {
-        (host_port.to_string(), 80)
-    };
-    Ok((host, port, path))
-}
-
 // ─── State Export / Import / Merge ───
 
-/// Export DesiredWorld as JSON for inter-node sync
 /// Base directory for Royak-managed volume data (projected ConfigMaps/
 /// Secrets, StatefulSet per-ordinal storage). Must be a path the container
 /// runtime can bind-mount with the SAME content the royak process wrote —
@@ -5649,182 +4491,6 @@ pub fn royak_data_dir() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         format!("{home}/.royak")
     })
-}
-
-pub fn export_state(world: &DesiredWorld) -> serde_json::Value {
-    serde_json::json!({
-        "nodes": world.nodes.iter().map(|(k, n)| (k.clone(), serde_json::json!({
-            "name": n.name, "address": n.address,
-            "cpuCapacity": n.cpu_capacity, "memCapacity": n.mem_capacity,
-            "cpuUsed": n.cpu_used, "memUsed": n.mem_used,
-            "podCount": n.pod_count, "joinedAt": n.joined_at,
-            "status": match n.status { NodeStatus::Ready => "Ready", NodeStatus::NotReady => "NotReady", NodeStatus::Draining => "Draining" }
-        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "deployments": world.deployments.iter().map(|(k, d)| (k.clone(), serde_json::json!({
-            "name": d.name, "namespace": d.namespace, "replicas": d.replicas,
-            "image": d.image, "paused": d.paused, "ownerRef": d.owner_ref,
-            "containers": d.containers.iter().map(|c| serde_json::json!({"name": c.name, "image": c.image, "env": c.env})).collect::<Vec<_>>()
-        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "configmaps": world.configmaps.iter().map(|(k, c)| (k.clone(), serde_json::json!({
-            "name": c.name, "namespace": c.namespace, "data": c.data
-        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "secrets": world.secrets.iter().map(|(k, s)| (k.clone(), serde_json::json!({
-            "name": s.name, "namespace": s.namespace, "data": s.data
-        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "ingresses": world.ingresses.iter().map(|(k, i)| (k.clone(), serde_json::json!({
-            "name": i.name, "namespace": i.namespace,
-            "rules": i.rules.iter().map(|r| serde_json::json!({"host": r.host})).collect::<Vec<_>>()
-        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "namespaces": world.namespaces,
-        "pipelines": world.pipelines.keys().collect::<Vec<_>>(),
-        "functions": world.functions.keys().collect::<Vec<_>>(),
-    })
-}
-
-/// Merge remote state into local — union-based, no master
-pub fn merge_state(local: &mut DesiredWorld, remote: &serde_json::Value) -> Vec<String> {
-    let mut log = Vec::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    // Merge nodes
-    if let Some(nodes) = remote.get("nodes").and_then(|n| n.as_object()) {
-        for (name, val) in nodes {
-            if !local.nodes.contains_key(name) {
-                local.nodes.insert(name.clone(), ClusterNode {
-                    name: val["name"].as_str().unwrap_or(name).to_string(),
-                    address: val["address"].as_str().unwrap_or("").to_string(),
-                    cpu_capacity: val["cpuCapacity"].as_f64().unwrap_or(100.0) as f32,
-                    mem_capacity: val["memCapacity"].as_f64().unwrap_or(0.0) as f32,
-                    cpu_used: val["cpuUsed"].as_f64().unwrap_or(0.0) as f32,
-                    mem_used: val["memUsed"].as_f64().unwrap_or(0.0) as f32,
-                    pod_count: val["podCount"].as_u64().unwrap_or(0) as u32,
-                    status: NodeStatus::Ready,
-                    last_heartbeat: now,
-                    neural_token: vec![],
-                    joined_at: val["joinedAt"].as_u64().unwrap_or(now),
-                });
-                log.push(format!("node/{name} added"));
-            } else {
-                // Update heartbeat for known nodes
-                if let Some(node) = local.nodes.get_mut(name) {
-                    node.last_heartbeat = now;
-                    node.cpu_used = val["cpuUsed"].as_f64().unwrap_or(node.cpu_used as f64) as f32;
-                    node.mem_used = val["memUsed"].as_f64().unwrap_or(node.mem_used as f64) as f32;
-                    node.pod_count = val["podCount"].as_u64().unwrap_or(node.pod_count as u64) as u32;
-                }
-            }
-        }
-    }
-
-    // Merge namespaces (union)
-    if let Some(nss) = remote.get("namespaces").and_then(|n| n.as_array()) {
-        for ns in nss {
-            if let Some(s) = ns.as_str() {
-                if !local.namespaces.contains(&s.to_string()) {
-                    local.namespaces.push(s.to_string());
-                    log.push(format!("namespace/{s} added"));
-                }
-            }
-        }
-    }
-
-    // Merge deployments (union — create locally if missing)
-    if let Some(deps) = remote.get("deployments").and_then(|d| d.as_object()) {
-        for (name, val) in deps {
-            if !local.deployments.contains_key(name) {
-                let containers: Vec<StoredContainer> = val.get("containers")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| arr.iter().map(|c| StoredContainer {
-                        name: c["name"].as_str().unwrap_or("main").to_string(),
-                        image: c["image"].as_str().unwrap_or("").to_string(),
-                        command: None, env: Vec::new(), volumes: Vec::new(),
-                        env_from_configmaps: vec![], env_from_secrets: vec![],
-                        liveness_probe: None, readiness_probe: None, startup_probe: None,
-                    }).collect())
-                    .unwrap_or_default();
-                let image = containers.first().map(|c| c.image.clone()).unwrap_or_default();
-                local.deployments.insert(name.clone(), StoredDeployment {
-                    name: val["name"].as_str().unwrap_or(name).to_string(),
-                    namespace: val["namespace"].as_str().unwrap_or("default").to_string(),
-                    replicas: val["replicas"].as_u64().unwrap_or(1) as u32,
-                    image, previous_image: None, command: None, env: Vec::new(),
-                    init_containers: Vec::new(), containers,
-                    resource_limits: None,
-                    strategy: None,
-                    pause_after_idle: None, paused: false, idle_since: None, stateful: false,
-                    owner_ref: val["ownerRef"].as_str().map(|s| s.to_string()),
-                });
-                log.push(format!("deployment/{name} synced from peer"));
-            }
-        }
-    }
-
-    // Merge configmaps (union — don't overwrite local secrets)
-    if let Some(cms) = remote.get("configmaps").and_then(|c| c.as_object()) {
-        for (name, val) in cms {
-            if !local.configmaps.contains_key(name) {
-                let data: std::collections::HashMap<String, String> = val.get("data")
-                    .and_then(|d| d.as_object())
-                    .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
-                    .unwrap_or_default();
-                local.configmaps.insert(name.clone(), StoredConfigMap {
-                    name: val["name"].as_str().unwrap_or(name).to_string(),
-                    namespace: val["namespace"].as_str().unwrap_or("default").to_string(),
-                    data,
-                });
-                log.push(format!("configmap/{name} synced from peer"));
-            }
-        }
-    }
-
-    log
-}
-
-/// Send heartbeat to all peer nodes
-pub fn send_heartbeats(world: &mut DesiredWorld, brain: &OrinBrain) {
-    let local_hostname = local_node_name();
-    let token_b64 = OrinBrain::identity_base64(&brain.neural_identity(&local_hostname));
-
-    // Collect peer addresses (skip ourselves)
-    let peers: Vec<(String, String)> = world.nodes.iter()
-        .filter(|(name, _)| **name != local_hostname)
-        .map(|(name, n)| (name.clone(), n.address.clone()))
-        .collect();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    // Get our own stats
-    let local = world.nodes.get(&local_hostname);
-    let cpu = local.map(|n| n.cpu_used).unwrap_or(0.0);
-    let mem = local.map(|n| n.mem_used).unwrap_or(0.0);
-    let pods = local.map(|n| n.pod_count).unwrap_or(0);
-
-    let body = serde_json::json!({
-        "node": local_hostname,
-        "cpu_used": cpu, "mem_used": mem, "pod_count": pods,
-        "timestamp": now
-    }).to_string();
-
-    for (name, addr) in &peers {
-        match http_post(
-            &format!("http://{addr}/royak/v1/heartbeat"),
-            &body,
-            &[("X-Royak-Token", token_b64.as_str()), ("Content-Type", "application/json")],
-        ) {
-            Ok(_) => {
-                if let Some(node) = world.nodes.get_mut(name) {
-                    node.last_heartbeat = now;
-                    // A successful POST means we reached the peer's API → it is
-                    // alive and serving. Promote it (check_node_health only
-                    // demotes; a fresh heartbeat alone never restores Ready).
-                    node.status = NodeStatus::Ready;
-                }
-            }
-            Err(_) => {} // check_node_health will handle stale nodes
-        }
-    }
 }
 
 /// Heartbeat check — mark nodes with stale heartbeat as NotReady
@@ -5841,26 +4507,14 @@ pub fn check_node_health(world: &mut DesiredWorld) -> Vec<String> {
     for (name, node) in world.nodes.iter_mut() {
         if *name == me { continue; }
         let age = now.saturating_sub(node.last_heartbeat);
-        // 90s, not 30s: heartbeats go every 3 ticks and a docker-bound tick can
-        // run ~10s, so 30s sat right on the edge and flapped a healthy peer.
-        if age > 90 && node.status == NodeStatus::Ready {
+        // Heartbeats run every CENSUS_INTERVAL on their own thread (never
+        // behind a reconcile tick), so NODE_TIMEOUT_SECS is many missed beats.
+        if age > NODE_TIMEOUT_SECS && node.status == NodeStatus::Ready {
             node.status = NodeStatus::NotReady;
             log.push(format!("  ⚠ [node] {name}: no heartbeat for {age}s — marked NotReady"));
         }
     }
     log
-}
-
-/// Pick the best node for a new pod (neural scheduling)
-pub fn pick_node(world: &DesiredWorld) -> Option<String> {
-    world.nodes.values()
-        .filter(|n| n.status == NodeStatus::Ready)
-        .max_by(|a, b| {
-            let score_a = (a.cpu_capacity - a.cpu_used) * 0.5 + (a.mem_capacity - a.mem_used) * 0.001 - a.pod_count as f32 * 5.0;
-            let score_b = (b.cpu_capacity - b.cpu_used) * 0.5 + (b.mem_capacity - b.mem_used) * 0.001 - b.pod_count as f32 * 5.0;
-            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|n| n.name.clone())
 }
 
 /// Invoke a function (start container if cold, exec if hot)
@@ -5900,8 +4554,14 @@ pub fn invoke_function(desired: &mut DesiredWorld, name: &str) -> Result<String,
             }
         }
         FunctionState::Cold | FunctionState::Paused => {
-            // Cold start — create and run container
-            docker::pull_image(&image).ok();
+            // Cold start — create and run container. Invocation runs under
+            // the desired-state lock, so a missing image is pulled in the
+            // background and the caller retries.
+            match docker::ensure_image_nonblocking(&image) {
+                docker::ImageState::Present => {}
+                docker::ImageState::Pulling => return Err(format!("image {image} is being pulled; retry the invocation shortly")),
+                docker::ImageState::Failed(e) => return Err(format!("image {image} unavailable: {e}")),
+            }
 
             let cmd_refs: Vec<&str> = cmd.as_ref()
                 .map(|c| c.iter().map(|s| s.as_str()).collect())
@@ -6005,3 +4665,565 @@ fn get_system_mem() -> f32 {
             .unwrap_or(8192.0)
     }
 }
+
+#[cfg(test)]
+mod storage_binding_tests {
+    use super::*;
+
+    fn apply(w: &mut DesiredWorld, kind: &str, ns: &str, name: &str, spec: serde_json::Value) -> Result<String, String> {
+        let r: Resource = serde_json::from_value(serde_json::json!({
+            "kind": kind, "metadata": {"name": name, "namespace": ns}, "spec": spec
+        })).unwrap();
+        w.apply(&r)
+    }
+    fn pv(w: &mut DesiredWorld, name: &str, size: &str) -> Result<String, String> {
+        apply(w, "PersistentVolume", "default", name, serde_json::json!({
+            "capacity": {"storage": size}, "hostPath": {"path": format!("/tmp/royak-binding-tests/{name}")}
+        }))
+    }
+    fn claim(w: &mut DesiredWorld, ns: &str, name: &str, size: &str) -> Result<String, String> {
+        apply(w, "PersistentVolumeClaim", ns, name, serde_json::json!({"resources": {"requests": {"storage": size}}}))
+    }
+
+    #[test]
+    fn small_pv_never_satisfies_larger_claim() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "small", "512Mi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(w.pvcs["a/data"].bound_pv.is_none());
+        assert!(w.pvs["small"].status == PVStatus::Available);
+        pv(&mut w, "large", "2Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert_eq!(w.pvcs["a/data"].bound_pv.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn pv_reapply_preserves_binding_and_rejects_mutation() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        assert!(w.pvs["disk"].status == PVStatus::Bound);
+        assert_eq!(w.pvs["disk"].bound_to.as_deref(), Some("a/data"));
+        assert!(pv(&mut w, "disk", "2Gi").is_err());
+        claim(&mut w, "b", "data", "1Gi").unwrap();
+        assert!(w.pvcs["b/data"].bound_pv.is_none());
+    }
+
+    #[test]
+    fn bound_claim_is_immutable_and_requires_reciprocal_binding() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(claim(&mut w, "a", "data", "2Gi").is_err());
+        assert_eq!(w.pvcs["a/data"].requested, "1Gi");
+        w.pvs.get_mut("disk").unwrap().bound_to = Some("b/data".into());
+        assert!(claim(&mut w, "a", "data", "1Gi").is_err());
+    }
+
+    #[test]
+    fn released_volume_cannot_be_rearmed_by_reapply() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        w.delete_resource("pvc", "a", "data").unwrap();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        assert!(w.pvs["disk"].status == PVStatus::Released);
+        claim(&mut w, "b", "data", "1Gi").unwrap();
+        assert!(w.pvcs["b/data"].bound_pv.is_none());
+    }
+
+    #[test]
+    fn storage_class_reapply_preserves_counter_and_incarnation_paths() {
+        let mut w = DesiredWorld::new();
+        let sc = serde_json::json!({"hostPathPrefix": "/tmp/royak-binding-tests", "reclaimPolicy": "Retain"});
+        apply(&mut w, "StorageClass", "default", "local", sc.clone()).unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        let first = w.pvcs["a/data"].bound_pv.clone().unwrap();
+        let first_path = w.pvs[&first].host_path.clone();
+        apply(&mut w, "StorageClass", "default", "local", sc).unwrap();
+        w.delete_resource("pvc", "a", "data").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        let second = w.pvcs["a/data"].bound_pv.clone().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first_path, w.pvs[&second].host_path);
+        assert!(w.pvs[&first].status == PVStatus::Released);
+    }
+
+    #[test]
+    fn invalid_quantities_and_unsupported_storage_modes_fail_closed() {
+        let mut w = DesiredWorld::new();
+        for size in ["0", "-1Gi", "1.5Gi", "1MiB", "18446744073709551616", "16Ei"] {
+            assert!(pv(&mut w, "disk", size).is_err(), "{size}");
+            assert!(claim(&mut w, "a", "data", size).is_err(), "{size}");
+        }
+        assert!(apply(&mut w, "StorageClass", "default", "other", serde_json::json!({"provisioner": "foreign/driver"})).is_err());
+        assert!(apply(&mut w, "StorageClass", "default", "other", serde_json::json!({"reclaimPolicy": "Bogus"})).is_err());
+        assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"accessModes": ["ReadWriteOnce", "ReadWriteMany"]})).is_err());
+        assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"accessModes": ["Unknown"]})).is_err());
+        for value in [serde_json::Value::Null, serde_json::json!(1024), serde_json::json!({}), serde_json::json!([])] {
+            assert!(apply(&mut w, "PersistentVolume", "default", "disk", serde_json::json!({"capacity": {"storage": value}})).is_err());
+            assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"resources": {"requests": {"storage": value}}})).is_err());
+        }
+    }
+
+    #[test]
+    fn loaded_inconsistent_or_cross_namespace_binding_is_not_mountable() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_ok());
+        assert!(crate::storage::bound_volume(&w, "b", "data").is_err());
+        w.pvcs.insert("b/data".into(), w.pvcs["a/data"].clone());
+        assert!(crate::storage::bound_volume(&w, "b", "data").is_err());
+        w.pvs.get_mut("disk").unwrap().capacity = "512Mi".into();
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_err());
+        w.pvs.get_mut("disk").unwrap().capacity = "1Gi".into();
+        w.pvs.get_mut("disk").unwrap().status = PVStatus::Released;
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_err());
+    }
+
+    #[test]
+    fn claimed_pv_deletion_and_unsafe_legacy_delete_reclaim_are_rejected_atomically() {
+        let mut w=DesiredWorld::new();
+        let sc=serde_json::json!({"reclaimPolicy":"Delete","hostPathPrefix":"/tmp/royak-binding-tests"});
+        apply(&mut w,"StorageClass","","local",sc).unwrap();
+        claim(&mut w,"a","data","1Gi").unwrap();
+        let pv=w.pvcs["a/data"].bound_pv.clone().unwrap();let before=w.to_state().to_canonical_json();
+        assert!(w.validate_storage_delete("pv","",&pv).is_err());
+        assert!(w.delete_resource("pv","",&pv).is_none());
+        assert!(w.validate_storage_delete("pvc","a","data").is_err());
+        assert!(w.delete_resource("pvc","a","data").is_none());
+        assert!(w.validate_storage_delete("namespace","","a").is_err());
+        assert!(w.delete_resource("namespace","","a").is_none());
+        assert_eq!(before,w.to_state().to_canonical_json());
+    }
+}
+
+
+/// Modeled boundary fixtures only. They cannot supply production permissions,
+/// and never execute a host runtime. Each test thread scopes/restores its own
+/// trace even during unwinding; the outer suite remains default-parallel.
+#[cfg(test)]
+mod unsupported_storage_runtime_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone)]
+    struct Trace {
+        docker_available: bool,
+        pings: usize,
+        effects: Vec<(String, Vec<String>)>,
+    }
+    std::thread_local! {
+        static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+    }
+    struct Scope { previous: Option<Trace> }
+    impl Scope {
+        fn install(docker_available: bool) -> Self {
+            let next=Trace {docker_available,pings:0,effects:Vec::new()};
+            Self {previous:TRACE.with(|slot|slot.replace(Some(next)))}
+        }
+        fn trace(&self) -> Trace {
+            TRACE.with(|slot|slot.borrow().as_ref().unwrap().clone())
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            TRACE.with(|slot|{slot.replace(self.previous.take());});
+        }
+    }
+    pub(super) fn docker_ping() -> Option<bool> {
+        TRACE.with(|slot| {
+            let mut slot=slot.borrow_mut();
+            slot.as_mut().map(|trace| {trace.pings+=1;trace.docker_available})
+        })
+    }
+    pub(super) fn before_effect(runtime: &str, admitted: &[String]) -> Option<Vec<String>> {
+        TRACE.with(|slot| {
+            let mut slot=slot.borrow_mut();
+            slot.as_mut().map(|trace| {
+                trace.effects.push((runtime.into(),admitted.to_vec()));
+                vec!["  [modeled-boundary] no host runtime effects executed".into()]
+            })
+        })
+    }
+
+    fn put(world: &mut DesiredWorld, kind: &str, namespace: &str, name: &str,
+        spec: serde_json::Value) {
+        let resource=serde_json::from_value(serde_json::json!({
+            "kind":kind,"metadata":{"name":name,"namespace":namespace},"spec":spec
+        })).unwrap();
+        world.apply(&resource).unwrap();
+    }
+    fn native_world(in_init: bool) -> DesiredWorld {
+        let mut world=DesiredWorld::new();
+        put(&mut world,"StorageClass","","native",serde_json::json!({
+            "provisioner":crate::storage_lifecycle::PROVISIONER,"reclaimPolicy":"Retain"}));
+        put(&mut world,"PersistentVolumeClaim","a","data",serde_json::json!({
+            "storageClassName":"native","resources":{"requests":{"storage":"64Mi"}}}));
+        let mount=serde_json::json!([{"name":"data","mountPath":"/data"}]);
+        let main=if in_init {serde_json::json!({"name":"main","image":"busybox:1.36"})}
+            else {serde_json::json!({"name":"main","image":"busybox:1.36","volumeMounts":mount})};
+        let init=if in_init {serde_json::json!([{"name":"setup","image":"busybox:1.36",
+            "volumeMounts":mount}])} else {serde_json::json!([])};
+        put(&mut world,"Deployment","a","native",serde_json::json!({
+            "replicas":1,"template":{"spec":{"containers":[main],"initContainers":init,
+            "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data"}}]}}}));
+        world
+    }
+    fn add_legacy(world: &mut DesiredWorld) {
+        put(world,"StorageClass","","legacy",serde_json::json!({
+            "provisioner":"royak/host-path","hostPathPrefix":"/srv/royak-legacy-observation",
+            "reclaimPolicy":"Retain"}));
+        put(world,"PersistentVolumeClaim","a","old",serde_json::json!({
+            "storageClassName":"legacy","resources":{"requests":{"storage":"64Mi"}}}));
+        put(world,"Deployment","a","old",serde_json::json!({
+            "replicas":1,"template":{"spec":{
+                "containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"old","mountPath":"/data"}]}],
+                "volumes":[{"name":"old","persistentVolumeClaim":{"claimName":"old"}}]}}}));
+    }
+    fn state(world: &DesiredWorld) -> serde_json::Value {
+        serde_json::to_value(world.to_state()).unwrap()
+    }
+    fn assert_blocked(log: &[String], scope: &Scope) {
+        assert!(log.iter().any(|line|line.contains("[storage]")&&line.contains("refusing")));
+        assert!(scope.trace().effects.is_empty(),
+            "blocked-only workload reached the pre-host effect boundary");
+        assert!(!log.iter().any(|line|line.contains("[ok]")));
+    }
+
+    #[test]
+    fn direct_neuropod_refuses_native_main_and_init_before_any_effect_boundary() {
+        for in_init in [false,true] {
+            let mut world=native_world(in_init);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4));
+            assert_blocked(&log,&scope);
+            assert_eq!(scope.trace().pings,0);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn direct_trait_refuses_native_main_and_init_before_runtime_factory() {
+        for runtime in ["light","cri"] {
+            for in_init in [false,true] {
+                let mut world=native_world(in_init);let before=state(&world);
+                let scope=Scope::install(false);
+                let log=reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),runtime);
+                assert_blocked(&log,&scope);
+                assert_eq!(scope.trace().pings,0);
+                assert_eq!(before,state(&world));
+            }
+        }
+    }
+    #[test]
+    fn actual_auto_docker_down_route_refuses_before_neuropod_effect_boundary() {
+        for in_init in [false,true] {
+            let mut world=native_world(in_init);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false);
+            assert_blocked(&log,&scope);
+            assert_eq!(scope.trace().pings,1);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn actual_explicit_neuropod_route_does_not_probe_docker_or_run_blocked_work() {
+        let mut world=native_world(false);
+        let scope=Scope::install(true);
+        let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),true);
+        assert_blocked(&log,&scope);
+        assert_eq!(scope.trace().pings,0);
+    }
+    #[test]
+    fn both_direct_mixed_routes_admit_only_exact_proven_legacy_keys() {
+        for runtime in ["neuropod","light","cri"] {
+            let mut world=native_world(true);add_legacy(&mut world);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=if runtime=="neuropod" {
+                reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4))
+            } else {
+                reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),runtime)
+            };
+            assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+            assert_eq!(scope.trace().effects,vec![(runtime.into(),vec!["a/old".into()])]);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn actual_auto_fallback_mixed_route_passes_only_legacy_effect_keys() {
+        let mut world=native_world(false);add_legacy(&mut world);let before=state(&world);
+        let scope=Scope::install(false);
+        let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false);
+        assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+        assert_eq!(scope.trace().pings,1);
+        assert_eq!(scope.trace().effects,vec![("neuropod".into(),vec!["a/old".into()])]);
+        assert_eq!(before,state(&world));
+    }
+    #[test]
+    fn unresolved_metadata_is_not_a_legacy_direct_or_fallback_escape() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(false);world.storage_classes.remove("native");
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            assert_blocked(&log,&scope);
+            assert!(log.iter().any(|line|line.contains("unresolved")));
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn scoped_effect_trap_restores_outer_trace_even_after_panic() {
+        let outer=Scope::install(false);
+        let result=std::panic::catch_unwind(|| {
+            let _inner=Scope::install(true);
+            assert_eq!(docker_ping(),Some(true));
+            panic!("modeled fixture unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(docker_ping(),Some(false));
+        assert_eq!(outer.trace().pings,1);
+        assert!(outer.trace().effects.is_empty());
+    }
+
+
+
+    fn add_classless_static_legacy(world: &mut DesiredWorld) {
+        put(world,"PersistentVolume","","static-old",serde_json::json!({
+            "capacity":{"storage":"64Mi"},"storageClassName":"",
+            "hostPath":{"path":"/srv/royak-static-observation"}}));
+        put(world,"PersistentVolumeClaim","a","classless",serde_json::json!({
+            "storageClassName":"","resources":{"requests":{"storage":"64Mi"}}}));
+        put(world,"Deployment","a","classless",serde_json::json!({
+            "replicas":1,"template":{"spec":{
+                "containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"old","mountPath":"/data"}]}],
+                "volumes":[{"name":"old","persistentVolumeClaim":{"claimName":"classless"}}]}}}));
+    }
+    #[test]
+    fn classless_legacy_mixed_direct_and_auto_routes_keep_only_static_legacy_key() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(true);add_classless_static_legacy(&mut world);
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            let runtime=if entry=="light" {"light"} else {"neuropod"};
+            assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+            assert_eq!(scope.trace().effects,vec![(runtime.into(),vec!["a/classless".into()])]);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn cleared_native_classes_remain_blocked_before_direct_and_auto_effects() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(false);
+            let pv=world.pvcs["a/data"].bound_pv.clone().unwrap();
+            world.pvcs.get_mut("a/data").unwrap().storage_class.clear();
+            world.pvs.get_mut(&pv).unwrap().storage_class.clear();
+            world.pvs.get_mut(&pv).unwrap().host_path="/srv/forged-native-public-path".into();
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            assert_blocked(&log,&scope);
+            assert!(log.iter().any(|line|line.contains("unresolved")));
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn source_binding_keeps_traps_before_host_and_effect_loops_on_exact_admitted_keys() {
+        let source=include_str!("reconcile.rs");
+        let neuropod=source.split("pub fn reconcile_neuropod(").nth(1).unwrap()
+            .split("\nfn dirs_or_home(").next().unwrap();
+        let trait_runtime=source.split("fn reconcile_via_trait(").nth(1).unwrap()
+            .split("\n/// Check a single probe").next().unwrap();
+        for (body,first_host) in [(neuropod,"let pods_root="),(trait_runtime,"runtime::get_runtime(")] {
+            let admission=body.find("unsupported_runtime_workloads(").unwrap();
+            let early_return=body.find("admitted.is_empty() && !log.is_empty()").unwrap();
+            let trap=body.find("unsupported_storage_runtime_tests::before_effect(").unwrap();
+            let host=body.find(first_host).unwrap();
+            assert!(admission<early_return && early_return<trap && trap<host);
+        }
+        assert!(neuropod.contains("for name in &admitted {"));
+        assert!(!neuropod.contains("for (name, dep) in &desired.deployments"));
+        assert!(neuropod.contains("if dep.is_some() && !admitted.contains(&record_key) { continue; }"));
+        assert!(trait_runtime.contains("for key in admitted {"));
+        assert!(!trait_runtime.contains("let keys: Vec<String> = desired.deployments.keys()"));
+        let apply=source.split("fn apply_resource(").nth(1).unwrap();
+        assert!(apply.find("require_legacy_template_class(self, template)?").unwrap()
+            < apply.find("self.namespaces.push(ns)").unwrap());
+    }
+    fn stateful(class: Option<serde_json::Value>) -> Resource {
+        let mut volume_spec=serde_json::json!({"resources":{"requests":{"storage":"64Mi"}}});
+        if let Some(class)=class {volume_spec["storageClassName"]=class;}
+        serde_json::from_value(serde_json::json!({
+            "kind":"StatefulSet","metadata":{"name":"db","namespace":"new"},
+            "spec":{"replicas":1,"volumeClaimTemplates":[
+                {"metadata":{"name":"data"},"spec":volume_spec}],
+                "template":{"spec":{"containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}}
+        })).unwrap()
+    }
+    #[test]
+    fn native_vct_is_refused_before_erasure_or_new_namespace_mutation() {
+        let mut world=native_world(false);let before=state(&world);
+        let error=world.apply(&stateful(Some(serde_json::json!("native")))).unwrap_err();
+        assert!(error.contains("native volumeClaimTemplates"));
+        assert_eq!(before,state(&world));
+        assert!(!world.deployments.contains_key("new/db"));
+        assert!(!world.namespaces.iter().any(|namespace|namespace=="new"));
+    }
+    #[test]
+    fn unknown_and_malformed_explicit_vct_classes_never_default_legacy() {
+        for class in [serde_json::json!("missing"),serde_json::json!(""),
+            serde_json::json!(null),serde_json::json!(false),serde_json::json!([])] {
+            let mut world=native_world(false);let before=state(&world);
+            assert!(world.apply(&stateful(Some(class))).is_err());
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn explicit_known_legacy_and_absent_vct_class_keep_legacy_only_lowering() {
+        for class in [Some(serde_json::json!("legacy")),None] {
+            let mut world=native_world(false);add_legacy(&mut world);
+            let claims=world.pvcs.len();let volumes=world.pvs.len();
+            world.apply(&stateful(class)).unwrap();
+            let deployment=&world.deployments["new/db"];
+            assert!(deployment.stateful);
+            assert_eq!(deployment.containers[0].volumes[0].0,"vct:data");
+            assert_eq!(world.pvcs.len(),claims);
+            assert_eq!(world.pvs.len(),volumes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn apply_yaml(yaml: &str) -> Result<DesiredWorld, String> {
+        let mut w = DesiredWorld::new();
+        for r in crate::spec::parse_yaml(yaml)? { w.apply(&r)?; }
+        Ok(w)
+    }
+
+    fn dep_with_readiness(probe: &str) -> String {
+        format!(r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: {{name: web}}
+spec:
+  template:
+    spec:
+      containers:
+      - name: c
+        image: busybox:1.36
+        readinessProbe:
+{probe}
+"#)
+    }
+
+    fn readiness_json(w: &DesiredWorld) -> serde_json::Value {
+        serde_json::to_value(w.deployments["default/web"].containers[0].readiness_probe.as_ref().unwrap()).unwrap()
+    }
+
+    fn no_handler() -> StoredProbe {
+        serde_json::from_value(serde_json::json!({
+            "http_get": null, "exec": null,
+            "initial_delay_seconds": 0, "period_seconds": 10, "failure_threshold": 3
+        })).unwrap()
+    }
+
+    #[test]
+    fn probe_without_a_handler_is_never_healthy() {
+        // Regression: check_probe used to fall through to `true`.
+        assert_eq!(check_probe("no-such-container", &no_handler()), Some(false));
+    }
+
+    #[test]
+    fn tcp_socket_readiness_is_parsed_and_stored() {
+        let w = apply_yaml(&dep_with_readiness("          tcpSocket: {port: 8080}\n          periodSeconds: 2")).unwrap();
+        let p = readiness_json(&w);
+        assert_eq!(p["tcp_socket"], serde_json::json!(8080), "{p}");
+        assert_eq!(p["period_seconds"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn tcp_socket_survives_a_persistence_roundtrip() {
+        let w = apply_yaml(&dep_with_readiness("          tcpSocket: {port: 8080}")).unwrap();
+        let json = serde_json::to_string(&w.deployments["default/web"]).unwrap();
+        let back: StoredDeployment = serde_json::from_str(&json).unwrap();
+        let p = serde_json::to_value(back.containers[0].readiness_probe.as_ref().unwrap()).unwrap();
+        assert_eq!(p["tcp_socket"], serde_json::json!(8080));
+    }
+
+    #[test]
+    fn probes_without_tcp_keep_their_serialized_form() {
+        // Template hashes are computed over the serialized container: adding
+        // the tcp field must not roll every existing HTTP/exec deployment.
+        let w = apply_yaml(&dep_with_readiness("          httpGet: {path: /, port: 80}")).unwrap();
+        assert!(!serde_json::to_string(&w.deployments["default/web"].containers[0]).unwrap().contains("tcp_socket"));
+    }
+
+    #[test]
+    fn invalid_or_unsupported_probes_are_rejected_at_apply() {
+        for (probe, needle) in [
+            ("          periodSeconds: 5", "no handler"),
+            ("          grpc: {port: 9000}", "grpc"),
+            ("          tcpSocket: {port: http}", "named port"),
+            ("          httpGet: {path: /, port: http}", "named port"),
+            ("          tcpSocket: {port: 0}", "port"),
+            ("          exec: {command: []}", "empty"),
+            ("          tcpSocket: {port: 80}\n          httpGet: {path: /, port: 80}", "exactly one"),
+            ("          exec: {command: ['true']}\n          periodSeconds: 0", "positive"),
+            ("          exec: {command: ['true']}\n          timeoutSeconds: 0", "positive"),
+            ("          exec: {command: ['true']}\n          failureThreshold: 0", "positive"),
+            ("          exec: {command: ['true']}\n          successThreshold: 0", "positive"),
+            ("          exec: {command: ['true']}\n          terminationGracePeriodSeconds: 2", "unknown field"),
+            ("          httpGet: {path: /, port: 80, scheme: HTTPS}", "HTTPS"),
+            ("          httpGet: {path: /, port: 80, host: example.test}", "unknown field"),
+        ] {
+            let e = match apply_yaml(&dep_with_readiness(probe)) {
+                Ok(_) => panic!("probe accepted: {probe}"),
+                Err(e) => e,
+            };
+            assert!(e.contains(needle), "probe {probe:?}: error {e:?} should mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn valid_http_and_exec_probes_are_still_accepted() {
+        apply_yaml(&dep_with_readiness("          httpGet: {path: /healthz, port: 8080}")).unwrap();
+        apply_yaml(&dep_with_readiness("          exec: {command: [cat, /tmp/ready]}")).unwrap();
+        apply_yaml(&dep_with_readiness("          httpGet: {port: 8080, scheme: HTTP}")).unwrap();
+    }
+
+    #[test]
+    fn regular_init_container_probes_are_rejected() {
+        let yaml = "kind: Deployment\nmetadata: {name: web}\nspec:\n  template:\n    spec:\n      initContainers:\n      - name: init\n        image: alpine:3.22\n        readinessProbe: {exec: {command: ['true']}}\n      containers: [{name: main, image: 'alpine:3.22'}]\n";
+        let error = apply_yaml(yaml).err().unwrap();
+        assert!(error.contains("regular init containers cannot define probes"), "{error}");
+    }
+    #[test]
+    fn single_container_controllers_refuse_unmodelled_probe_targets() {
+        for kind in ["DaemonSet", "Job", "CronJob"] {
+            for shape in ["containers:\n      - {name: main, image: alpine}\n      - {name: extra, image: alpine, readinessProbe: {exec: {command: ['true']}}}",
+                "initContainers:\n      - {name: init, image: alpine, startupProbe: {exec: {command: ['true']}}}\n      containers: [{name: main, image: alpine}]"] {
+                let yaml = format!("kind: {kind}\nmetadata: {{name: web}}\nspec:\n  template:\n    spec:\n      {shape}\n");
+                let error = apply_yaml(&yaml).err().expect("unsupported probe target must be refused");
+                assert!(error.contains("single modelled regular container"), "{kind}: {error}");
+            }
+        }
+    }
+}
+

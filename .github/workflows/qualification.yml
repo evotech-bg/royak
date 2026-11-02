@@ -1,0 +1,78 @@
+name: Royak three-daemon qualification
+
+# Opt-in until the lab's runtime/capacity envelope is established. This does
+# not change or replace the existing integration/security jobs.
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Fault target seed
+        default: "42"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the checker and external ledger
+        run: |
+          python3 -B -m unittest discover -s tests/qualification -p 'test_*.py' -v
+          python3 -B -m unittest discover -s tests/qualification/parallels -p 'test_*.py' -v
+      - name: Pin signature-verified restic for the owned Linux unit runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          gpg --version >/dev/null
+          TOOL_ROOT="tests/qualification/.runs/qualification-restic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B tests/qualification/parallels/get_restic.py --platform linux_arm64 --platform linux_amd64 --root "$TOOL_ROOT"
+          printf 'ROYAK_QUAL_RESTIC_MANIFEST=%s/%s/restic-build.json\n' "$GITHUB_WORKSPACE" "$TOOL_ROOT" >> "$GITHUB_ENV"
+      - name: Mandatory Linux Rust tests with the exact verified tool
+        run: python3 -B tests/qualification/linux_unit.py --release --restic-manifest "$ROYAK_QUAL_RESTIC_MANIFEST"
+      - name: Build the Linux working-source binary
+        id: linux_build
+        run: python3 -B tests/qualification/run.py build
+      - name: Check BusyBox and Dash probe cleanup and deadlines
+        run: |
+          docker pull alpine:3.22
+          docker pull python:3.13-slim
+          python3 -B tests/qualification/watchdog_runtime.py --output tests/qualification/.runs/watchdog-portable.json
+      - name: Check default HTTP probe compatibility
+        env:
+          QUALIFICATION_SEED: ${{ inputs.seed }}
+        run: python3 -B tests/qualification/run.py run --seed "$QUALIFICATION_SEED"
+      - name: Independently run the fault matrix with explicit IPv4 exec readiness
+        if: always() && steps.linux_build.outcome == 'success'
+        env:
+          QUALIFICATION_SEED: ${{ inputs.seed }}
+        run: python3 -B tests/qualification/run.py run --seed "$QUALIFICATION_SEED" --probe-mode exec-ipv4
+      - name: Export causal diagnostic datasets
+        if: always()
+        run: |
+          for run in tests/qualification/.runs/rkq-*; do
+            if [ -f "$run/telemetry.jsonl" ]; then
+              python3 -B tests/qualification/dataset.py "$run"
+            fi
+          done
+      - name: Keep qualification evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-evidence
+          path: |
+            tests/qualification/.runs/**/manifest.json
+            tests/qualification/.runs/**/report.json
+            tests/qualification/.runs/**/performance.json
+            tests/qualification/.runs/**/ledger.json
+            tests/qualification/.runs/**/*.jsonl
+            tests/qualification/.runs/**/node-*.log
+            tests/qualification/.runs/watchdog-portable.json
+            tests/qualification/.runs/**/restic-build.json
+            tests/qualification/.runs/**/SHA256SUMS
+            tests/qualification/.runs/**/SHA256SUMS.asc
+            tests/qualification/.runs/**/key.asc
+          include-hidden-files: true
