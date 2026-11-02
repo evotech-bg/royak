@@ -221,18 +221,49 @@ pub fn call(method: &str, addr: &str, path: &str, body: &[u8], timeout: Duration
 }
 
 /// Async variant (Raft RPCs).
+async fn write_request<S: tokio::io::AsyncWrite + Unpin>(stream: &mut S, request: &[u8]) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(request).await.map_err(|e| format!("write request: {e}"))?;
+    // TLS may accept all plaintext while encrypted records remain buffered.
+    // Waiting for a response before flushing can leave both peers waiting.
+    stream.flush().await.map_err(|e| format!("flush request: {e}"))
+}
+
 pub async fn call_async(method: &str, addr: &str, path: &str, body: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    call_async_bound(method, addr, path, body, timeout, None).await
+}
+
+/// Connect's data hop must never fall back from WireGuard onto an ordinary route.
+pub async fn call_async_bound(method: &str, addr: &str, path: &str, body: &[u8], timeout: Duration, interface: Option<&str>) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
     let (req, nonce) = build_request(method, addr, path, body)?;
     let fut = async {
-        let tcp = tokio::net::TcpStream::connect(addr).await.map_err(|e| format!("connect {addr}: {e}"))?;
-        async fn read_all<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>, String> {
+        let tcp = if let Some(interface) = interface {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                let address: std::net::SocketAddr = addr.parse().map_err(|_| "WireGuard peer must be a numeric socket address")?;
+                let name = std::ffi::CString::new(interface).map_err(|_| "invalid WireGuard interface")?;
+                if interface.is_empty() || interface.len() >= libc::IFNAMSIZ { return Err("invalid WireGuard interface".into()); }
+                let socket = if address.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }.map_err(|e| e.to_string())?;
+                let result = unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                    name.as_ptr().cast(), name.as_bytes_with_nul().len() as libc::socklen_t) };
+                if result != 0 { return Err(format!("bind WireGuard device: {}", std::io::Error::last_os_error())); }
+                socket.connect(address).await.map_err(|e| format!("WireGuard connect: {e}"))?
+            }
+            #[cfg(not(target_os = "linux"))]
+            { let _ = interface; return Err("Connect WireGuard server transport requires Linux".into()); }
+        } else { tokio::net::TcpStream::connect(addr).await.map_err(|e| format!("connect {addr}: {e}"))? };
+        async fn read_all<S: tokio::io::AsyncRead + Unpin>(s: &mut S, limit: usize) -> Result<Vec<u8>, String> {
             let mut buf = Vec::with_capacity(4096);
             let mut chunk = [0u8; 16384];
             while !response_complete(&buf) {
                 match s.read(&mut chunk).await {
                     Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        if n > limit.saturating_sub(buf.len()) { return Err("bounded node RPC response exceeded".into()); }
+                        buf.extend_from_slice(&chunk[..n]);
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(format!("read: {e}")),
                 }
@@ -242,12 +273,12 @@ pub async fn call_async(method: &str, addr: &str, path: &str, body: &[u8], timeo
         if tls_on() {
             let connector = tokio_rustls::TlsConnector::from(client_config());
             let mut s = connector.connect(server_name(), tcp).await.map_err(|e| format!("tls {addr}: {e}"))?;
-            s.write_all(&req).await.map_err(|e| format!("write {addr}: {e}"))?;
-            read_all(&mut s).await
+            write_request(&mut s, &req).await?;
+            read_all(&mut s, if interface.is_some() {128*1024} else {usize::MAX}).await
         } else {
             let mut s = tcp;
-            s.write_all(&req).await.map_err(|e| format!("write {addr}: {e}"))?;
-            read_all(&mut s).await
+            write_request(&mut s, &req).await?;
+            read_all(&mut s, if interface.is_some() {128*1024} else {usize::MAX}).await
         }
     };
     let raw = tokio::time::timeout(timeout, fut).await.map_err(|_| format!("rpc to {addr} timed out"))??;
@@ -257,6 +288,31 @@ pub async fn call_async(method: &str, addr: &str, path: &str, body: &[u8], timeo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_is_flushed_before_waiting_for_a_buffered_peer_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload = vec![0x91; 48 * 1024];
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut client = tokio::io::BufWriter::with_capacity(payload.len() + 1, client);
+        let expected = payload.clone();
+        let peer = tokio::spawn(async move {
+            let mut received = vec![0; expected.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            server.write_all(b"OK").await.unwrap();
+        });
+        let exchange = async {
+            write_request(&mut client, &payload).await.unwrap();
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"OK");
+        };
+        let result = tokio::time::timeout(Duration::from_secs(1), exchange).await;
+        if result.is_err() { peer.abort(); }
+        assert!(result.is_ok(), "waiting for a response before flushing leaves the peer waiting for request bytes");
+        peer.await.unwrap();
+    }
 
     fn with_secret() {
         std::env::set_var("ROYAK_CLUSTER_SECRET", "test-cluster-secret-0123456789abcdef");

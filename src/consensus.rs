@@ -22,6 +22,12 @@ pub enum Command {
     /// `base_generation`. `state` is the serialized [`crate::store::DesiredState`],
     /// sealed (AES-256-GCM) with a key derived from the cluster secret.
     Commit { base_generation: u64, state: String },
+    /// Internal root-approved install-once metadata transaction. Ordinary
+    /// Commit/serde/import/snapshot can never take its place.
+    EnrollStorageDirectory {
+        base_generation: u64,
+        proposal: String,
+    },
 }
 
 #[cfg(test)]
@@ -30,7 +36,10 @@ mod tests {
 
     #[test]
     fn command_roundtrips_through_json() {
-        let cmd = Command::Commit { base_generation: 41, state: "opaque".into() };
+        let cmd = Command::Commit {
+            base_generation: 41,
+            state: "opaque".into(),
+        };
         let s = serde_json::to_string(&cmd).expect("encode");
         let back: Command = serde_json::from_str(&s).expect("decode");
         assert_eq!(back, cmd);

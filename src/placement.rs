@@ -55,6 +55,11 @@ pub struct PodView {
     /// True for pods dispatched but not yet confirmed by the census.
     #[serde(default)]
     pub pending: bool,
+    /// Container ports the main container publishes on the host (for
+    /// NodePort/LoadBalancer). None = unknown (e.g. a peer on an older build);
+    /// unknown never forces a pod to be replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<Vec<u16>>,
 }
 
 /// A peer's census report.
@@ -254,7 +259,7 @@ mod tests {
     fn view(pod: &str, node: &str, owner: &str) -> PodView {
         PodView {
             pod: pod.into(), node: node.into(), namespace: "default".into(), kind: "deployment".into(),
-            owner: owner.into(), template: "t".into(), image: "i".into(), running: true, ready: true, pending: false,
+            owner: owner.into(), template: "t".into(), image: "i".into(), running: true, ready: true, pending: false, published: None,
         }
     }
     fn report(node: &str, pods: Vec<PodView>) -> PeerReport {

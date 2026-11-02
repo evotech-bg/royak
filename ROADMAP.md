@@ -8,7 +8,8 @@ Versioning tracks the git tag cadence, not calendar time. Items move forward whe
 
 ## Current state — v0.4-beta
 
-What's working end-to-end, covered by the test suite:
+What's working end-to-end, covered by the test suites. Items marked *(source)* landed after the
+latest published release (`v0.4.0-beta.1`) and exist only in the source so far:
 
 - Container orchestration on Docker (single node): deploy, scale, rolling update, rollback, health probes, CrashLoopBackOff detection.
 - 22+ K8s resource kinds with YAML/JSON parsing (Deployment, Service, ConfigMap, Secret, HPA, NetworkPolicy, ResourceQuota, Ingress, Operator, CustomResource, Pipeline, Function, Job, CronJob, DaemonSet, RbacRole, Guard, PV, PVC, StorageClass, Namespace).
@@ -20,25 +21,29 @@ What's working end-to-end, covered by the test suite:
 - Namespaces as real identity: objects are keyed by namespace + name; same names coexist, operations stay inside their namespace.
 - kubectl compatibility: discovery, get, describe, delete, watch, **and native apply for creation** (full OpenAPI v3 operation IDs — no `--validate=false`). ✅ landed in v0.3. Client-side apply updates (strategic merge + last-applied annotations + full field schemas) ✅ landed in v0.4-beta.
 - Cross-node mesh proxy (MVP): pods on node B reach services on node A through per-node proxies. ✅ landed in v0.3
-- Ingress as a live reverse proxy: async, streaming, binary-safe, TLS, Host+path routing. ✅ landed in v0.3
-- openraft on the live write path (phase 3): every desired-state change in cluster mode commits on a quorum before it is acknowledged; durable log and vote; snapshots. Only a quorum-confirmed leader schedules; a minority answers 504 "outcome unknown". ✅ verified with 3 nodes on one host (`test-raft-cluster.sh`)
+- Ingress as a live reverse proxy: async, binary-safe, TLS, Host+path routing. ✅ landed in v0.3. Current HTTP response decoding is bounded/buffered; streaming/SSE/upgrades are not qualified.
+- *(source)* openraft on the live write path (phase 3): every desired-state change in cluster mode commits on a quorum before it is acknowledged; durable log and vote; snapshots. Only a quorum-confirmed leader schedules; a minority answers 504 "outcome unknown". ✅ verified with 3 nodes on one host (`test-raft-cluster.sh`)
+- ServiceLB (NodePort + LoadBalancer) forwards only to Ready pods and follows Service changes (selector, targetPort, delete/recreate) without a restart; `tcpSocket` probes alongside `httpGet`/`exec`, with invalid probes rejected at apply (`test-servicelb-probes.sh`). *(source)*
 - Multi-node placement: the leader places pods on any Ready node via signed RPC with the full workload contract; self-healing after pod kills and node loss without over-provisioning (`test-multinode.sh`).
 - Prometheus `/metrics`, Kubernetes-compat `/openapi/v3`, built-in dashboard.
-- Test coverage: unit suite + single-node integration + multi-node + Raft cluster + single-writer + mesh + ingress + NeuroPod + load suites.
+- *(source)* Read-only live topology graph with scoped RBAC, actual placement/ownership and labelled declared references; search/filter/map/list/fit and keyboard-preserved details. Native, real Docker/API, three-daemon fault and browser checks passed for the [bounded local beta](tests/qualification/BETA-RESULTS-2026-10-27.md), not production certification.
+- *(source)* Probe lifecycle scheduling/thresholds/startup/incarnation reset, immutable new-pod health contracts, sidecar readiness and exec process-group cleanup; 53 real lifecycle/topology/RBAC regressions pass. Unsupported targets/fields are refused within the [documented subset](tests/qualification/PROBE-TOPOLOGY-CONTRACT.md).
+- Test coverage: unit suite + single-node integration + multi-node + Raft cluster + single-writer + ServiceLB/probes + auth-over-HTTP + mesh + ingress + NeuroPod + load suites.
 
 ## Known limits
 
 | What's not in v0.4-beta | Why it matters | Planned in |
 |---|---|---|
-| Multi-machine verification | The cluster suites run 3 nodes on one host and one Docker daemon; real partitions between machines are not yet exercised. | v0.4.x |
-| Replicated / movable volumes | Host-local volumes stay on the scheduling node and come back empty after a failover. | v0.5 |
+| Multi-machine verification | Legacy cluster suites use 3 processes/one daemon; the fault lab now uses 3 distinct daemons, still on one physical host. Separate-machine failure domains remain untested. | v0.4.x |
+| Replicated / movable volumes | Local PVC paths have no durable node binding or fenced handoff; a new scheduler can resolve another machine's directory. Stateful production is blocked on the [separate storage gate](tests/qualification/STATEFUL-PRODUCTION-GATE.md), with backend architecture not yet selected. | v0.5 |
 | Node cordon/drain/join | Nodes are declared with `--peers`; no live membership change or drain. | v0.4.x |
 | Mesh frame replay protection + per-host mesh port | Sealed mesh frames are encrypted and authenticated, but a captured frame can be replayed; the fixed `:6550` port allows one node per host. | v0.4.x |
 | kubectl `port-forward` | kubectl 1.36 tunnels SPDY-over-WebSocket, which is not decoded (`royak port-forward` works). | v0.4.x |
 | WireGuard L3 mesh | Cross-node **service** traffic is now AES-256-GCM encrypted on the proxy hop (v0.4-beta). A routed encrypted L3 (raw pod-IP peering across hosts via WireGuard) is still v0.5. | v0.5 |
 | Native Helm engine | Today: `helm template \| royak apply -`. | v0.5 |
 | Canary traffic splitting at service layer | Parsed and scheduled; needs proxy integration. | v0.5 |
-| Multi-node ServiceLB | NodePort + LoadBalancer ✅ shipped (single-node, klipper-lb-style); multi-node external IP pools pending. | v0.5 |
+| Multi-node ServiceLB | NodePort + LoadBalancer work per node (readiness-gated, live Service updates); each node forwards only to its own pods, and multi-node external IP pools are pending. | v0.5 |
+| Full probe/runtime parity and upgrades | Source lifecycle semantics passed the bounded Docker tests, but synchronous deadlines, hostile exec escape, full multi-container controller API and legacy in-place/version-skew upgrades remain unqualified. | separate qualification |
 
 ---
 

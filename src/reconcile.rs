@@ -63,6 +63,7 @@ pub struct StoredTrigger {
 
 /// A pipeline run (execution instance)
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct PipelineRun {
     pub pipeline: String,
     pub run_id: u64,
@@ -134,8 +135,8 @@ pub struct StoredConfig {
 impl Default for StoredConfig {
     fn default() -> Self {
         StoredConfig {
-            llm_host: "http://localhost:11434".to_string(),
-            llm_model: "llama3.2:3b".to_string(),
+            llm_host: "http://localhost:11433".to_string(),
+            llm_model: "mlx-community--Llama-3.2-3B-Instruct-4bit".to_string(),
             llm_temperature: 0.3,
             alert_webhook: None,
             alert_on_anomaly: true,
@@ -190,6 +191,7 @@ pub struct StoredRepository {
 }
 
 /// Stored desired state — replaces etcd (in-memory + persistent JSON)
+#[derive(Clone)]
 pub struct DesiredWorld {
     /// Monotonic desired-state version. Bumped by every committed change; the
     /// commit path uses it as a compare-and-swap token (see store::commit).
@@ -220,8 +222,11 @@ pub struct DesiredWorld {
     pub pvs: HashMap<String, StoredPV>,
     pub pvcs: HashMap<String, StoredPVC>,
     pub namespaces: Vec<String>,
+    pub storage_identities: crate::storage_identity::Identities,
+    pub(crate) storage_node_directory: crate::storage_node_directory::Registry,
+    pub backup_registry: crate::backup_engine::Registry,
     #[allow(dead_code)]
-    pub pod_health: HashMap<String, PodHealth>,
+    pub pod_health: HashMap<String, crate::probes::PodHealth>,
     pub pending_rollouts: HashMap<String, RolloutState>,
     pub pipelines: HashMap<String, StoredPipeline>,
     pub pipeline_runs: Vec<PipelineRun>,
@@ -371,6 +376,7 @@ pub struct CanaryStep {
 
 // ─── Cluster Events (kubectl get events) ───
 
+#[derive(Clone)]
 pub struct ClusterEvent {
     pub kind: String,        // "Pod", "Deployment", "Pipeline"
     pub object: String,      // resource name
@@ -565,6 +571,8 @@ pub fn reconcile_operators(desired: &mut DesiredWorld, log: &mut Vec<String>) {
 
             // Create deployment for this component
             let containers = vec![StoredContainer {
+                host_access: None,
+                security_context: None,
                 name: component.role.clone(),
                 image: component.image.clone(),
                 command: None,
@@ -692,6 +700,7 @@ pub struct StoredResourceQuota {
 
 /// Pod certificate tracking — for mTLS cert lifecycle
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct PodCertStatus {
     pub pod_name: String,
     pub namespace: String,
@@ -848,6 +857,10 @@ fn default_ns_string() -> String { "default".to_string() }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredContainer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_access: Option<crate::host_access::Permit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_context: Option<crate::security::SecurityContext>,
     pub name: String,
     pub image: String,
     pub command: Option<Vec<String>>,
@@ -875,24 +888,28 @@ pub struct EnvKeyRef {
 }
 
 /// Stored health probe configuration
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct StoredProbe {
     pub http_get: Option<(String, u16)>,   // (path, port)
     pub exec: Option<Vec<String>>,          // command
+    /// TCP connect probe port. Skipped when absent so existing HTTP/exec probes
+    /// serialize (and template-hash) exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_socket: Option<u16>,
     pub initial_delay_seconds: u64,
     pub period_seconds: u64,
     pub failure_threshold: u32,
+    #[serde(default = "legacy_probe_timeout", skip_serializing_if = "is_legacy_probe_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "probe_success_default", skip_serializing_if = "is_probe_success_default")]
+    pub success_threshold: u32,
 }
 
-/// Per-pod health tracking
-#[allow(dead_code)]
-pub struct PodHealth {
-    pub created_at: std::time::Instant,
-    pub liveness_failures: u32,
-    pub readiness_failures: u32,
-    pub ready: bool,
-}
+fn legacy_probe_timeout() -> u64 { 3 }
+fn is_legacy_probe_timeout(n: &u64) -> bool { *n == 3 }
+fn probe_success_default() -> u32 { 1 }
+fn is_probe_success_default(n: &u32) -> bool { *n == 1 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredConfigMap {
@@ -972,6 +989,9 @@ impl DesiredWorld {
             pvs: HashMap::new(),
             pvcs: HashMap::new(),
             namespaces: vec!["default".to_string()],
+            storage_identities: crate::storage_identity::Identities::fresh(),
+            storage_node_directory: crate::storage_node_directory::Registry::fresh(),
+            backup_registry: crate::backup_engine::Registry::fresh(),
             pod_health: HashMap::new(),
             pending_rollouts: HashMap::new(),
             pipelines: HashMap::new(),
@@ -1013,7 +1033,25 @@ impl DesiredWorld {
         ports
     }
 
+    pub fn synchronize_storage_identities(&mut self) -> Result<(),String> {
+        self.storage_identities.synchronize(&self.namespaces,&self.pvs,&self.pvcs)
+    }
+
     pub fn apply(&mut self, resource: &Resource) -> Result<String, String> {
+        self.apply_with_host_access(resource, true)
+    }
+    pub fn apply_with_host_access(&mut self, resource: &Resource, authorized: bool) -> Result<String, String> {
+        if crate::host_access::resource_requires(resource)? && !authorized {
+            return Err("host access requires cluster-scoped use hostaccess permission".into());
+        }
+        let result=self.apply_resource(resource)?;
+        self.synchronize_storage_identities()?;
+        crate::host_access::issue_resource(self,resource,authorized)?;
+        crate::storage_lifecycle::Registry::register_pending(self)?;
+        Ok(result)
+    }
+
+    fn apply_resource(&mut self, resource: &Resource) -> Result<String, String> {
         // Identity validation: names become store keys ("ns/name") and Docker
         // container names, so they must be valid RFC 1123 names — in
         // particular they can never contain '/' or '_', the separators used to
@@ -1033,6 +1071,25 @@ impl DesiredWorld {
             let ns = crate::store::ns_of(resource);
             if !crate::store::is_dns_label(&ns) {
                 return Err(format!("namespace {ns:?} is invalid: must be a lowercase RFC 1123 label"));
+            }
+            // The legacy vct: lowering below discards the template spec. Refuse
+            // explicit native/unknown classes before either that loss or an
+            // implicit namespace insertion; no fresh native claim is invented.
+            if kind == "StatefulSet" {
+                if let Some(deployment) = spec::as_deployment(resource) {
+                    for template in deployment.volume_claim_templates.as_deref().unwrap_or(&[]) {
+                        crate::storage::require_legacy_template_class(self, template)?;
+                    }
+                }
+            }
+            // The first native consumer has no policy-capable network effect
+            // permit. Refuse BEFORE even implicit namespace mutation; all API
+            // apply/patch/replace scratch commits share this admission path.
+            if kind=="NetworkPolicy" {
+                let selector=resource.spec.as_ref().and_then(|s|s.get("podSelector"))
+                    .and_then(|s|s.get("matchLabels")).and_then(|s|s.get("app"))
+                    .and_then(|s|s.as_str()).unwrap_or("*");
+                crate::workload::managed::require_supported_policy_admission(self,&ns,selector)?;
             }
             // Royak creates namespaces implicitly on first use.
             if !self.namespaces.iter().any(|n| n == &ns) {
@@ -1064,18 +1121,25 @@ impl DesiredWorld {
                 let mut vct_map: HashMap<String, String> = HashMap::new();
                 if resource.kind == "StatefulSet" {
                     for vct in dep.volume_claim_templates.as_deref().unwrap_or(&[]) {
+                        if !crate::store::is_dns_label(&vct.metadata.name){return Err("invalid volumeClaimTemplate name".into());}
                         vct_map.insert(vct.metadata.name.clone(), format!("vct:{}", vct.metadata.name));
                     }
                 }
 
                 let volume_map = pod_volume_map(dep.template.spec.volumes.as_deref().unwrap_or(&[]), vct_map)?;
                 let stored_containers: Vec<StoredContainer> = dep.template.spec.containers.iter()
-                    .map(|c| parse_container(c, &volume_map)).collect();
+                    .map(|c| parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())).collect::<Result<_, _>>()?;
 
                 // Init containers (run before main, must complete) get the same
                 // full contract as main containers (env, envFrom, volumes).
                 let init_containers: Vec<StoredContainer> = dep.template.spec.init_containers.as_ref()
-                    .map(|inits| inits.iter().map(|c| parse_container(c, &volume_map)).collect())
+                    .map(|inits| inits.iter().map(|c| {
+                        if c.liveness_probe.is_some() || c.readiness_probe.is_some() || c.startup_probe.is_some() {
+                            return Err(format!("init container {:?}: regular init containers cannot define probes", c.name));
+                        }
+                        parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())
+                    }).collect::<Result<_, _>>())
+                    .transpose()?
                     .unwrap_or_default();
 
                 let first = match stored_containers.first() {
@@ -1316,8 +1380,26 @@ impl DesiredWorld {
                 }).collect();
                 let selector = svc.selector.clone().unwrap_or_default();
                 let service_type = svc.service_type.clone().unwrap_or("ClusterIP".to_string());
+                // A node port is one host socket: two Services may not claim it.
+                let key = crate::store::obj_key(&ns, &name);
+                let listen_ports = |t: &str, ps: &[ServicePort]| -> Vec<u16> {
+                    match t {
+                        "NodePort" => ps.iter().filter_map(|p| p.node_port).collect(),
+                        "LoadBalancer" => ps.iter().map(|p| p.port).collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                for lp in listen_ports(&service_type, &ports) {
+                    if lp == 0 {
+                        return Err(format!("service/{name}: port 0 cannot be exposed on the node"));
+                    }
+                    if let Some((other, _)) = self.services.iter()
+                        .find(|(k, o)| **k != key && listen_ports(&o.service_type, &o.ports).contains(&lp)) {
+                        return Err(format!("service/{name}: node port {lp} is already allocated to service {other}"));
+                    }
+                }
                 let port_desc: Vec<String> = ports.iter().map(|p| format!("{}→{}", p.port, p.target_port)).collect();
-                self.services.insert(crate::store::obj_key(&ns, &name), StoredService {
+                self.services.insert(key, StoredService {
                     name: name.clone(), namespace: ns, selector, ports, service_type: service_type.clone(),
                 });
                 Ok(format!("service/{name} ({service_type}, ports: {})", port_desc.join(", ")))
@@ -1335,12 +1417,30 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let provisioner = spec.get("provisioner").and_then(|v| v.as_str())
-                    .unwrap_or("royak/host-path").to_string();
-                let host_path_prefix = spec.get("hostPathPrefix").and_then(|v| v.as_str())
-                    .unwrap_or("/data/royak/volumes").to_string();
-                let reclaim_policy = spec.get("reclaimPolicy").and_then(|v| v.as_str())
-                    .unwrap_or("Delete").to_string();
+                let provisioner = crate::storage::string_field(spec, &["provisioner"], "royak/host-path")?;
+                let native=provisioner==crate::storage_lifecycle::PROVISIONER;
+                let host_path_prefix = crate::storage::string_field(spec, &["hostPathPrefix"], if native {""} else {"/data/royak/volumes"})?;
+                let reclaim_policy = crate::storage::string_field(spec, &["reclaimPolicy"], "Delete")?;
+
+                if provisioner != "royak/host-path" && !native {
+                    return Err(format!("storageclass/{name}: unsupported provisioner {provisioner:?}; no storage driver is installed"));
+                }
+                if native && !host_path_prefix.is_empty() {
+                    return Err("managed storage never accepts a user-supplied host path".into());
+                }
+                if !native && crate::host_access::validate_public_path(&host_path_prefix).is_err() {
+                    return Err(format!("storageclass/{name}: unsafe hostPathPrefix"));
+                }
+                if !matches!(reclaim_policy.as_str(), "Retain" | "Delete") {
+                    return Err(format!("storageclass/{name}: reclaimPolicy must be Retain or Delete"));
+                }
+                if let Some(existing) = self.storage_classes.get(&name) {
+                    if existing.provisioner != provisioner || existing.host_path_prefix != host_path_prefix
+                        || existing.reclaim_policy != reclaim_policy {
+                        return Err(format!("storageclass/{name}: provisioning and retention settings are immutable"));
+                    }
+                    return Ok(format!("storageclass/{name} unchanged"));
+                }
 
                 self.storage_classes.insert(name.clone(), StoredStorageClass {
                     name: name.clone(),
@@ -1356,25 +1456,27 @@ impl DesiredWorld {
                 let name = resource.metadata.name.clone();
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let capacity = spec.get("capacity")
-                    .and_then(|c| c.get("storage"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("1Gi").to_string();
-                let storage_class = spec.get("storageClassName")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("local").to_string();
-                let host_path = spec.get("hostPath")
-                    .and_then(|h| h.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("/data").to_string();
-                let access_mode = spec.get("accessModes")
-                    .and_then(|a| a.as_sequence())
-                    .and_then(|s| s.first())
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ReadWriteOnce").to_string();
+                let capacity = crate::storage::string_field(spec, &["capacity", "storage"], "1Gi")?;
+                let capacity_bytes = crate::storage::capacity_bytes(&capacity)?;
+                let storage_class = crate::storage::string_field(spec, &["storageClassName"], "local")?;
+                if self.storage_classes.get(&storage_class).is_some_and(|s|s.provisioner==crate::storage_lifecycle::PROVISIONER) {
+                    return Err("managed PV metadata is controller-owned; create a PersistentVolumeClaim instead".into());
+                }
+                let host_path = crate::storage::string_field(spec, &["hostPath", "path"], "/data")?;
+                let access_mode = crate::storage::access_mode(spec)?;
 
-                if !validate_path(&host_path) {
+                if crate::host_access::validate_public_path(&host_path).is_err() {
                     return Err(format!("pv/{name}: unsafe hostPath {host_path}"));
+                }
+                // Reapply is not a release/adoption operation. In particular,
+                // it cannot turn a Bound or Released volume back to Available.
+                if let Some(existing) = self.pvs.get(&name) {
+                    if crate::storage::capacity_bytes(&existing.capacity)? != capacity_bytes
+                        || existing.storage_class != storage_class || existing.host_path != host_path
+                        || existing.access_mode != access_mode {
+                        return Err(format!("pv/{name}: capacity, class, path and access mode are immutable; expansion is not implemented"));
+                    }
+                    return Ok(format!("pv/{name} unchanged"));
                 }
                 // The host directory is created when a pod mounts it (or after
                 // the commit, see materialize_storage) — never during apply,
@@ -1396,29 +1498,29 @@ impl DesiredWorld {
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let spec = resource.spec.as_ref().ok_or("No spec")?;
 
-                let storage_class = spec.get("storageClassName")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("local").to_string();
-                let requested = spec.get("resources")
-                    .and_then(|r| r.get("requests"))
-                    .and_then(|r| r.get("storage"))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("1Gi").to_string();
-                let access_mode = spec.get("accessModes")
-                    .and_then(|a| a.as_sequence())
-                    .and_then(|s| s.first())
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ReadWriteOnce").to_string();
+                let storage_class = crate::storage::string_field(spec, &["storageClassName"], "local")?;
+                let requested = crate::storage::string_field(spec, &["resources", "requests", "storage"], "1Gi")?;
+                let requested_bytes = crate::storage::capacity_bytes(&requested)?;
+                let access_mode = crate::storage::access_mode(spec)?;
 
                 let key = crate::store::obj_key(&ns, &name);
+                if self.storage_classes.get(&storage_class).is_some_and(|s|s.provisioner==crate::storage_lifecycle::PROVISIONER)
+                    && access_mode!="ReadWriteOnce" {
+                    return Err("managed replicated volumes require ReadWriteOnce and one active writer pod".into());
+                }
                 // Re-applying a bound claim keeps its binding.
                 if let Some(existing) = self.pvcs.get(&key) {
                     if let Some(pv) = existing.bound_pv.clone() {
-                        let requested2 = requested.clone();
-                        self.pvcs.insert(key, StoredPVC {
-                            name: name.clone(), namespace: ns, storage_class,
-                            requested: requested2, access_mode, bound_pv: Some(pv.clone()),
-                        });
+                        if existing.storage_class != storage_class || existing.access_mode != access_mode
+                            || crate::storage::capacity_bytes(&existing.requested)? != requested_bytes {
+                            return Err(format!("pvc/{name}: a bound claim is immutable; expansion is not implemented"));
+                        }
+                        let volume = self.pvs.get(&pv).ok_or_else(|| format!("pvc/{name}: bound PV is missing"))?;
+                        if volume.status != PVStatus::Bound || volume.bound_to.as_deref() != Some(key.as_str())
+                            || volume.storage_class != storage_class || volume.access_mode != access_mode
+                            || crate::storage::capacity_bytes(&volume.capacity)? < requested_bytes {
+                            return Err(format!("pvc/{name}: inconsistent PV binding; refusing to adopt storage"));
+                        }
                         return Ok(format!("pvc/{name} Bound ({requested}) → pv/{pv}"));
                     }
                 }
@@ -1426,8 +1528,10 @@ impl DesiredWorld {
                 let mut bound_pv = None;
                 for (pv_name, pv) in self.pvs.iter_mut() {
                     if pv.status == PVStatus::Available
+                        && pv.bound_to.is_none()
                         && pv.storage_class == storage_class
                         && pv.access_mode == access_mode
+                        && crate::storage::capacity_bytes(&pv.capacity).is_ok_and(|n| n >= requested_bytes)
                     {
                         pv.status = PVStatus::Bound;
                         pv.bound_to = Some(key.clone());
@@ -1439,8 +1543,17 @@ impl DesiredWorld {
                 // Dynamic provisioning: if no PV matches, use StorageClass to create one
                 if bound_pv.is_none() {
                     if let Some(sc) = self.storage_classes.get_mut(&storage_class) {
-                        let pv_name = format!("pv-auto-{}-{}", sc.name, sc.provisioned_count);
-                        let host_path = format!("{}/{}/{}", sc.host_path_prefix, ns, name);
+                        let native=sc.provisioner==crate::storage_lifecycle::PROVISIONER;
+                        if !native && (sc.provisioner != "royak/host-path" || !validate_path(&sc.host_path_prefix)) {
+                            return Err(format!("pvc/{name}: unsupported or unsafe provisioner"));
+                        }
+                        let count = sc.provisioned_count.checked_add(1).ok_or("storage class provision counter exhausted")?;
+                        // Fresh data identity even when the same claim/class is
+                        // deleted and recreated. Retained paths are never reused.
+                        let identity = format!("{:032x}", rand::random::<u128>());
+                        let pv_name = format!("pv-auto-{identity}");
+                        if self.pvs.contains_key(&pv_name) { return Err("storage identity collision; retry admission".into()); }
+                        let host_path = if native {String::new()} else {format!("{}/{}/{name}-{identity}", sc.host_path_prefix, ns)};
                         // Directory is created after commit (materialize_storage).
 
                         let pv = StoredPV {
@@ -1453,7 +1566,7 @@ impl DesiredWorld {
                             bound_to: Some(key.clone()),
                         };
                         self.pvs.insert(pv_name.clone(), pv);
-                        sc.provisioned_count += 1;
+                        sc.provisioned_count = count;
                         bound_pv = Some(pv_name);
                         let _ = &host_path;
                     }
@@ -1476,6 +1589,7 @@ impl DesiredWorld {
 
             "DaemonSet" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid DaemonSet spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let c = dep.template.spec.containers.first().ok_or("DaemonSet has no containers")?;
@@ -1483,13 +1597,14 @@ impl DesiredWorld {
                 self.daemonsets.insert(crate::store::obj_key(&ns, &name), StoredDaemonSet {
                     name: name.clone(),
                     namespace: ns,
-                    container: parse_container(c, &volume_map),
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
                 });
                 Ok(format!("daemonset/{name} applied (runs on every node)"))
             }
 
             "Job" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid Job spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let c = dep.template.spec.containers.first().ok_or("Job has no containers")?;
@@ -1499,7 +1614,7 @@ impl DesiredWorld {
                 self.jobs.insert(crate::store::obj_key(&ns, &name), StoredJob {
                     name: name.clone(),
                     namespace: ns,
-                    container: parse_container(c, &volume_map),
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
                     completions,
                     status: JobStatus::Pending,
                 });
@@ -1508,6 +1623,7 @@ impl DesiredWorld {
 
             "CronJob" => {
                 let dep = spec::as_deployment(resource).ok_or("Invalid CronJob spec")?;
+                validate_single_container_probe_scope(&dep.template.spec)?;
                 let name = resource.metadata.name.clone();
                 let ns = resource.metadata.namespace.clone().unwrap_or("default".to_string());
                 let c = dep.template.spec.containers.first().ok_or("CronJob has no containers")?;
@@ -1524,7 +1640,7 @@ impl DesiredWorld {
                     name: name.clone(),
                     namespace: ns,
                     schedule: schedule.clone(),
-                    container: parse_container(c, &volume_map),
+                    container: parse_container(c, &volume_map, dep.template.spec.security_context.as_ref())?,
                     last_run,
                 });
                 Ok(format!("cronjob/{name} scheduled ({schedule})"))
@@ -2305,6 +2421,62 @@ impl DesiredWorld {
     /// Docker itself — the caller does that only after a successful commit,
     /// and the reconcile loop garbage-collects the containers.
     pub fn delete_resource(&mut self, resource_type: &str, ns: &str, name: &str) -> Option<Vec<String>> {
+        if self.validate_storage_delete(resource_type,ns,name).is_err() { return None; }
+        let result=self.delete_resource_inner(resource_type,ns,name);
+        if result.is_some() {
+            // A commit validates the resulting identities before publishing;
+            // do not discard old identities to mask a namespace mismatch.
+            let _ = self.synchronize_storage_identities();
+        }
+        result
+    }
+
+    /// Admission must not remove a claimed PV, nor erase arbitrary legacy host
+    /// paths while writers may still be using them. A real driver needs durable
+    /// detach/fencing acknowledgements before honoring Delete. Until that
+    /// lifecycle is implemented, legacy Delete fails explicitly instead of
+    /// acknowledging deletion and removing a directory behind a running pod.
+    pub fn validate_storage_delete(&self, kind: &str, ns: &str, name: &str) -> Result<(),String> {
+        match kind {
+            "persistentvolumes"|"persistentvolume"|"pvs"|"pv" => {
+                if self.pvs.get(name).is_some_and(|v|v.status==PVStatus::Bound)
+                    || self.pvcs.values().any(|c|c.bound_pv.as_deref()==Some(name)) {
+                    return Err("persistentvolume is still claimed; delete/detach the claim before removing PV metadata".into());
+                }
+            },
+            "persistentvolumeclaims"|"persistentvolumeclaim"|"pvcs"|"pvc" => {
+                if let Some(c)=self.pvcs.get(&crate::store::obj_key(ns,name)) {
+                    if let Some(pv)=&c.bound_pv {
+                        if let Some(uid)=self.storage_identities.volumes.get(pv) {
+                            if !self.storage_identities.lifecycle.may_remove_metadata(uid) {
+                                return Err("managed volume needs verified release/detach/fencing before metadata deletion".into());
+                            }
+                        }
+                        let pv=self.pvs.get(pv).ok_or("claim binding is inconsistent; refusing data deletion")?;
+                        if self.storage_classes.get(&pv.storage_class).is_some_and(|sc|sc.provisioner=="royak/host-path" && sc.reclaim_policy=="Delete") {
+                            return Err("legacy host-path Delete reclaim is not qualified: no durable detach/fencing proof; data was NOT removed".into());
+                        }
+                    }
+                }
+            },
+            "storageclasses"|"storageclass" => {
+                if self.pvs.values().filter(|pv|pv.storage_class==name).any(|pv|
+                    self.storage_identities.lifecycle.for_pv(&self.storage_identities,&pv.name)
+                        .is_some_and(|v|!matches!(v.phase(),crate::storage_lifecycle::Phase::Released|crate::storage_lifecycle::Phase::Deleted))) {
+                    return Err("storage class still owns managed volume lifecycle records".into());
+                }
+            },
+            "namespaces"|"namespace"|"ns" => {
+                for c in self.pvcs.values().filter(|c|c.namespace==name) {
+                    self.validate_storage_delete("pvc",name,&c.name)?;
+                }
+            },
+            _=>{},
+        }
+        Ok(())
+    }
+
+    fn delete_resource_inner(&mut self, resource_type: &str, ns: &str, name: &str) -> Option<Vec<String>> {
         use crate::store::obj_key;
         let key = obj_key(ns, name);
         let none = || Some(Vec::new());
@@ -2336,6 +2508,10 @@ impl DesiredWorld {
             "clusterrolebindings" | "clusterrolebinding" => self.rbac_bindings.remove(name).and_then(|_| none()),
             "persistentvolumes" | "persistentvolume" | "pvs" | "pv" => self.pvs.remove(name).and_then(|_| none()),
             "persistentvolumeclaims" | "persistentvolumeclaim" | "pvcs" | "pvc" => {
+                if let Some(uid)=self.pvcs.get(&key).and_then(|c|c.bound_pv.as_ref())
+                    .and_then(|pv|self.storage_identities.volumes.get(pv)).cloned() {
+                    if self.storage_identities.lifecycle.cancel_unstarted(&uid).is_err() {return None;}
+                }
                 let pvc = self.pvcs.remove(&key)?;
                 let mut cleanup = Vec::new();
                 if let Some(pv_name) = &pvc.bound_pv {
@@ -2346,7 +2522,7 @@ impl DesiredWorld {
                         // StorageClass reclaim policy Delete → PV and data go.
                         if let Some(sc) = self.storage_classes.get(&pv.storage_class) {
                             if sc.reclaim_policy == "Delete" {
-                                cleanup.push(pv.host_path.clone());
+                                if sc.provisioner=="royak/host-path" {cleanup.push(pv.host_path.clone());}
                                 drop_pv = true;
                             }
                         }
@@ -2387,7 +2563,7 @@ impl DesiredWorld {
 
     /// Cascade-delete a namespace and every namespaced object in it. Returns
     /// host paths to clean up after commit.
-    pub fn delete_namespace(&mut self, ns: &str) -> Vec<String> {
+    fn delete_namespace(&mut self, ns: &str) -> Vec<String> {
         let prefix = format!("{ns}/");
         let in_ns = |k: &String| k.starts_with(&prefix);
         let mut cleanup = Vec::new();
@@ -2424,9 +2600,9 @@ impl DesiredWorld {
     /// Idempotent; called after commits and by the reconcile loop.
     pub fn materialize_storage(&self) {
         for pvc in self.pvcs.values() {
-            let Some(pv) = pvc.bound_pv.as_ref().and_then(|n| self.pvs.get(n)) else { continue };
+            let Ok(pv) = crate::storage::bound_volume(self, &pvc.namespace, &pvc.name) else { continue };
             let provisioner = self.storage_classes.get(&pv.storage_class).map(|sc| sc.provisioner.as_str());
-            if matches!(provisioner, None | Some("royak/host-path")) && validate_path(&pv.host_path) {
+            if matches!(provisioner, None | Some("royak/host-path")) && crate::host_access::validate_resolved_public_path(&pv.host_path).is_ok() {
                 if let Err(e) = std::fs::create_dir_all(&pv.host_path) {
                     eprintln!("  ⚠ [storage] cannot create {}: {e}", pv.host_path);
                 }
@@ -2455,8 +2631,14 @@ pub fn cleanup_paths(paths: &[String]) {
 fn pod_volume_map(vols: &[spec::VolumeSpec], vct_map: HashMap<String, String>) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
     for v in vols {
+        if !crate::store::is_dns_label(&v.name) || map.contains_key(&v.name) {
+            return Err("volume names must be unique RFC1123 labels".into());
+        }
+        if [v.host_path.is_some(),v.empty_dir.is_some(),v.config_map.is_some(),v.secret.is_some(),v.pvc.is_some()].into_iter().filter(|v|*v).count()!=1 {
+            return Err("volume must define exactly one supported source".into());
+        }
         if let Some(hp) = &v.host_path {
-            if !validate_path(&hp.path) {
+            if crate::host_access::validate_public_path(&hp.path).is_err() {
                 return Err(format!("volume {}: unsafe hostPath {:?} rejected", v.name, hp.path));
             }
             map.insert(v.name.clone(), hp.path.clone());
@@ -2476,18 +2658,84 @@ fn pod_volume_map(vols: &[spec::VolumeSpec], vct_map: HashMap<String, String>) -
     Ok(map)
 }
 
-fn parse_probe(p: &spec::ProbeSpec) -> StoredProbe {
-    StoredProbe {
-        http_get: p.http_get.as_ref().map(|h| (h.path.clone(), h.port)),
-        exec: p.exec.as_ref().map(|e| e.command.clone()),
+/// Validate and store a probe. A probe must have exactly one supported
+/// handler — an empty, ambiguous or unsupported probe is rejected here rather
+/// than silently counting as healthy at runtime.
+fn parse_probe(kind: &str, p: &spec::ProbeSpec) -> Result<StoredProbe, String> {
+    if !crate::security::runtime_supported() {
+        return Err(format!("{kind}: health probes require Docker runtime; experimental NeuroPod does not execute them"));
+    }
+    if p.period_seconds == 0 || p.timeout_seconds == 0 || p.failure_threshold == 0 || p.success_threshold == 0 {
+        return Err(format!("{kind}: periodSeconds, timeoutSeconds and thresholds must be positive"));
+    }
+    if [p.period_seconds, p.timeout_seconds, p.initial_delay_seconds, p.failure_threshold as u64, p.success_threshold as u64]
+        .iter().any(|n| *n > i32::MAX as u64) {
+        return Err(format!("{kind}: probe timing/threshold value exceeds int32 range"));
+    }
+    if !kind.ends_with("readinessProbe") && p.success_threshold != 1 {
+        return Err(format!("{kind}: successThreshold must be 1 for startup/liveness"));
+    }
+    let port = |what: &str, port: &spec::ProbePort| -> Result<u16, String> {
+        match port {
+            spec::ProbePort::Number(n) if (1..=65535).contains(n) => Ok(*n as u16),
+            spec::ProbePort::Number(n) => Err(format!("{kind}: {what} port {n} is out of range (1-65535)")),
+            spec::ProbePort::Name(name) => Err(format!(
+                "{kind}: {what} uses named port {name:?}; Royak does not resolve named ports — use the port number")),
+        }
+    };
+    if p.grpc.is_some() {
+        return Err(format!("{kind}: grpc probes are not supported (use httpGet, tcpSocket or exec)"));
+    }
+    let handlers = [p.http_get.is_some(), p.exec.is_some(), p.tcp_socket.is_some()].iter().filter(|h| **h).count();
+    if handlers == 0 {
+        return Err(format!("{kind}: no handler — set exactly one of httpGet, tcpSocket or exec"));
+    }
+    if handlers > 1 {
+        return Err(format!("{kind}: set exactly one of httpGet, tcpSocket or exec"));
+    }
+    let http_get = match &p.http_get {
+        Some(h) => {
+            if h.scheme.as_deref().unwrap_or("HTTP") != "HTTP" {
+                return Err(format!("{kind}: only HTTP probes are supported; HTTPS scheme is not implemented"));
+            }
+            Some((h.path.clone(), port("httpGet", &h.port)?))
+        }
+        None => None,
+    };
+    let exec = match &p.exec {
+        Some(e) if e.command.is_empty() || e.command[0].trim().is_empty() => {
+            return Err(format!("{kind}: exec command is empty"));
+        }
+        Some(e) => Some(e.command.clone()),
+        None => None,
+    };
+    let tcp_socket = match &p.tcp_socket {
+        Some(t) => Some(port("tcpSocket", &t.port)?),
+        None => None,
+    };
+    Ok(StoredProbe {
+        http_get,
+        exec,
+        tcp_socket,
         initial_delay_seconds: p.initial_delay_seconds,
         period_seconds: p.period_seconds,
         failure_threshold: p.failure_threshold,
-    }
+        timeout_seconds: p.timeout_seconds,
+        success_threshold: p.success_threshold,
+    })
 }
 
 /// The full stored container contract (shared by every workload kind).
-fn parse_container(c: &spec::ContainerSpec, volume_map: &HashMap<String, String>) -> StoredContainer {
+fn validate_single_container_probe_scope(pod: &spec::PodSpec) -> Result<(), String> {
+    if pod.containers.iter().skip(1).chain(pod.init_containers.iter().flatten()).any(|c|
+        c.liveness_probe.is_some() || c.readiness_probe.is_some() || c.startup_probe.is_some()) {
+        return Err("DaemonSet/Job/CronJob support probes only on their single modelled regular container; additional and init-container probes are unsupported".into());
+    }
+    Ok(())
+}
+
+fn parse_container(c: &spec::ContainerSpec, volume_map: &HashMap<String, String>, pod_security: Option<&crate::security::PodSecurityContext>) -> Result<StoredContainer, String> {
+    if !crate::store::is_dns_label(&c.name){return Err("container name must be an RFC1123 label".into());}
     let env: Vec<String> = c.env.as_ref()
         .map(|vars| vars.iter().filter_map(|e| e.value.as_ref().map(|v| format!("{}={}", e.name, v))).collect())
         .unwrap_or_default();
@@ -2521,7 +2769,9 @@ fn parse_container(c: &spec::ContainerSpec, volume_map: &HashMap<String, String>
     let env_from_secrets: Vec<String> = c.env_from.as_ref()
         .map(|refs| refs.iter().filter_map(|r| r.secret_ref.as_ref().map(|s| s.name.clone())).collect())
         .unwrap_or_default();
-    StoredContainer {
+    Ok(StoredContainer {
+        host_access: None,
+        security_context: crate::security::SecurityContext::effective(pod_security, c.security_context.as_ref())?,
         name: c.name.clone(),
         image: c.image.clone(),
         command,
@@ -2530,10 +2780,10 @@ fn parse_container(c: &spec::ContainerSpec, volume_map: &HashMap<String, String>
         env_from_secrets,
         env_refs,
         volumes,
-        liveness_probe: c.liveness_probe.as_ref().map(parse_probe),
-        readiness_probe: c.readiness_probe.as_ref().map(parse_probe),
-        startup_probe: c.startup_probe.as_ref().map(parse_probe),
-    }
+        liveness_probe: c.liveness_probe.as_ref().map(|p| parse_probe(&format!("container {:?} livenessProbe", c.name), p)).transpose()?,
+        readiness_probe: c.readiness_probe.as_ref().map(|p| parse_probe(&format!("container {:?} readinessProbe", c.name), p)).transpose()?,
+        startup_probe: c.startup_probe.as_ref().map(|p| parse_probe(&format!("container {:?} startupProbe", c.name), p)).transpose()?,
+    })
 }
 
 /// Decide which StatefulSet ordinal (if any) may be created THIS tick, honoring
@@ -2581,8 +2831,38 @@ pub fn reconcile_once(desired: &mut DesiredWorld, brain: &mut OrinBrain) -> Vec<
 }
 
 pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain, use_neuropod: bool) -> Vec<String> {
+    reconcile_with_observer(desired, brain, use_neuropod, &mut |_| true)
+}
+
+
+/// Pure scheduling observation, not authority for any runtime effect. Both
+/// unsupported entrypoints use this EXACT list for creation/healthy counting.
+fn unsupported_runtime_workloads(desired: &DesiredWorld, runtime: &str) -> (Vec<String>, Vec<String>) {
+    let mut admitted = Vec::new();
+    let mut log = Vec::new();
+    for (key, deployment) in &desired.deployments {
+        match crate::storage::observe_unsupported_runtime_storage(desired, &deployment.namespace,
+            &deployment.init_containers, &deployment.containers) {
+            crate::storage::UnsupportedRuntimeStorage::ProvenLegacy => admitted.push(key.clone()),
+            crate::storage::UnsupportedRuntimeStorage::Managed => log.push(format!(
+                "  [storage] {key}: {runtime} cannot mount managed PVCs; refusing workload without substituting an empty disk")),
+            crate::storage::UnsupportedRuntimeStorage::Unresolved => log.push(format!(
+                "  [storage] {key}: current PVC identity/binding is unresolved; refusing {runtime} fallback")),
+        }
+    }
+    (admitted, log)
+}
+
+fn runtime_docker_available() -> bool {
+    #[cfg(test)]
+    if let Some(available) = unsupported_storage_runtime_tests::docker_ping() { return available; }
+    crate::docker::ping()
+}
+
+fn reconcile_with_observer(desired: &mut DesiredWorld, brain: &mut OrinBrain, use_neuropod: bool,
+    publish_health: &mut dyn FnMut(&DesiredWorld) -> bool) -> Vec<String> {
     // Auto-detect: if NeuroPod requested OR Docker unavailable → NeuroPod mode (EXPERIMENTAL)
-    if use_neuropod || !crate::docker::ping() {
+    if use_neuropod || !runtime_docker_available() {
         return reconcile_neuropod(desired, brain);
     }
     // Docker mode: production-ready, 28/28 tests
@@ -2592,7 +2872,7 @@ pub fn reconcile_with_runtime(desired: &mut DesiredWorld, brain: &mut OrinBrain,
     if rt_name != "docker" {
         return reconcile_via_trait(desired, brain, &rt_name);
     }
-    docker_tick::reconcile_docker(desired, brain)
+    docker_tick::reconcile_docker(desired, brain, publish_health)
 }
 
 #[path = "reconcile_docker.rs"]
@@ -2627,8 +2907,16 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
         let target_ns = &policy.namespace;
         let selector = &policy.pod_selector;
 
+        // A restored/out-of-band policy can bypass ordinary admission. Do
+        // not attempt even namespace-network setup for an ambiguous native
+        // selection, nor call this a network revocation/fencing proof.
+        if crate::workload::managed::require_supported_policy_admission(desired,target_ns,selector).is_err(){
+            log.push(format!("  [netpol] {}: UNKNOWN unsupported native selection; no policy effects/enforced claim",policy.name));
+            continue;
+        }
+
         // Find containers matching the policy selector in this namespace
-        let matching: Vec<&&docker::DockerContainer> = managed.iter()
+        let selected: Vec<&&docker::DockerContainer> = managed.iter()
             .filter(|c| {
                 let in_ns = c.labels.get("royak.namespace").map(|s| s.as_str()) == Some(target_ns.as_str())
                     || (target_ns == "default" && !c.labels.contains_key("royak.namespace"));
@@ -2641,6 +2929,23 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
                 in_ns && matches_selector
             })
             .collect();
+
+        // Native policy is NOT implemented by legacy namespace membership or
+        // a NET_ADMIN helper. Restored/out-of-band unsupported policy is an
+        // explicit UNKNOWN, never a false `enforced` audit/marker/count.
+        let mut unsupported_native=false;
+        let matching:Vec<_>=selected.into_iter().filter(|c|{
+            let native=crate::docker::managed::registered_target(&c.id)
+                ||[crate::workload::managed::LABEL_WRITER,crate::workload::managed::LABEL_OPERATION,
+                    crate::workload::managed::LABEL_NONCE].iter().any(|key|c.labels.contains_key(*key))
+                ||c.names.iter().any(|name|desired.storage_identities.lifecycle.contains_writer_pod(
+                    target_ns,name.trim_start_matches('/')))
+                ||c.labels.get("royak.pod").is_some_and(|pod|
+                    desired.storage_identities.lifecycle.contains_writer_pod(target_ns,pod));
+            if native{unsupported_native=true;log.push(format!("  [netpol] {}: UNKNOWN unsupported native policy for {}; no legacy network/helper effect",
+                policy.name,c.id));}
+            !native
+        }).collect();
 
         if matching.is_empty() { continue; }
 
@@ -2761,8 +3066,8 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
             }
         }
 
-        log.push(format!("  [netpol] {}: enforced on {} pods (ns={target_ns}, selector={selector}{}{}{})",
-            policy.name, matching.len(),
+        log.push(format!("  [netpol] {}: {} on {} legacy pods (ns={target_ns}, selector={selector}{}{}{})",
+            policy.name, if unsupported_native{"legacy-only processing; native UNKNOWN"}else{"enforced"},matching.len(),
             if policy.internal { ", internal" } else { "" },
             if policy.mtls_required { ", mTLS" } else { "" },
             if policy.deny_all { ", deny-all" } else { "" },
@@ -2788,7 +3093,38 @@ fn enforce_network_policies(desired: &mut DesiredWorld, managed: &[&docker::Dock
 /// Reconcile loop for NeuroPod runtime — no Docker daemon needed.
 /// Creates/manages pods as isolated Linux processes with OverlayFS + namespaces.
 pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) -> Vec<String> {
-    let mut log = Vec::new();
+    let (admitted, mut log) = unsupported_runtime_workloads(desired, "NeuroPod");
+    if admitted.is_empty() && !log.is_empty() { return log; }
+    // Test-only trap is at the last edge before any filesystem/GC/bridge/disk
+    // effect. Production has no override or substitute runtime capability.
+    #[cfg(test)]
+    if let Some(rows) = unsupported_storage_runtime_tests::before_effect("neuropod", &admitted) {
+        log.extend(rows); return log;
+    }
+    let pods_root=dirs_or_home().join(".royak/pods");
+    let scope=crate::neuropod_gc::Owner::current(desired,"default","scope");
+    let records=crate::neuropod_gc::inventory(&pods_root);
+    for record in &records {
+        if !record.owner.same_scope(&scope) || record.owner.generation>desired.generation {continue;}
+        let record_key=crate::store::obj_key(&record.owner.namespace,&record.owner.deployment);
+        let dep=desired.deployments.get(&record_key);
+        // Current blocked workloads retain their old experimental resources;
+        // they are neither counted healthy nor reclaimed as a fallback effect.
+        if dep.is_some() && !admitted.contains(&record_key) { continue; }
+        let wanted=dep.map(|d|(1..=d.replicas).any(|i|record.name==format!("{}-{i}",crate::store::pod_stem(&d.namespace,&d.name)))).unwrap_or(false);
+        if !wanted {
+            match crate::neuropod_gc::reclaim(record,&scope) {
+                Ok(archive)=>log.push(format!("  [neuropod-gc] {} reclaimed; data retained at {}",record.name,archive.display())),
+                Err(error)=>log.push(format!("  [neuropod-gc] {} cleanup deferred: {error}",record.name)),
+            }
+        }
+    }
+    if crate::security::world_has_constraints(desired) {
+        log.push("  [security] NeuroPod cannot enforce securityContext; refusing pod creation".into());return log;
+    }
+    if crate::probes::world_has_probes(desired) {
+        log.push("  [probe] NeuroPod does not execute health probes; refusing silent unenforced startup".into());return log;
+    }
 
     // Initialize Cluster CA
     if desired.cluster_ca.is_none() {
@@ -2808,21 +3144,22 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
     let existing_names: std::collections::HashSet<String> = existing.iter()
         .map(|(name, _, _, _, _)| name.clone()).collect();
 
-    let mut pod_index: u32 = existing.len() as u32;
+    let mut used_ips:std::collections::HashSet<String>=existing.iter().filter_map(|(name,_,_,_,_)|
+        crate::neuropod_gc::read_meta(&pods_root.join(name)).ok().and_then(|m|m["network"]["ip"].as_str().map(str::to_string))).collect();
 
-    // For each deployment: create NeuroPods if needed
-    for (name, dep) in &desired.deployments {
+    // Only the exact admitted legacy keys can reach this runtime's effects.
+    for name in &admitted {
+        let dep = &desired.deployments[name];
         let mut running = 0u32;
         for i in 1..=dep.replicas {
             // Same per-namespace stem as Docker pods ("ns/name" keys must never
             // reach a pod, directory or netns name).
             let pod_name = format!("{}-{i}", crate::store::pod_stem(&dep.namespace, &dep.name));
             if existing_names.contains(&pod_name) {
-                // Check if actually running
-                let meta_path = dirs_or_home().join(".royak").join("pods").join(&pod_name).join("meta.json");
-                if meta_path.exists() {
-                    running += 1;
-                }
+                let meta=crate::neuropod_gc::read_meta(&pods_root.join(&pod_name));
+                let owned=meta.as_ref().ok().and_then(|m|serde_json::from_value::<crate::neuropod_gc::Owner>(m["owner"].clone()).ok()).map(|o|o.same_scope(&scope)&&o.namespace==dep.namespace&&o.deployment==dep.name).unwrap_or(false);
+                if owned && meta.as_ref().map(crate::neuropod_gc::process_running).unwrap_or(false){running+=1;}
+                else{log.push(format!("  [neuropod] {pod_name}: occupied or cleanup pending; not adopted"));}
                 continue;
             }
 
@@ -2838,7 +3175,10 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
                 .unwrap_or(512); // default 512MB disk
             let mount_path = "/data";
 
-            match crate::runtime::NeuroPod::create(&pod_name, &dep.image, disk_mb, mount_path) {
+            if pods_root.join(&pod_name).symlink_metadata().is_ok(){log.push(format!("  [neuropod] {pod_name}: unmanaged path collision; creation refused"));continue;}
+            let owner=crate::neuropod_gc::Owner::current(desired,&dep.namespace,&dep.name);
+            let Some(pod_index)=crate::runtime::next_pod_network_index(&used_ips) else {log.push(format!("  [neuropod] {pod_name}: pod network address capacity reached"));continue;};
+            match crate::runtime::NeuroPod::create_owned(&pod_name, &dep.image, disk_mb, mount_path,owner) {
                 Ok(mut pod) => {
                     // Collect env
                     let mut env = dep.env.clone();
@@ -2858,14 +3198,15 @@ pub fn reconcile_neuropod(desired: &mut DesiredWorld, _brain: &mut OrinBrain) ->
                     }
 
                     // Set up network
-                    pod_index += 1;
                     let ports: Vec<(u16, u16)> = Vec::new(); // TODO: parse from spec
                     match crate::runtime::create_pod_network(&pod_name, pod_index, &ports) {
                         Ok(net) => {
+                            used_ips.insert(net.ip.clone());
                             env.push(format!("NEUROPOD_IP={}", net.ip));
                             log.push(format!("    [net] {pod_name} → {} (bridge)", net.ip));
+                            if let Err(error)=pod.set_network(net.clone()){crate::runtime::destroy_pod_network(&net);log.push(format!("  [neuropod] {pod_name}: network metadata failed: {error}"));continue;}
                         }
-                        Err(e) => log.push(format!("    [net] {pod_name}: {e} (host networking)")),
+                        Err(e) => {log.push(format!("    [net] {pod_name}: {e}; managed startup refused"));continue;},
                     }
 
                     // Start
@@ -3003,9 +3344,9 @@ pub fn try_take_ownership(world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>
     if let Some(v) = loaded.migrated_from {
         // Persist the migrated form now (original kept as .v1.bak) so the
         // on-disk file and the served state are the same thing from tick one.
-        crate::persist::backup_before_migration(state_path)?;
+        crate::persist::backup_before_migration(state_path, v)?;
         crate::persist::save(state_path, &loaded.state, &[])?;
-        println!("  [migrate] {state_path}: schema v{v} → v{} written (backup: {state_path}.v1.bak)", crate::persist::SCHEMA_VERSION);
+        println!("  [migrate] {state_path}: schema v{v} → v{} written (backup: {state_path}.v{}.bak)", crate::persist::SCHEMA_VERSION, v.max(1));
     }
     {
         let mut w = world.write().unwrap_or_else(|e| e.into_inner());
@@ -3018,30 +3359,95 @@ pub fn try_take_ownership(world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>
 
 /// One reconcile tick with the commit contract applied to the loop itself.
 ///
-/// The tick runs on the live world (it needs runtime bookkeeping: probe state,
-/// events, census). Any change it makes to DESIRED state (HPA replicas, CronJob
-/// last-run, rollout progress, CA, hibernation) is then reverted and committed
-/// through `store::commit_state` like an API write — durable before it is
-/// visible. `commit_lock` is held for the whole tick so an API write can never
-/// interleave with (and be overwritten by) the tick's commit.
+/// Slow Docker/peer operations run on a detached snapshot. Committed desired
+/// state stays readable during graceful stops; only runtime observations merge
+/// back, and desired mutations still pass through the durable CAS commit.
+/// `commit_lock` retains the existing ordering against local API writes.
 pub fn reconcile_tick(
     world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
     brain: &mut OrinBrain,
     use_neuropod: bool,
 ) -> Vec<String> {
-    let _serial = crate::store::commit_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let base = world.read().unwrap_or_else(|e| e.into_inner()).to_state();
-    // Run, snapshot and revert under ONE write guard: no reader ever sees a
-    // desired-state change that is not yet durable.
-    let (mut log, after) = {
-        let mut w = world.write().unwrap_or_else(|e| e.into_inner());
-        let log = reconcile_with_runtime(&mut w, brain, use_neuropod);
-        let after = w.to_state();
-        if !after.same_content(&base) {
-            w.install_state(base.clone());
+    reconcile_tick_with(world, |working, publish| reconcile_with_observer(working, brain, use_neuropod, publish))
+}
+
+fn merge_tick_health(live: &mut DesiredWorld, base: &DesiredWorld, observed: &DesiredWorld) -> bool {
+    if live.generation != base.generation || live.cluster_id != base.cluster_id { return false; }
+    live.restart_count = observed.restart_count.clone();
+    live.startup_ok = observed.startup_ok.clone();
+    live.pod_ready = observed.pod_ready.clone();
+    live.pod_health = observed.pod_health.clone();
+    true
+}
+
+fn merge_tick_observations(live: &mut DesiredWorld, base: &DesiredWorld, observed: &DesiredWorld) -> bool {
+    if !merge_tick_health(live, base, observed) { return false; }
+    live.netpol_applied = observed.netpol_applied.clone();
+    live.cluster_ca = observed.cluster_ca.clone();
+    live.pod_certs = observed.pod_certs.clone();
+    live.network_audit = observed.network_audit.clone();
+    live.net_tracker = observed.net_tracker.clone();
+    let me = local_node_name();
+    if let Some(local) = observed.nodes.get(&me) { live.nodes.insert(me.clone(), local.clone()); }
+    // Heartbeats continue while the tick does I/O. Never replace a fresh peer
+    // address/stats/heartbeat with its older snapshot or demote a fresh peer.
+    for (name, node) in &observed.nodes {
+        if name == &me { continue; }
+        if let (Some(before), Some(current)) = (base.nodes.get(name), live.nodes.get_mut(name)) {
+            if current.last_heartbeat == before.last_heartbeat && current.address == before.address {
+                current.status = node.status.clone();
+            }
         }
-        (log, after)
-    };
+    }
+    // Runtime API events may arrive without a desired-state commit. Merge only
+    // this tick's count delta, preserving concurrent events and their messages.
+    for event in &observed.events {
+        let same = |e: &&ClusterEvent| e.namespace == event.namespace && e.object == event.object && e.reason == event.reason;
+        let old = base.events.iter().find(same).map(|e| e.count).unwrap_or(0);
+        let delta = event.count.saturating_sub(old);
+        if delta == 0 { continue; }
+        if let Some(current) = live.events.iter_mut().find(|e| e.namespace == event.namespace && e.object == event.object && e.reason == event.reason) {
+            if current.count == old || current.last_seen < event.last_seen {
+                current.last_seen = event.last_seen.clone(); current.message = event.message.clone();
+            }
+            current.count = current.count.saturating_add(delta);
+        } else {
+            let mut added = event.clone(); added.count = delta; live.events.push(added);
+        }
+    }
+    if live.events.len() > 200 { live.events.drain(..live.events.len() - 200); }
+    // A pipeline may also be triggered through the runtime API during I/O.
+    for run in &observed.pipeline_runs {
+        let same = |r: &&PipelineRun| r.pipeline == run.pipeline && r.run_id == run.run_id && r.started_at == run.started_at;
+        let before = base.pipeline_runs.iter().find(same);
+        if let Some(current) = live.pipeline_runs.iter_mut().find(|r| r.pipeline == run.pipeline && r.run_id == run.run_id && r.started_at == run.started_at) {
+            for (name, status) in &run.stage_status {
+                let old = before.and_then(|b| b.stage_status.iter().find(|(n, _)| n == name)).map(|(_, s)| s);
+                if let Some((_, current_status)) = current.stage_status.iter_mut().find(|(n, _)| n == name) {
+                    if old == Some(&*current_status) && old != Some(status) { *current_status = status.clone(); }
+                }
+            }
+        } else if before.is_none() { live.pipeline_runs.push(run.clone()); }
+    }
+    true
+}
+
+fn reconcile_tick_with(
+    world: &std::sync::Arc<std::sync::RwLock<DesiredWorld>>,
+    run: impl FnOnce(&mut DesiredWorld, &mut dyn FnMut(&DesiredWorld) -> bool) -> Vec<String>,
+) -> Vec<String> {
+    let _serial = crate::store::commit_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let before = world.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let base = before.to_state();
+    let mut working = before.clone();
+    let mut publish = |observed: &DesiredWorld| merge_tick_health(
+        &mut world.write().unwrap_or_else(|e| e.into_inner()), &before, observed);
+    let mut log = run(&mut working, &mut publish);
+    let after = working.to_state();
+    if !merge_tick_observations(&mut world.write().unwrap_or_else(|e| e.into_inner()), &before, &working) {
+        log.push("  [warn] reconcile snapshot superseded by committed state; observations discarded".into());
+        return log;
+    }
     if after.same_content(&base) {
         return log;
     }
@@ -3055,6 +3461,122 @@ pub fn reconcile_tick(
         Err(e) => log.push(format!("  [warn] reconcile bookkeeping not committed (will retry): {e:?}")),
     }
     log
+}
+
+#[cfg(test)]
+mod tick_snapshot_tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn replacement_readiness_is_visible_before_slow_retirement_without_desired_leak() {
+        let world = Arc::new(RwLock::new(DesiredWorld::new()));
+        let worker_world = world.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || reconcile_tick_with(&worker_world, |working, publish| {
+            working.pod_ready.insert("replacement".into());
+            working.namespaces.push("not-committed".into());
+            assert!(publish(working));
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200)); // old pod retirement
+            working.namespaces.pop();
+            Vec::new()
+        }));
+        rx.recv().unwrap();
+        let live = world.try_read().expect("retirement I/O must not block readers");
+        assert!(live.pod_ready.contains("replacement"));
+        assert!(!live.namespaces.iter().any(|n| n == "not-committed"));
+        drop(live);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn slow_tick_keeps_committed_state_readable() {
+        let world = Arc::new(RwLock::new(DesiredWorld::new()));
+        let worker_world = world.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || reconcile_tick_with(&worker_world, |working, _| {
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            working.pod_ready.insert("observed-pod".into());
+            Vec::new()
+        }));
+        rx.recv().unwrap();
+        assert!(world.try_read().is_ok(), "slow container operations must not monopolize committed-state readers");
+        worker.join().unwrap();
+        assert!(world.read().unwrap().pod_ready.contains("observed-pod"));
+    }
+
+    #[test]
+    fn publishing_observations_cannot_publish_desired_mutations() {
+        let mut live = DesiredWorld::new();
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.namespaces.push("not-committed".into());
+        observed.pod_ready.insert("actual-pod".into());
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.to_state().same_content(&base.to_state()));
+        assert!(live.pod_ready.contains("actual-pod"));
+    }
+
+    #[test]
+    fn stale_tick_cannot_overwrite_newer_committed_state_or_observations() {
+        let mut live = DesiredWorld::new();
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.pod_ready.insert("obsolete".into());
+        live.generation += 1;
+        live.pod_ready.insert("fresh".into());
+        assert!(!merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.pod_ready.contains("fresh"));
+        assert!(!live.pod_ready.contains("obsolete"));
+    }
+
+    #[test]
+    fn runtime_event_merge_preserves_concurrent_api_events_and_counts() {
+        let mut live = DesiredWorld::new();
+        live.record_event("Pod", "a", "Created", "base", "Normal");
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.record_event("Pod", "a", "Created", "tick", "Normal");
+        live.record_event("Pod", "a", "Created", "api", "Normal");
+        live.record_event("Pipeline", "b", "Triggered", "api-only", "Normal");
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert_eq!(live.events.iter().find(|e| e.object == "a").unwrap().count, 3);
+        assert!(live.events.iter().any(|e| e.object == "b" && e.message == "api-only"));
+    }
+
+    #[test]
+    fn runtime_pipeline_merge_preserves_concurrent_triggers_and_stage_updates() {
+        let mut live = DesiredWorld::new();
+        live.pipeline_runs.push(PipelineRun { pipeline: "build".into(), run_id: 1,
+            stage_status: vec![("test".into(), StageStatus::Pending)], started_at: Instant::now() });
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.pipeline_runs[0].stage_status[0].1 = StageStatus::Succeeded;
+        live.pipeline_runs.push(PipelineRun { pipeline: "build".into(), run_id: 2,
+            stage_status: vec![], started_at: Instant::now() });
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert_eq!(live.pipeline_runs.len(), 2);
+        assert!(live.pipeline_runs[0].stage_status[0].1 == StageStatus::Succeeded);
+    }
+
+    #[test]
+    fn runtime_merge_cannot_demote_a_peer_with_a_fresh_heartbeat() {
+        let mut live = DesiredWorld::new();
+        let peer = format!("peer-other-than-{}", local_node_name());
+        record_peer(&mut live, &NodeHello { node: peer.clone(), address: "10.0.0.2:6443".into(),
+            cpu_used: 1.0, mem_used: 1.0, mem_capacity: 100.0, pod_count: 1 });
+        let base = live.clone();
+        let mut observed = base.clone();
+        observed.nodes.get_mut(&peer).unwrap().status = NodeStatus::NotReady;
+        let fresh = live.nodes.get_mut(&peer).unwrap();
+        fresh.last_heartbeat += 1;
+        fresh.address = "10.0.0.3:6443".into();
+        assert!(merge_tick_observations(&mut live, &base, &observed));
+        assert!(live.nodes[&peer].status == NodeStatus::Ready);
+        assert_eq!(live.nodes[&peer].address, "10.0.0.3:6443");
+    }
 }
 
 pub fn run_loop_shared_with_runtime(
@@ -3593,9 +4115,16 @@ pub fn validate_path(path: &str) -> bool {
 /// stopped or removed. Cluster placement, probes, rollouts and the unified
 /// workload contract are Docker-only.
 fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_name: &str) -> Vec<String> {
+    let (admitted, mut log) = unsupported_runtime_workloads(desired, rt_name);
+    if admitted.is_empty() && !log.is_empty() { return log; }
+    // Even the legacy runtime factory can create directories. Never construct
+    // it for blocked-only work; the test trap is BEFORE that first effect.
+    #[cfg(test)]
+    if let Some(rows) = unsupported_storage_runtime_tests::before_effect(rt_name, &admitted) {
+        log.extend(rows); return log;
+    }
     use crate::runtime::{self, ContainerState};
     let rt = runtime::get_runtime(rt_name);
-    let mut log = Vec::new();
     if crate::raft_node::is_clustered() {
         log.push(format!("  [error] runtime {rt_name} is single-node only; cluster mode requires the docker runtime"));
         return log;
@@ -3614,8 +4143,7 @@ fn reconcile_via_trait(desired: &mut DesiredWorld, _brain: &mut OrinBrain, rt_na
     };
     let me_name = local_node_name();
     let mut local_pods = 0u32;
-    let keys: Vec<String> = desired.deployments.keys().cloned().collect();
-    for key in keys {
+    for key in admitted {
         let dep = desired.deployments[&key].clone();
         let stem = crate::store::pod_stem(&dep.namespace, &dep.name);
         let running: Vec<&runtime::Container> = actual.iter()
@@ -3675,24 +4203,27 @@ fn normalize_image(image: &str) -> String {
     }
 }
 
-fn check_probe(container_id: &str, probe: &StoredProbe) -> bool {
-    if let Some((path, port)) = &probe.http_get {
-        // HTTP GET probe
-        match docker::http_check_container(container_id, path, *port) {
-            Ok(healthy) => return healthy,
-            Err(_) => return false,
-        }
-    }
-    if let Some(cmd) = &probe.exec {
-        // Exec probe
+/// Run one probe. Only a handler that actually ran and passed counts as
+/// healthy: errors, timeouts, missing tools and handler-less probes all fail.
+fn check_probe(container_id: &str, probe: &StoredProbe) -> Option<bool> {
+    let timeout = std::time::Duration::from_secs(probe.timeout_seconds.max(1));
+    let result = if let Some((path, port)) = &probe.http_get {
+        docker::http_check_container(container_id, path, *port, timeout)
+    } else if let Some(port) = probe.tcp_socket {
+        docker::tcp_check_container(container_id, port, timeout)
+    } else if let Some(cmd) = &probe.exec {
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        match docker::exec_in_container(container_id, &cmd_refs) {
-            Ok((exit_code, _)) => return exit_code == 0,
-            Err(_) => return false,
+        docker::probe_exec(container_id, &cmd_refs, timeout).map(|code| code == 0)
+    } else {
+        Err("probe has no handler".to_string())
+    };
+    match result {
+        Ok(healthy) => Some(healthy),
+        Err(e) => {
+            eprintln!("  [probe] {container_id}: {e}");
+            if docker::exec_admission_unknown(&e) { None } else { Some(false) }
         }
     }
-    // No probe configured = healthy
-    true
 }
 
 // ─── Multi-Node Cluster ───
@@ -3906,9 +4437,15 @@ pub fn find_pod_node(world: &DesiredWorld, pod_name: &str) -> Option<(String, St
     None
 }
 
-/// Fetch a pod's logs from the peer that runs it (signed node request).
-pub fn fetch_remote_logs(peer_addr: &str, ns: &str, pod_name: &str) -> Result<String, String> {
-    node_get(peer_addr, &format!("/royak/v1/pod-logs/{ns}/{pod_name}"), Duration::from_secs(15))
+/// Trusted local node operator (already has the private state/cluster key).
+/// HTTP users never call this helper: their verified identity is forwarded.
+pub fn fetch_remote_logs(world:&DesiredWorld,peer_addr:&str,ns:&str,pod_name:&str)->Result<String,String>{
+    let namespace_uid=world.storage_identities.namespaces.get(ns).cloned().ok_or("namespace identity missing")?;
+    let request=crate::pod_access::LogRequest{namespace:ns.into(),namespace_uid,pod:pod_name.into(),container:None,tail:200,
+        user:format!("node-operator:{}",crate::store::node_name()),groups:vec![crate::auth::MASTERS_GROUP.into()]};
+    let raw=node_post(peer_addr,"/royak/v2/pod-logs",&serde_json::to_string(&request).map_err(|e|e.to_string())?,Duration::from_secs(15))?;
+    let (status,body):(u16,String)=serde_json::from_str(&raw).map_err(|_|"invalid caller-bound log response")?;
+    if status==200 {Ok(body)}else{Err(format!("peer logs HTTP {status}: {body}"))}
 }
 
 /// Minimal standard-base64 decoder (Secret `data:` values are base64 in K8s).
@@ -4128,3 +4665,565 @@ fn get_system_mem() -> f32 {
             .unwrap_or(8192.0)
     }
 }
+
+#[cfg(test)]
+mod storage_binding_tests {
+    use super::*;
+
+    fn apply(w: &mut DesiredWorld, kind: &str, ns: &str, name: &str, spec: serde_json::Value) -> Result<String, String> {
+        let r: Resource = serde_json::from_value(serde_json::json!({
+            "kind": kind, "metadata": {"name": name, "namespace": ns}, "spec": spec
+        })).unwrap();
+        w.apply(&r)
+    }
+    fn pv(w: &mut DesiredWorld, name: &str, size: &str) -> Result<String, String> {
+        apply(w, "PersistentVolume", "default", name, serde_json::json!({
+            "capacity": {"storage": size}, "hostPath": {"path": format!("/tmp/royak-binding-tests/{name}")}
+        }))
+    }
+    fn claim(w: &mut DesiredWorld, ns: &str, name: &str, size: &str) -> Result<String, String> {
+        apply(w, "PersistentVolumeClaim", ns, name, serde_json::json!({"resources": {"requests": {"storage": size}}}))
+    }
+
+    #[test]
+    fn small_pv_never_satisfies_larger_claim() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "small", "512Mi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(w.pvcs["a/data"].bound_pv.is_none());
+        assert!(w.pvs["small"].status == PVStatus::Available);
+        pv(&mut w, "large", "2Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert_eq!(w.pvcs["a/data"].bound_pv.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn pv_reapply_preserves_binding_and_rejects_mutation() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        assert!(w.pvs["disk"].status == PVStatus::Bound);
+        assert_eq!(w.pvs["disk"].bound_to.as_deref(), Some("a/data"));
+        assert!(pv(&mut w, "disk", "2Gi").is_err());
+        claim(&mut w, "b", "data", "1Gi").unwrap();
+        assert!(w.pvcs["b/data"].bound_pv.is_none());
+    }
+
+    #[test]
+    fn bound_claim_is_immutable_and_requires_reciprocal_binding() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(claim(&mut w, "a", "data", "2Gi").is_err());
+        assert_eq!(w.pvcs["a/data"].requested, "1Gi");
+        w.pvs.get_mut("disk").unwrap().bound_to = Some("b/data".into());
+        assert!(claim(&mut w, "a", "data", "1Gi").is_err());
+    }
+
+    #[test]
+    fn released_volume_cannot_be_rearmed_by_reapply() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        w.delete_resource("pvc", "a", "data").unwrap();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        assert!(w.pvs["disk"].status == PVStatus::Released);
+        claim(&mut w, "b", "data", "1Gi").unwrap();
+        assert!(w.pvcs["b/data"].bound_pv.is_none());
+    }
+
+    #[test]
+    fn storage_class_reapply_preserves_counter_and_incarnation_paths() {
+        let mut w = DesiredWorld::new();
+        let sc = serde_json::json!({"hostPathPrefix": "/tmp/royak-binding-tests", "reclaimPolicy": "Retain"});
+        apply(&mut w, "StorageClass", "default", "local", sc.clone()).unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        let first = w.pvcs["a/data"].bound_pv.clone().unwrap();
+        let first_path = w.pvs[&first].host_path.clone();
+        apply(&mut w, "StorageClass", "default", "local", sc).unwrap();
+        w.delete_resource("pvc", "a", "data").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        let second = w.pvcs["a/data"].bound_pv.clone().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first_path, w.pvs[&second].host_path);
+        assert!(w.pvs[&first].status == PVStatus::Released);
+    }
+
+    #[test]
+    fn invalid_quantities_and_unsupported_storage_modes_fail_closed() {
+        let mut w = DesiredWorld::new();
+        for size in ["0", "-1Gi", "1.5Gi", "1MiB", "18446744073709551616", "16Ei"] {
+            assert!(pv(&mut w, "disk", size).is_err(), "{size}");
+            assert!(claim(&mut w, "a", "data", size).is_err(), "{size}");
+        }
+        assert!(apply(&mut w, "StorageClass", "default", "other", serde_json::json!({"provisioner": "foreign/driver"})).is_err());
+        assert!(apply(&mut w, "StorageClass", "default", "other", serde_json::json!({"reclaimPolicy": "Bogus"})).is_err());
+        assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"accessModes": ["ReadWriteOnce", "ReadWriteMany"]})).is_err());
+        assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"accessModes": ["Unknown"]})).is_err());
+        for value in [serde_json::Value::Null, serde_json::json!(1024), serde_json::json!({}), serde_json::json!([])] {
+            assert!(apply(&mut w, "PersistentVolume", "default", "disk", serde_json::json!({"capacity": {"storage": value}})).is_err());
+            assert!(apply(&mut w, "PersistentVolumeClaim", "a", "data", serde_json::json!({"resources": {"requests": {"storage": value}}})).is_err());
+        }
+    }
+
+    #[test]
+    fn loaded_inconsistent_or_cross_namespace_binding_is_not_mountable() {
+        let mut w = DesiredWorld::new();
+        pv(&mut w, "disk", "1Gi").unwrap();
+        claim(&mut w, "a", "data", "1Gi").unwrap();
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_ok());
+        assert!(crate::storage::bound_volume(&w, "b", "data").is_err());
+        w.pvcs.insert("b/data".into(), w.pvcs["a/data"].clone());
+        assert!(crate::storage::bound_volume(&w, "b", "data").is_err());
+        w.pvs.get_mut("disk").unwrap().capacity = "512Mi".into();
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_err());
+        w.pvs.get_mut("disk").unwrap().capacity = "1Gi".into();
+        w.pvs.get_mut("disk").unwrap().status = PVStatus::Released;
+        assert!(crate::storage::bound_volume(&w, "a", "data").is_err());
+    }
+
+    #[test]
+    fn claimed_pv_deletion_and_unsafe_legacy_delete_reclaim_are_rejected_atomically() {
+        let mut w=DesiredWorld::new();
+        let sc=serde_json::json!({"reclaimPolicy":"Delete","hostPathPrefix":"/tmp/royak-binding-tests"});
+        apply(&mut w,"StorageClass","","local",sc).unwrap();
+        claim(&mut w,"a","data","1Gi").unwrap();
+        let pv=w.pvcs["a/data"].bound_pv.clone().unwrap();let before=w.to_state().to_canonical_json();
+        assert!(w.validate_storage_delete("pv","",&pv).is_err());
+        assert!(w.delete_resource("pv","",&pv).is_none());
+        assert!(w.validate_storage_delete("pvc","a","data").is_err());
+        assert!(w.delete_resource("pvc","a","data").is_none());
+        assert!(w.validate_storage_delete("namespace","","a").is_err());
+        assert!(w.delete_resource("namespace","","a").is_none());
+        assert_eq!(before,w.to_state().to_canonical_json());
+    }
+}
+
+
+/// Modeled boundary fixtures only. They cannot supply production permissions,
+/// and never execute a host runtime. Each test thread scopes/restores its own
+/// trace even during unwinding; the outer suite remains default-parallel.
+#[cfg(test)]
+mod unsupported_storage_runtime_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone)]
+    struct Trace {
+        docker_available: bool,
+        pings: usize,
+        effects: Vec<(String, Vec<String>)>,
+    }
+    std::thread_local! {
+        static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+    }
+    struct Scope { previous: Option<Trace> }
+    impl Scope {
+        fn install(docker_available: bool) -> Self {
+            let next=Trace {docker_available,pings:0,effects:Vec::new()};
+            Self {previous:TRACE.with(|slot|slot.replace(Some(next)))}
+        }
+        fn trace(&self) -> Trace {
+            TRACE.with(|slot|slot.borrow().as_ref().unwrap().clone())
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            TRACE.with(|slot|{slot.replace(self.previous.take());});
+        }
+    }
+    pub(super) fn docker_ping() -> Option<bool> {
+        TRACE.with(|slot| {
+            let mut slot=slot.borrow_mut();
+            slot.as_mut().map(|trace| {trace.pings+=1;trace.docker_available})
+        })
+    }
+    pub(super) fn before_effect(runtime: &str, admitted: &[String]) -> Option<Vec<String>> {
+        TRACE.with(|slot| {
+            let mut slot=slot.borrow_mut();
+            slot.as_mut().map(|trace| {
+                trace.effects.push((runtime.into(),admitted.to_vec()));
+                vec!["  [modeled-boundary] no host runtime effects executed".into()]
+            })
+        })
+    }
+
+    fn put(world: &mut DesiredWorld, kind: &str, namespace: &str, name: &str,
+        spec: serde_json::Value) {
+        let resource=serde_json::from_value(serde_json::json!({
+            "kind":kind,"metadata":{"name":name,"namespace":namespace},"spec":spec
+        })).unwrap();
+        world.apply(&resource).unwrap();
+    }
+    fn native_world(in_init: bool) -> DesiredWorld {
+        let mut world=DesiredWorld::new();
+        put(&mut world,"StorageClass","","native",serde_json::json!({
+            "provisioner":crate::storage_lifecycle::PROVISIONER,"reclaimPolicy":"Retain"}));
+        put(&mut world,"PersistentVolumeClaim","a","data",serde_json::json!({
+            "storageClassName":"native","resources":{"requests":{"storage":"64Mi"}}}));
+        let mount=serde_json::json!([{"name":"data","mountPath":"/data"}]);
+        let main=if in_init {serde_json::json!({"name":"main","image":"busybox:1.36"})}
+            else {serde_json::json!({"name":"main","image":"busybox:1.36","volumeMounts":mount})};
+        let init=if in_init {serde_json::json!([{"name":"setup","image":"busybox:1.36",
+            "volumeMounts":mount}])} else {serde_json::json!([])};
+        put(&mut world,"Deployment","a","native",serde_json::json!({
+            "replicas":1,"template":{"spec":{"containers":[main],"initContainers":init,
+            "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"data"}}]}}}));
+        world
+    }
+    fn add_legacy(world: &mut DesiredWorld) {
+        put(world,"StorageClass","","legacy",serde_json::json!({
+            "provisioner":"royak/host-path","hostPathPrefix":"/srv/royak-legacy-observation",
+            "reclaimPolicy":"Retain"}));
+        put(world,"PersistentVolumeClaim","a","old",serde_json::json!({
+            "storageClassName":"legacy","resources":{"requests":{"storage":"64Mi"}}}));
+        put(world,"Deployment","a","old",serde_json::json!({
+            "replicas":1,"template":{"spec":{
+                "containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"old","mountPath":"/data"}]}],
+                "volumes":[{"name":"old","persistentVolumeClaim":{"claimName":"old"}}]}}}));
+    }
+    fn state(world: &DesiredWorld) -> serde_json::Value {
+        serde_json::to_value(world.to_state()).unwrap()
+    }
+    fn assert_blocked(log: &[String], scope: &Scope) {
+        assert!(log.iter().any(|line|line.contains("[storage]")&&line.contains("refusing")));
+        assert!(scope.trace().effects.is_empty(),
+            "blocked-only workload reached the pre-host effect boundary");
+        assert!(!log.iter().any(|line|line.contains("[ok]")));
+    }
+
+    #[test]
+    fn direct_neuropod_refuses_native_main_and_init_before_any_effect_boundary() {
+        for in_init in [false,true] {
+            let mut world=native_world(in_init);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4));
+            assert_blocked(&log,&scope);
+            assert_eq!(scope.trace().pings,0);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn direct_trait_refuses_native_main_and_init_before_runtime_factory() {
+        for runtime in ["light","cri"] {
+            for in_init in [false,true] {
+                let mut world=native_world(in_init);let before=state(&world);
+                let scope=Scope::install(false);
+                let log=reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),runtime);
+                assert_blocked(&log,&scope);
+                assert_eq!(scope.trace().pings,0);
+                assert_eq!(before,state(&world));
+            }
+        }
+    }
+    #[test]
+    fn actual_auto_docker_down_route_refuses_before_neuropod_effect_boundary() {
+        for in_init in [false,true] {
+            let mut world=native_world(in_init);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false);
+            assert_blocked(&log,&scope);
+            assert_eq!(scope.trace().pings,1);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn actual_explicit_neuropod_route_does_not_probe_docker_or_run_blocked_work() {
+        let mut world=native_world(false);
+        let scope=Scope::install(true);
+        let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),true);
+        assert_blocked(&log,&scope);
+        assert_eq!(scope.trace().pings,0);
+    }
+    #[test]
+    fn both_direct_mixed_routes_admit_only_exact_proven_legacy_keys() {
+        for runtime in ["neuropod","light","cri"] {
+            let mut world=native_world(true);add_legacy(&mut world);let before=state(&world);
+            let scope=Scope::install(false);
+            let log=if runtime=="neuropod" {
+                reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4))
+            } else {
+                reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),runtime)
+            };
+            assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+            assert_eq!(scope.trace().effects,vec![(runtime.into(),vec!["a/old".into()])]);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn actual_auto_fallback_mixed_route_passes_only_legacy_effect_keys() {
+        let mut world=native_world(false);add_legacy(&mut world);let before=state(&world);
+        let scope=Scope::install(false);
+        let log=reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false);
+        assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+        assert_eq!(scope.trace().pings,1);
+        assert_eq!(scope.trace().effects,vec![("neuropod".into(),vec!["a/old".into()])]);
+        assert_eq!(before,state(&world));
+    }
+    #[test]
+    fn unresolved_metadata_is_not_a_legacy_direct_or_fallback_escape() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(false);world.storage_classes.remove("native");
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            assert_blocked(&log,&scope);
+            assert!(log.iter().any(|line|line.contains("unresolved")));
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn scoped_effect_trap_restores_outer_trace_even_after_panic() {
+        let outer=Scope::install(false);
+        let result=std::panic::catch_unwind(|| {
+            let _inner=Scope::install(true);
+            assert_eq!(docker_ping(),Some(true));
+            panic!("modeled fixture unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(docker_ping(),Some(false));
+        assert_eq!(outer.trace().pings,1);
+        assert!(outer.trace().effects.is_empty());
+    }
+
+
+
+    fn add_classless_static_legacy(world: &mut DesiredWorld) {
+        put(world,"PersistentVolume","","static-old",serde_json::json!({
+            "capacity":{"storage":"64Mi"},"storageClassName":"",
+            "hostPath":{"path":"/srv/royak-static-observation"}}));
+        put(world,"PersistentVolumeClaim","a","classless",serde_json::json!({
+            "storageClassName":"","resources":{"requests":{"storage":"64Mi"}}}));
+        put(world,"Deployment","a","classless",serde_json::json!({
+            "replicas":1,"template":{"spec":{
+                "containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"old","mountPath":"/data"}]}],
+                "volumes":[{"name":"old","persistentVolumeClaim":{"claimName":"classless"}}]}}}));
+    }
+    #[test]
+    fn classless_legacy_mixed_direct_and_auto_routes_keep_only_static_legacy_key() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(true);add_classless_static_legacy(&mut world);
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            let runtime=if entry=="light" {"light"} else {"neuropod"};
+            assert!(log.iter().any(|line|line.contains("a/native")&&line.contains("refusing")));
+            assert_eq!(scope.trace().effects,vec![(runtime.into(),vec!["a/classless".into()])]);
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn cleared_native_classes_remain_blocked_before_direct_and_auto_effects() {
+        for entry in ["neuropod","light","auto"] {
+            let mut world=native_world(false);
+            let pv=world.pvcs["a/data"].bound_pv.clone().unwrap();
+            world.pvcs.get_mut("a/data").unwrap().storage_class.clear();
+            world.pvs.get_mut(&pv).unwrap().storage_class.clear();
+            world.pvs.get_mut(&pv).unwrap().host_path="/srv/forged-native-public-path".into();
+            let before=state(&world);let scope=Scope::install(false);
+            let log=match entry {
+                "neuropod"=>reconcile_neuropod(&mut world,&mut OrinBrain::new(32,4)),
+                "light"=>reconcile_via_trait(&mut world,&mut OrinBrain::new(32,4),"light"),
+                _=>reconcile_with_runtime(&mut world,&mut OrinBrain::new(32,4),false),
+            };
+            assert_blocked(&log,&scope);
+            assert!(log.iter().any(|line|line.contains("unresolved")));
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn source_binding_keeps_traps_before_host_and_effect_loops_on_exact_admitted_keys() {
+        let source=include_str!("reconcile.rs");
+        let neuropod=source.split("pub fn reconcile_neuropod(").nth(1).unwrap()
+            .split("\nfn dirs_or_home(").next().unwrap();
+        let trait_runtime=source.split("fn reconcile_via_trait(").nth(1).unwrap()
+            .split("\n/// Check a single probe").next().unwrap();
+        for (body,first_host) in [(neuropod,"let pods_root="),(trait_runtime,"runtime::get_runtime(")] {
+            let admission=body.find("unsupported_runtime_workloads(").unwrap();
+            let early_return=body.find("admitted.is_empty() && !log.is_empty()").unwrap();
+            let trap=body.find("unsupported_storage_runtime_tests::before_effect(").unwrap();
+            let host=body.find(first_host).unwrap();
+            assert!(admission<early_return && early_return<trap && trap<host);
+        }
+        assert!(neuropod.contains("for name in &admitted {"));
+        assert!(!neuropod.contains("for (name, dep) in &desired.deployments"));
+        assert!(neuropod.contains("if dep.is_some() && !admitted.contains(&record_key) { continue; }"));
+        assert!(trait_runtime.contains("for key in admitted {"));
+        assert!(!trait_runtime.contains("let keys: Vec<String> = desired.deployments.keys()"));
+        let apply=source.split("fn apply_resource(").nth(1).unwrap();
+        assert!(apply.find("require_legacy_template_class(self, template)?").unwrap()
+            < apply.find("self.namespaces.push(ns)").unwrap());
+    }
+    fn stateful(class: Option<serde_json::Value>) -> Resource {
+        let mut volume_spec=serde_json::json!({"resources":{"requests":{"storage":"64Mi"}}});
+        if let Some(class)=class {volume_spec["storageClassName"]=class;}
+        serde_json::from_value(serde_json::json!({
+            "kind":"StatefulSet","metadata":{"name":"db","namespace":"new"},
+            "spec":{"replicas":1,"volumeClaimTemplates":[
+                {"metadata":{"name":"data"},"spec":volume_spec}],
+                "template":{"spec":{"containers":[{"name":"main","image":"busybox:1.36",
+                    "volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}}
+        })).unwrap()
+    }
+    #[test]
+    fn native_vct_is_refused_before_erasure_or_new_namespace_mutation() {
+        let mut world=native_world(false);let before=state(&world);
+        let error=world.apply(&stateful(Some(serde_json::json!("native")))).unwrap_err();
+        assert!(error.contains("native volumeClaimTemplates"));
+        assert_eq!(before,state(&world));
+        assert!(!world.deployments.contains_key("new/db"));
+        assert!(!world.namespaces.iter().any(|namespace|namespace=="new"));
+    }
+    #[test]
+    fn unknown_and_malformed_explicit_vct_classes_never_default_legacy() {
+        for class in [serde_json::json!("missing"),serde_json::json!(""),
+            serde_json::json!(null),serde_json::json!(false),serde_json::json!([])] {
+            let mut world=native_world(false);let before=state(&world);
+            assert!(world.apply(&stateful(Some(class))).is_err());
+            assert_eq!(before,state(&world));
+        }
+    }
+    #[test]
+    fn explicit_known_legacy_and_absent_vct_class_keep_legacy_only_lowering() {
+        for class in [Some(serde_json::json!("legacy")),None] {
+            let mut world=native_world(false);add_legacy(&mut world);
+            let claims=world.pvcs.len();let volumes=world.pvs.len();
+            world.apply(&stateful(class)).unwrap();
+            let deployment=&world.deployments["new/db"];
+            assert!(deployment.stateful);
+            assert_eq!(deployment.containers[0].volumes[0].0,"vct:data");
+            assert_eq!(world.pvcs.len(),claims);
+            assert_eq!(world.pvs.len(),volumes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn apply_yaml(yaml: &str) -> Result<DesiredWorld, String> {
+        let mut w = DesiredWorld::new();
+        for r in crate::spec::parse_yaml(yaml)? { w.apply(&r)?; }
+        Ok(w)
+    }
+
+    fn dep_with_readiness(probe: &str) -> String {
+        format!(r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: {{name: web}}
+spec:
+  template:
+    spec:
+      containers:
+      - name: c
+        image: busybox:1.36
+        readinessProbe:
+{probe}
+"#)
+    }
+
+    fn readiness_json(w: &DesiredWorld) -> serde_json::Value {
+        serde_json::to_value(w.deployments["default/web"].containers[0].readiness_probe.as_ref().unwrap()).unwrap()
+    }
+
+    fn no_handler() -> StoredProbe {
+        serde_json::from_value(serde_json::json!({
+            "http_get": null, "exec": null,
+            "initial_delay_seconds": 0, "period_seconds": 10, "failure_threshold": 3
+        })).unwrap()
+    }
+
+    #[test]
+    fn probe_without_a_handler_is_never_healthy() {
+        // Regression: check_probe used to fall through to `true`.
+        assert_eq!(check_probe("no-such-container", &no_handler()), Some(false));
+    }
+
+    #[test]
+    fn tcp_socket_readiness_is_parsed_and_stored() {
+        let w = apply_yaml(&dep_with_readiness("          tcpSocket: {port: 8080}\n          periodSeconds: 2")).unwrap();
+        let p = readiness_json(&w);
+        assert_eq!(p["tcp_socket"], serde_json::json!(8080), "{p}");
+        assert_eq!(p["period_seconds"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn tcp_socket_survives_a_persistence_roundtrip() {
+        let w = apply_yaml(&dep_with_readiness("          tcpSocket: {port: 8080}")).unwrap();
+        let json = serde_json::to_string(&w.deployments["default/web"]).unwrap();
+        let back: StoredDeployment = serde_json::from_str(&json).unwrap();
+        let p = serde_json::to_value(back.containers[0].readiness_probe.as_ref().unwrap()).unwrap();
+        assert_eq!(p["tcp_socket"], serde_json::json!(8080));
+    }
+
+    #[test]
+    fn probes_without_tcp_keep_their_serialized_form() {
+        // Template hashes are computed over the serialized container: adding
+        // the tcp field must not roll every existing HTTP/exec deployment.
+        let w = apply_yaml(&dep_with_readiness("          httpGet: {path: /, port: 80}")).unwrap();
+        assert!(!serde_json::to_string(&w.deployments["default/web"].containers[0]).unwrap().contains("tcp_socket"));
+    }
+
+    #[test]
+    fn invalid_or_unsupported_probes_are_rejected_at_apply() {
+        for (probe, needle) in [
+            ("          periodSeconds: 5", "no handler"),
+            ("          grpc: {port: 9000}", "grpc"),
+            ("          tcpSocket: {port: http}", "named port"),
+            ("          httpGet: {path: /, port: http}", "named port"),
+            ("          tcpSocket: {port: 0}", "port"),
+            ("          exec: {command: []}", "empty"),
+            ("          tcpSocket: {port: 80}\n          httpGet: {path: /, port: 80}", "exactly one"),
+            ("          exec: {command: ['true']}\n          periodSeconds: 0", "positive"),
+            ("          exec: {command: ['true']}\n          timeoutSeconds: 0", "positive"),
+            ("          exec: {command: ['true']}\n          failureThreshold: 0", "positive"),
+            ("          exec: {command: ['true']}\n          successThreshold: 0", "positive"),
+            ("          exec: {command: ['true']}\n          terminationGracePeriodSeconds: 2", "unknown field"),
+            ("          httpGet: {path: /, port: 80, scheme: HTTPS}", "HTTPS"),
+            ("          httpGet: {path: /, port: 80, host: example.test}", "unknown field"),
+        ] {
+            let e = match apply_yaml(&dep_with_readiness(probe)) {
+                Ok(_) => panic!("probe accepted: {probe}"),
+                Err(e) => e,
+            };
+            assert!(e.contains(needle), "probe {probe:?}: error {e:?} should mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn valid_http_and_exec_probes_are_still_accepted() {
+        apply_yaml(&dep_with_readiness("          httpGet: {path: /healthz, port: 8080}")).unwrap();
+        apply_yaml(&dep_with_readiness("          exec: {command: [cat, /tmp/ready]}")).unwrap();
+        apply_yaml(&dep_with_readiness("          httpGet: {port: 8080, scheme: HTTP}")).unwrap();
+    }
+
+    #[test]
+    fn regular_init_container_probes_are_rejected() {
+        let yaml = "kind: Deployment\nmetadata: {name: web}\nspec:\n  template:\n    spec:\n      initContainers:\n      - name: init\n        image: alpine:3.22\n        readinessProbe: {exec: {command: ['true']}}\n      containers: [{name: main, image: 'alpine:3.22'}]\n";
+        let error = apply_yaml(yaml).err().unwrap();
+        assert!(error.contains("regular init containers cannot define probes"), "{error}");
+    }
+    #[test]
+    fn single_container_controllers_refuse_unmodelled_probe_targets() {
+        for kind in ["DaemonSet", "Job", "CronJob"] {
+            for shape in ["containers:\n      - {name: main, image: alpine}\n      - {name: extra, image: alpine, readinessProbe: {exec: {command: ['true']}}}",
+                "initContainers:\n      - {name: init, image: alpine, startupProbe: {exec: {command: ['true']}}}\n      containers: [{name: main, image: alpine}]"] {
+                let yaml = format!("kind: {kind}\nmetadata: {{name: web}}\nspec:\n  template:\n    spec:\n      {shape}\n");
+                let error = apply_yaml(&yaml).err().expect("unsupported probe target must be refused");
+                assert!(error.contains("single modelled regular container"), "{kind}: {error}");
+            }
+        }
+    }
+}
+

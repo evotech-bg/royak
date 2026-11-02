@@ -31,7 +31,7 @@ use bytes::Bytes;
 use tokio::net::TcpListener;
 
 /// Boxed body type — supports both buffered (Full) and streaming responses
-type BoxedBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+pub(crate) type BoxedBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 /// Byte stream from a tokio channel — implements futures Stream for hyper streaming responses
 struct ByteStream {
@@ -73,6 +73,19 @@ fn resource_uid(kind: &str, name: &str, ns: &str) -> String {
         hash as u16 & 0x0fff | 0x4000,
         ((hash >> 48) as u16 & 0x3fff) | 0x8000,
         hash & 0xffffffffffff)
+}
+
+/// Storage identities are server-owned persisted incarnations, never hashes of
+/// names or a workload-supplied metadata.uid. Non-storage legacy kinds retain
+/// their existing compatibility identifiers until their own lifecycle upgrade.
+fn storage_resource_uid(world: &DesiredWorld, kind: &str, name: &str, ns: &str) -> String {
+    let id=match kind {
+        "Namespace"=>world.storage_identities.namespaces.get(name),
+        "PersistentVolume"=>world.storage_identities.volumes.get(name),
+        "PersistentVolumeClaim"=>world.storage_identities.claims.get(&crate::store::obj_key(ns,name)).map(|c| &c.uid),
+        _=>None,
+    };
+    id.map(|id| id.as_str().to_string()).unwrap_or_else(||resource_uid(kind,name,ns))
 }
 
 fn now_rfc3339() -> String {
@@ -130,7 +143,7 @@ pub fn generate_tls_cert() -> Result<(String, String), String> {
 
 // ─── Response helpers ───
 
-fn json_response(status: u16, body: &str) -> hyper::Response<BoxedBody> {
+pub(crate) fn json_response(status: u16, body: &str) -> hyper::Response<BoxedBody> {
     hyper::Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
@@ -317,7 +330,7 @@ fn cluster_pods(world: &DesiredWorld) -> Vec<(crate::placement::PodView, String)
         out.push((crate::placement::PodView {
             pod: name, node: crate::store::node_name(), namespace: crate::store::DEFAULT_NS.into(),
             kind: "neuropod".into(), owner: String::new(), template: String::new(), image,
-            running, ready: running, pending: false,
+            running, ready: running, pending: false, published: None,
         }, if running { "Running".into() } else { "Pending".into() }));
     }
     out
@@ -355,16 +368,35 @@ fn get_pod(world: &DesiredWorld, name: &str, ns: &str) -> (u16, String) {
     }
 }
 
-fn pod_logs(world: &DesiredWorld, ns: &str, pod: &str, container: Option<&str>, tail: u32) -> (u16, String) {
+fn pod_access_permit(world:&DesiredWorld, caller:Option<&crate::auth::Identity>, c:&docker::DockerContainer,
+    verb:&str, sub:&str, ns:&str, pod:&str) -> Result<crate::pod_access::Permit,(u16,String)> {
+    let caller=caller.ok_or_else(||(401,status_json(401,"Unauthorized","valid bearer token required")))?;
+    let attrs=crate::auth::Attrs::new(verb,"pods",Some(sub),Some(ns),Some(pod));
+    crate::pod_access::Permit::issue(world,caller,&attrs,c).map_err(|(status,message)|
+        (status,status_json(status,if status==403{"Forbidden"}else{"Conflict"},&message)))
+}
+
+fn pod_session_busy(busy:crate::pod_sessions::Busy)->hyper::Response<BoxedBody>{
+    let status=busy.status();let mut response=json_response(status,&status_json(status,"TooManyRequests",busy.message()));
+    response.headers_mut().insert("retry-after",hyper::header::HeaderValue::from_static("1"));response
+}
+
+fn pod_logs(world: &DesiredWorld, caller:Option<&crate::auth::Identity>, ns: &str, pod: &str, container: Option<&str>, tail: u32) -> (u16, String) {
     if let Some(c) = find_pod_container(world, ns, pod, container) {
-        return match docker::get_logs(&c.id[..12.min(c.id.len())], tail) {
+        if let Err(e)=pod_access_permit(world,caller,&c,"get","log",ns,pod){return e;}
+        return match docker::get_logs(&c.id, tail) {
             Ok(logs) => (200, logs),
             Err(e) => (500, status_json(500, "InternalError", &format!("log error: {e}"))),
         };
     }
     if let Some((node, addr)) = find_remote_pod(ns, pod) {
-        return match reconcile::fetch_remote_logs(&addr, ns, pod) {
-            Ok(l) => (200, l),
+        let Some(caller)=caller else{return (401,status_json(401,"Unauthorized","valid bearer token required"));};
+        let Some(namespace_uid)=world.storage_identities.namespaces.get(ns).cloned() else{return (404,not_found_status(ns));};
+        let request=crate::pod_access::LogRequest {namespace:ns.into(),namespace_uid,pod:pod.into(),container:container.map(str::to_string),tail,
+            user:caller.user.clone(),groups:caller.groups.clone()};
+        return match reconcile::node_post(&addr,"/royak/v2/pod-logs",&serde_json::to_string(&request).unwrap(),std::time::Duration::from_secs(15))
+            .and_then(|raw|serde_json::from_str::<(u16,String)>(&raw).map_err(|_|"invalid peer log response".into())) {
+            Ok((status,l)) => (status, l),
             Err(e) => (502, status_json(502, "BadGateway", &format!("pod {pod} runs on {node}; log fetch failed: {e}"))),
         };
     }
@@ -433,6 +465,10 @@ fn bind_and_authorize(
         if !crate::auth::authorize(world, caller, &attrs) {
             return Err((403, forbidden(caller, &attrs)));
         }
+        if crate::host_access::resource_requires(r).map_err(|e|(400,status_json(400,"BadRequest",&e)))?
+            && !crate::host_access::allowed(world,caller) {
+            return Err((403,forbidden(caller,&crate::host_access::attrs())));
+        }
     }
     Ok(())
 }
@@ -443,7 +479,8 @@ fn forbidden(caller: &crate::auth::Identity, a: &crate::auth::Attrs) -> String {
 
 /// Apply resources through the commit path; also records full Deployment
 /// manifests (the base partial PATCHes merge into).
-fn commit_apply(world: &Arc<RwLock<DesiredWorld>>, resources: Vec<spec::Resource>, docs: Vec<serde_json::Value>) -> (u16, String) {
+fn commit_apply(world: &Arc<RwLock<DesiredWorld>>, mut resources: Vec<spec::Resource>, docs: Vec<serde_json::Value>, caller: &crate::auth::Identity,
+    verb: &str,url_ns: Option<&str>,url_name: Option<&str>) -> (u16, String) {
     let first = resources.first().map(|r| (
         r.api_version.clone().unwrap_or_else(|| "v1".to_string()),
         r.kind.clone(),
@@ -451,9 +488,15 @@ fn commit_apply(world: &Arc<RwLock<DesiredWorld>>, resources: Vec<spec::Resource
         r.metadata.namespace.clone().unwrap_or_else(|| crate::store::DEFAULT_NS.to_string()),
         r.spec.as_ref().and_then(|v| serde_json::to_value(v).ok()).unwrap_or(serde_json::Value::Null),
     ));
+    let identity=first.as_ref().map(|(_,kind,name,ns,_)|(kind.clone(),name.clone(),ns.clone()));
     let res = crate::store::commit(world, move |w| {
+        // Recheck against the serialized commit's actual base generation. A
+        // preflight read is not authority after a concurrent RBAC revocation.
+        bind_and_authorize(w,caller,verb,url_ns,url_name,&mut resources).map_err(|(c,m)|(c,
+            serde_json::from_str::<serde_json::Value>(&m).ok().and_then(|v|v["message"].as_str().map(str::to_string)).unwrap_or(m)))?;
+        let host_access=crate::host_access::allowed(w,caller);
         for r in &resources {
-            w.apply(r).map_err(|e| (400, e))?;
+            w.apply_with_host_access(r,host_access).map_err(|e| (400, e))?;
         }
         for doc in &docs {
             if doc.get("kind").and_then(|k| k.as_str()) == Some("Deployment") {
@@ -463,10 +506,10 @@ fn commit_apply(world: &Arc<RwLock<DesiredWorld>>, resources: Vec<spec::Resource
                 }
             }
         }
-        Ok(())
+        Ok(identity.map(|(kind,name,ns)|storage_resource_uid(w,&kind,&name,&ns)).unwrap_or_default())
     });
     match res {
-        Ok(()) => {
+        Ok(uid) => {
             next_rv();
             let (api_version, kind, name, namespace, spec) = match first {
                 Some(t) => t,
@@ -475,7 +518,7 @@ fn commit_apply(world: &Arc<RwLock<DesiredWorld>>, resources: Vec<spec::Resource
             (201, serde_json::json!({
                 "apiVersion": api_version, "kind": kind,
                 "metadata": {"name": name, "namespace": namespace, "resourceVersion": current_rv(),
-                    "uid": resource_uid(&kind, &name, &namespace), "creationTimestamp": "1970-01-01T00:00:00Z"},
+                    "uid": uid, "creationTimestamp": "1970-01-01T00:00:00Z"},
                 "spec": spec,
             }).to_string())
         }
@@ -499,8 +542,12 @@ struct Ctx<'a> {
 fn route_request(cx: &Ctx) -> (u16, String) {
     let (method, path, world) = (cx.method, cx.path, cx.world);
     eprintln!("  [api] {method} {}", mask_log_path(path));
+    if method=="GET" && path=="/royak/v1/pod-access/usage"{return (200,crate::pod_sessions::usage().to_string());}
     let k8s = crate::auth::parse_k8s_path(path);
     let qns = cx.query.get("namespace").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    if crate::auth::invalid_resource_scope(path) {
+        return (400, status_json(400, "BadRequest", "cluster-scoped resource cannot have a namespaced URL"));
+    }
 
     match (method, path) {
         ("GET", "/healthz") | ("GET", "/readyz") | ("GET", "/livez") => return (200, "ok".to_string()),
@@ -516,6 +563,28 @@ fn route_request(cx: &Ctx) -> (u16, String) {
     }
 
     // ─── Sandboxed public demo controls (ROYAK_DEMO=1 only) ───
+    if method == "GET" && path == "/royak/v1/topology" {
+        let Some(caller) = cx.caller else { return (401, status_json(401, "Unauthorized", "bearer token required")); };
+        let observed = docker::list_containers(true);
+        let w = world.read().unwrap_or_else(|e| e.into_inner());
+        let can = |resource: &str, cluster: bool| crate::auth::authorize(&w, caller,
+            &crate::auth::Attrs::new("list", resource, None, if cluster { None } else { qns }, None));
+        if !can("pods", false) { return (403, status_json(403, "Forbidden", "pod list permission required for this scope")); }
+        let mut pods = Vec::new();
+        let local_ok = observed.is_ok();
+        if let Ok(actual) = observed {
+            let ours = reconcile::our_containers(&w, &actual);
+            pods.extend(reconcile::local_views(&w, &ours).into_iter().map(|view|
+                crate::topology::Observation { view, source: "local Docker".into(), age_ms: 0 }));
+        }
+        for report in crate::placement::peer_reports() {
+            let age_ms = report.at.elapsed().as_millis() as u64;
+            pods.extend(report.pods.into_iter().map(|view| crate::topology::Observation {
+                view, source: "peer census".into(), age_ms,
+            }));
+        }
+        return (200, serde_json::to_string(&crate::topology::build(&w, &pods, qns, can, local_ok)).unwrap());
+    }
     match (method, path) {
         ("GET", "/demo/state") => {
             let snap = demo_state_snapshot().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -577,6 +646,7 @@ fn route_request(cx: &Ctx) -> (u16, String) {
                 // Leadership a quorum acknowledged within the lease; only then
                 // does this node schedule pods.
                 "leaderConfirmed": me.is_some() && crate::raft_node::is_cluster_scheduler(),
+                "leadership": crate::raft_node::leadership_diagnostics(),
                 "generation": world.read().unwrap_or_else(|e| e.into_inner()).generation}).to_string());
         }
         ("GET", "/royak/v1/flows") => {
@@ -817,24 +887,7 @@ fn route_request(cx: &Ctx) -> (u16, String) {
             let ns = url_ns.unwrap_or(crate::store::DEFAULT_NS);
             let tail: u32 = cx.query.get("tailLines").or(cx.query.get("tail")).and_then(|s| s.parse().ok()).unwrap_or(100);
             let w = world.read().unwrap_or_else(|e| e.into_inner());
-            pod_logs(&w, ns, name.unwrap_or(""), cx.query.get("container").map(|s| s.as_str()), tail)
-        }
-
-        // ─── Pod exec (non-websocket, Royak JSON form) ───
-        ("POST", Some("exec")) if resource == "pods" => {
-            let ns = url_ns.unwrap_or(crate::store::DEFAULT_NS);
-            let pod = name.unwrap_or("");
-            let w = world.read().unwrap_or_else(|e| e.into_inner());
-            let cmd: Vec<String> = query_all(cx.path_and_query(), "command");
-            let cmd: Vec<&str> = if cmd.is_empty() { vec!["sh"] } else { cmd.iter().map(|s| s.as_str()).collect() };
-            match find_pod_container(&w, ns, pod, cx.query.get("container").map(|s| s.as_str())) {
-                Some(c) => match docker::exec_in_container(&c.id[..12.min(c.id.len())], &cmd) {
-                    Ok((code, output)) => (200, serde_json::json!({"kind": "ExecResult", "pod": pod, "exitCode": code, "output": output}).to_string()),
-                    Err(e) => (500, status_json(500, "InternalError", &format!("exec error: {e}"))),
-                },
-                None if find_remote_pod(ns, pod).is_some() => (501, status_json(501, "NotImplemented", &format!("pod {ns}/{pod} runs on another node; exec is served by the node that runs it"))),
-                None => (404, status_json(404, "NotFound", &format!("pods \"{pod}\" not found in namespace \"{ns}\""))),
-            }
+            pod_logs(&w, cx.caller, ns, name.unwrap_or(""), cx.query.get("container").map(|s| s.as_str()), tail)
         }
 
         // ─── Reads ───
@@ -848,6 +901,23 @@ fn route_request(cx: &Ctx) -> (u16, String) {
                 ("deployments", None) => (200, list_deployments(&w, ns)),
                 ("namespaces", Some(n)) => get_namespace(&w, n),
                 ("namespaces", None) => (200, list_namespaces(&w)),
+                ("persistentvolumes", Some(n)) => match w.pvs.get(n) {
+                    Some(pv)=>(200,pv_json(&w,pv).to_string()),
+                    None=>(404,status_json(404,"NotFound","persistentvolume not found")),
+                },
+                ("persistentvolumeclaims", Some(n)) => match w.pvcs.get(&crate::store::obj_key(ns.unwrap_or(crate::store::DEFAULT_NS),n)) {
+                    Some(pvc)=>(200,pvc_json(&w,pvc).to_string()),
+                    None=>(404,status_json(404,"NotFound","persistentvolumeclaim not found in namespace")),
+                },
+                ("persistentvolumes", None) | ("persistentvolumeclaims", None) => {
+                    let (kind,mut items)=if resource=="persistentvolumes" {
+                        ("PersistentVolume",w.pvs.values().map(|pv|pv_json(&w,pv)).collect::<Vec<_>>())
+                    } else {
+                        ("PersistentVolumeClaim",w.pvcs.values().filter(|c|ns.map(|ns|ns==c.namespace).unwrap_or(true)).map(|c|pvc_json(&w,c)).collect::<Vec<_>>())
+                    };
+                    items.sort_by_key(|v|(v["metadata"]["namespace"].as_str().unwrap_or("").to_string(),v["metadata"]["name"].as_str().unwrap_or("").to_string()));
+                    (200,serde_json::json!({"apiVersion":"v1","kind":format!("{kind}List"),"metadata":{"resourceVersion":current_rv()},"items":items}).to_string())
+                },
                 ("configmaps", Some(n)) => get_configmap(&w, n, ns.unwrap_or(crate::store::DEFAULT_NS)),
                 ("configmaps", None) => (200, list_configmaps(&w, ns)),
                 ("secrets", Some(n)) => get_secret(&w, n, ns.unwrap_or(crate::store::DEFAULT_NS)),
@@ -880,6 +950,13 @@ fn route_request(cx: &Ctx) -> (u16, String) {
             };
             let ns = if resource == "namespaces" { name.clone() } else { url_ns.unwrap_or(crate::store::DEFAULT_NS).to_string() };
             if resource == "pods" {
+                {
+                    let current=world.read().unwrap_or_else(|e|e.into_inner());
+                    if current.storage_identities.lifecycle.contains_writer_pod(&ns,&name)
+                        || crate::storage_driver::native_runtime::mount::consumer::retained_pod(&ns,&name){
+                        return (409,status_json(409,"ManagedDrainRequired","managed Pod ownership requires its exact retained drain; no legacy delete or scratch cleanup"));
+                    }
+                }
                 // Deleting a pod removes its containers; its owner (if any)
                 // re-creates it. This is a runtime action, not a state change.
                 let w = world.read().unwrap_or_else(|e| e.into_inner());
@@ -903,6 +980,7 @@ fn route_request(cx: &Ctx) -> (u16, String) {
             }
             let (res, n2, ns2) = (resource.to_string(), name.clone(), ns.clone());
             match crate::store::commit(world, move |w| {
+                w.validate_storage_delete(&res,&ns2,&n2).map_err(|e|(409,e))?;
                 w.delete_resource(&res, &ns2, &n2).ok_or((404, format!("{res} \"{n2}\" not found in namespace \"{ns2}\"")))
             }) {
                 Ok(cleanup) => {
@@ -931,7 +1009,8 @@ fn route_request(cx: &Ctx) -> (u16, String) {
                             let mut resources = spec::parse_yaml(&yaml).map_err(|e| (400, format!("merged manifest invalid: {e}")))?;
                             bind_and_authorize(w, &caller, "patch", Some(&ns), Some(&name), &mut resources)
                                 .map_err(|(c, m)| (c, serde_json::from_str::<serde_json::Value>(&m).ok().and_then(|v| v["message"].as_str().map(|s| s.to_string())).unwrap_or(m)))?;
-                            for r in &resources { w.apply(r).map_err(|e| (400, e))?; }
+                            let host_access=crate::host_access::allowed(w,&caller);
+                            for r in &resources { w.apply_with_host_access(r,host_access).map_err(|e| (400, e))?; }
                             w.manifests.insert(mkey.clone(), manifest.clone());
                             Ok(manifest)
                         } else {
@@ -997,17 +1076,10 @@ fn route_request(cx: &Ctx) -> (u16, String) {
             for (d, r) in docs.iter_mut().zip(resources.iter()) {
                 if let Some(ns) = &r.metadata.namespace { d["metadata"]["namespace"] = serde_json::json!(ns); }
             }
-            commit_apply(world, resources, docs)
+            commit_apply(world, resources, docs,caller,verb,url_ns,if method=="POST"{None}else{name})
         }
 
         _ => (405, status_json(405, "MethodNotAllowed", &format!("{method} {path} is not supported"))),
-    }
-}
-
-impl Ctx<'_> {
-    fn path_and_query(&self) -> String {
-        let q: Vec<String> = self.query.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        format!("{}?{}", self.path, q.join("&"))
     }
 }
 
@@ -1053,6 +1125,10 @@ async fn handle_node_request(method: &str, path: &str, body: Bytes, world: Arc<R
             Ok(json) => (200, json),
             Err(e) => (503, serde_json::json!({"error": e}).to_string()),
         }
+    } else if method=="POST"&&path==crate::workload::managed::CREATE_PATH {
+        // DATA-only one-slot submission. No blocking task/thread is created
+        // for this native route; actual IO stays on the existing Watch actor.
+        node_route(method,path,&body,&world,&signer)
     } else {
         let p = path.to_string();
         let m = method.to_string();
@@ -1076,8 +1152,46 @@ fn node_response(path: &str, req_nonce: &str, status: u16, out: String) -> hyper
     b.body(Full::new(Bytes::from(wire)).boxed()).unwrap()
 }
 
+fn with_owned_snapshot<T>(world: &Arc<RwLock<DesiredWorld>>, all: &[docker::DockerContainer], action: impl FnOnce(&[&docker::DockerContainer]) -> T) -> T {
+    let owned: Vec<docker::DockerContainer> = {
+        let w = world.read().unwrap_or_else(|e| e.into_inner());
+        reconcile::our_containers(&w, all).into_iter().cloned().collect()
+    };
+    // Pin actual container IDs/ownership, then release state before slow stop
+    // or log I/O. A replacement with the same pod name has a different ID.
+    let refs: Vec<_> = owned.iter().collect();
+    action(&refs)
+}
+
+#[cfg(test)]
+mod node_snapshot_tests {
+    use super::*;
+    #[test]
+    fn container_operations_run_after_releasing_state_lock() {
+        let world = Arc::new(RwLock::new(DesiredWorld::new()));
+        with_owned_snapshot(&world, &[], |_| {
+            assert!(world.try_write().is_ok(), "container I/O must not retain a state reader");
+        });
+    }
+}
+
 fn node_route(method: &str, path: &str, body: &[u8], world: &Arc<RwLock<DesiredWorld>>, signer: &str) -> (u16, String) {
+    if path.starts_with("/royak/v1/connect/node/") {
+        return crate::connect::node_request(method, path, body, world, signer);
+    }
     match (method, path) {
+        ("POST","/royak/v5/create-pod")=>{
+            let value:serde_json::Value=match serde_json::from_slice(body){Ok(value)=>value,Err(_)=>return(400,status_json(400,"BadRequest","invalid native launch DATA"))};
+            let Some(sealed)=value.get("sealed").and_then(|v|v.as_str())else{return(400,status_json(400,"BadRequest","sealed native launch DATA required"));};
+            let plan=match crate::workload::unseal_launch(sealed){Ok(plan)=>plan,Err(_)=>return(400,status_json(400,"BadRequest","native launch domain/data refused"))};
+            if crate::workload::create_path(&plan)!=crate::workload::managed::CREATE_PATH{
+                return(400,status_json(400,"BadRequest","native DATA endpoint does not accept legacy plans"));
+            }
+            match crate::storage_driver::native_runtime::mount::consumer::submit_peer_data(world,signer,&plan){
+                Ok(receipt)=>(202,serde_json::to_string(&receipt).unwrap_or_else(|_|"{\"status\":\"Unknown\"}".into())),
+                Err(_)=>(409,status_json(409,"ManagedNotAccepted","no exact current local READY owner/issuer; no managed effect accepted")),
+            }
+        }
         ("POST", "/royak/v1/heartbeat") => {
             let hello: reconcile::NodeHello = match serde_json::from_slice(body) {
                 Ok(h) => h,
@@ -1091,12 +1205,12 @@ fn node_route(method: &str, path: &str, body: &[u8], world: &Arc<RwLock<DesiredW
             (200, serde_json::to_string(&reconcile::local_hello(&w)).unwrap_or_default())
         }
         ("GET", "/royak/v1/pods") => {
-            let w = world.read().unwrap_or_else(|e| e.into_inner());
             let all = docker::list_containers(true).unwrap_or_default();
+            let w = world.read().unwrap_or_else(|e| e.into_inner());
             let ours = reconcile::our_containers(&w, &all);
             (200, serde_json::to_string(&reconcile::local_views(&w, &ours)).unwrap_or_else(|_| "[]".into()))
         }
-        ("POST", "/royak/v1/create-pod") => {
+        ("POST", "/royak/v1/create-pod" | "/royak/v2/create-pod" | "/royak/v3/create-pod" | "/royak/v4/create-pod") => {
             let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
             let Some(sealed) = v["sealed"].as_str() else {
                 return (400, status_json(400, "BadRequest", "sealed pod plan required"));
@@ -1106,6 +1220,9 @@ fn node_route(method: &str, path: &str, body: &[u8], world: &Arc<RwLock<DesiredW
                 Err(e) => return (400, status_json(400, "BadRequest", &format!("cannot open pod plan: {e}"))),
             };
             let (cluster_id, me) = (world.read().unwrap_or_else(|e| e.into_inner()).cluster_id.clone(), crate::store::node_name());
+            if crate::workload::create_path(&plan) != path {
+                return (400, status_json(400, "BadRequest", "pod plan requires the matching launch-contract endpoint"));
+            }
             if plan.cluster_id != cluster_id || plan.node != me {
                 return (409, status_json(409, "Conflict", &format!("plan is for cluster {} node {}, this is cluster {cluster_id} node {me}", plan.cluster_id, plan.node)));
             }
@@ -1133,25 +1250,31 @@ fn node_route(method: &str, path: &str, body: &[u8], world: &Arc<RwLock<DesiredW
             let (Some(ns), Some(pod)) = (v["namespace"].as_str(), v["pod"].as_str()) else {
                 return (400, status_json(400, "BadRequest", "namespace and pod required"));
             };
-            let w = world.read().unwrap_or_else(|e| e.into_inner());
+            {
+                let current=world.read().unwrap_or_else(|e|e.into_inner());
+                if current.storage_identities.lifecycle.contains_writer_pod(ns,pod)
+                    || crate::storage_driver::native_runtime::mount::consumer::retained_pod(ns,pod){
+                    return(409,status_json(409,"ManagedDrainRequired","legacy node deletion cannot release/remove managed ownership"));
+                }
+            }
             let all = docker::list_containers(true).unwrap_or_default();
-            let ours = reconcile::our_containers(&w, &all);
-            crate::workload::remove_pod(&ours, ns, pod);
+            with_owned_snapshot(world, &all, |ours| crate::workload::remove_pod(ours, ns, pod));
             (200, serde_json::json!({"status": "ok", "pod": pod}).to_string())
         }
-        ("GET", p) if p.starts_with("/royak/v1/pod-logs/") => {
-            let rest = p.strip_prefix("/royak/v1/pod-logs/").unwrap_or("");
-            let Some((ns, pod)) = rest.split_once('/') else {
-                return (400, status_json(400, "BadRequest", "/royak/v1/pod-logs/<namespace>/<pod>"));
-            };
-            let w = world.read().unwrap_or_else(|e| e.into_inner());
-            match find_pod_container(&w, ns, pod, None) {
-                Some(c) => match docker::get_logs(&c.id[..12.min(c.id.len())], 200) {
-                    Ok(l) => (200, l),
-                    Err(e) => (500, status_json(500, "InternalError", &e)),
-                },
-                None => (404, status_json(404, "NotFound", &format!("pod {ns}/{pod} is not on this node"))),
-            }
+        ("GET", p) if p.starts_with("/royak/v1/pod-logs/") =>
+            (409,status_json(409,"Conflict","legacy log forwarding has no caller/runtime authority; upgrade all nodes")),
+        ("POST", "/royak/v2/pod-logs") => {
+            let request:crate::pod_access::LogRequest=match serde_json::from_slice(body){Ok(v)=>v,Err(_)=>return (400,status_json(400,"BadRequest","caller-bound log request required"))};
+            let _lease=match crate::pod_sessions::admit(&request.user){Ok(lease)=>lease,Err(busy)=>return (200,serde_json::to_string(&(busy.status(),status_json(busy.status(),"TooManyRequests",busy.message()))).unwrap())};
+            let w=world.read().unwrap_or_else(|e|e.into_inner());
+            let answer=if w.storage_identities.namespaces.get(&request.namespace)!=Some(&request.namespace_uid){
+                (409,status_json(409,"Conflict","forwarded logs target a different namespace incarnation"))
+            }else{match find_pod_container(&w,&request.namespace,&request.pod,request.container.as_deref()){
+                Some(c)=>match pod_access_permit(&w,Some(&request.identity()),&c,"get","log",&request.namespace,&request.pod){
+                    Err(e)=>e,Ok(_)=>match docker::get_logs(&c.id,request.tail){Ok(l)=>(200,l),Err(e)=>(500,status_json(500,"InternalError",&e))}
+                },None=>(404,status_json(404,"NotFound","Pod is not on this node"))
+            }};
+            (200,serde_json::to_string(&answer).unwrap())
         }
         _ => (404, status_json(404, "NotFound", &format!("no node endpoint {method} {path}"))),
     }
@@ -1173,6 +1296,18 @@ async fn handle_request(
         .map(|s| s.eq_ignore_ascii_case("websocket")).unwrap_or(false);
 
     // Dashboard: static page, no data.
+    if method == hyper::Method::GET {
+        let asset = match path.as_str() {
+            "/dashboard.css" => Some(("text/css; charset=utf-8", include_str!("dashboard.css"))),
+            "/dashboard-topology.js" => Some(("text/javascript; charset=utf-8", include_str!("dashboard-topology.js"))),
+            _ => None,
+        };
+        if let Some((mime, source)) = asset {
+            return Ok(hyper::Response::builder().status(200).header("Content-Type", mime)
+                .header("X-Content-Type-Options", "nosniff")
+                .body(Full::new(Bytes::from(source)).boxed()).unwrap());
+        }
+    }
     if (path == "/" || path == "/dashboard") && method == hyper::Method::GET {
         const DASHBOARD_HTML: &str = include_str!("dashboard.html");
         return Ok(hyper::Response::builder()
@@ -1187,15 +1322,32 @@ async fn handle_request(
     if path != "/" && path.trim_matches('/').split('/').any(|s| s.is_empty()) {
         return Ok(json_response(400, &status_json(400, "BadRequest", "empty path segment")));
     }
+    if crate::auth::invalid_resource_scope(&path) {
+        return Ok(json_response(400, &status_json(400, "BadRequest", "cluster-scoped resource cannot have a namespaced URL")));
+    }
     let access = crate::auth::classify(method.as_str(), &path, &query, websocket);
 
     // ── Node endpoints: HMAC signature over method, path, time, nonce, body ──
     if access == crate::auth::Access::Node {
-        let body = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+        let transport=req.extensions().get::<crate::connect::PeerTransport>().cloned();
+        let body = if path.starts_with("/royak/v1/connect/node/") {
+            match tokio::time::timeout(std::time::Duration::from_secs(3),http_body_util::Limited::new(req.into_body(),128*1024).collect()).await {
+                Ok(Ok(body))=>body.to_bytes(),_=>return Ok(json_response(413,"{\"error\":\"bounded Connect node body required\"}"))
+            }
+        } else if path==crate::workload::managed::CREATE_PATH {
+            match http_body_util::Limited::new(req.into_body(),MAX_BODY_SIZE).collect().await{
+                Ok(body)=>body.to_bytes(),Err(_)=>return Ok(json_response(413,"{\"error\":\"bounded native launch DATA required\"}")),
+            }
+        } else { req.collect().await.map(|c| c.to_bytes()).unwrap_or_default() };
         let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
         return Ok(match crate::auth::verify_node(method.as_str(), &path, header, &body) {
             Ok(signer) => {
                 let nonce = header(crate::auth::HDR_NONCE).unwrap_or_default();
+                if path.starts_with("/royak/v1/connect/node/") {
+                    let signer2=signer.clone();
+                    let transport_ok=tokio::task::spawn_blocking(move||crate::connect::validate_node_transport(&signer2,transport.as_ref())).await.unwrap_or_else(|_|Err("Connect transport validation failed".into()));
+                    if let Err(e)=transport_ok {return Ok(node_response(&path,&nonce,403,serde_json::json!({"error":e}).to_string()));}
+                }
                 match crate::node_rpc::open_body(&body) {
                     Ok(plain) => handle_node_request(method.as_str(), &path, Bytes::from(plain), world, signer, nonce).await,
                     Err(e) => {
@@ -1225,10 +1377,11 @@ async fn handle_request(
             let Some(id) = &identity else {
                 return Ok(json_response(401, &status_json(401, "Unauthorized", "Unauthorized: valid bearer token required")));
             };
-            let allowed = {
-                let w = world.read().unwrap_or_else(|e| e.into_inner());
-                crate::auth::authorize(&w, id, attrs)
-            };
+            let (auth_world, auth_id, auth_attrs) = (world.clone(), id.clone(), attrs.clone());
+            let allowed = tokio::task::spawn_blocking(move || {
+                let w = auth_world.read().unwrap_or_else(|e| e.into_inner());
+                crate::auth::authorize(&w, &auth_id, &auth_attrs)
+            }).await.unwrap_or(false);
             if !allowed {
                 eprintln!("  ⛔ [rbac] {} denied: {}", id.user, attrs.describe());
                 return Ok(json_response(403, &forbidden(id, attrs)));
@@ -1237,22 +1390,47 @@ async fn handle_request(
     }
     let attrs_ns: Option<String> = match &access { crate::auth::Access::Rbac(a) => a.namespace.clone(), _ => None };
 
+    if path.starts_with("/royak/v1/connect/") {
+        return Ok(crate::connect::handle(req, world, identity.expect("authenticated Connect route")).await);
+    }
+
+    let session_lease=if matches!(&access,crate::auth::Access::Rbac(a) if a.resource=="pods" && matches!(a.subresource.as_deref(),Some("exec"|"log"|"portforward"))){
+        match crate::pod_sessions::admit(&identity.as_ref().expect("authenticated Pod route").user){
+            Ok(lease)=>Some(lease),Err(busy)=>return Ok(pod_session_busy(busy))
+        }
+    }else{None};
+
     // ── Streaming / upgraded endpoints (already authorized above) ──
     if path.contains("/pods/") && path.ends_with("/exec") && websocket {
-        return Ok(handle_exec_ws(req, &path, &full_url, &headers, world).await);
+        let Some(lease)=session_lease else{return Ok(json_response(400,&status_json(400,"BadRequest","valid Pod route required")));};
+        return Ok(handle_exec_ws(req, &path, &full_url, &headers, world, identity.expect("authenticated Pod route"),lease).await);
+    }
+    if path.contains("/pods/") && path.ends_with("/exec") && method==hyper::Method::POST {
+        let Some(lease)=session_lease else{return Ok(json_response(400,&status_json(400,"BadRequest","valid Pod route required")));};
+        return Ok(handle_exec_json(&path,&full_url,world,identity.expect("authenticated Pod route"),lease).await);
     }
     if path.contains("/pods/") && path.ends_with("/portforward") && websocket
         && headers.get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).map(|s| s.contains("channel.k8s.io")).unwrap_or(false)
     {
-        return Ok(handle_portforward_ws(req, &path, &full_url, &headers, world).await);
+        let Some(lease)=session_lease else{return Ok(json_response(400,&status_json(400,"BadRequest","valid Pod route required")));};
+        return Ok(handle_portforward_ws(req, &path, &full_url, &headers, world, identity.expect("authenticated Pod route"),lease).await);
     }
     if path.contains("/pods/") && path.ends_with("/log")
         && matches!(query.get("follow").map(|v| v.as_str()), Some("true" | "1"))
     {
-        return Ok(handle_log_stream(&path, &query, world).await);
+        let Some(lease)=session_lease else{return Ok(json_response(400,&status_json(400,"BadRequest","valid Pod route required")));};
+        return Ok(handle_log_stream(&path, &query, world, identity.expect("authenticated Pod route"),lease).await);
     }
     if matches!(query.get("watch").map(|v| v.as_str()), Some("true" | "1")) {
-        return Ok(handle_watch(&path, &query, world, attrs_ns).await);
+        let (Some(identity),crate::auth::Access::Rbac(attrs))=(identity,&access) else {
+            return Ok(json_response(400,&status_json(400,"BadRequest","watch requires an authorized resource route")));
+        };
+        let namespace_uid={
+            let w=world.read().unwrap_or_else(|e|e.into_inner());
+            attrs_ns.as_ref().and_then(|ns|w.storage_identities.namespaces.get(ns)).cloned()
+        };
+        let permit=WatchPermit{identity,attrs:attrs.clone(),namespace_uid};
+        return Ok(handle_watch(&path, &query, world, permit).await);
     }
 
     let is_write = matches!(method, hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH);
@@ -1278,6 +1456,7 @@ async fn handle_request(
     // route_request does blocking work (locks, Docker, fsync, Raft commit
     // wait) — keep it off the async workers.
     let (status, body) = tokio::task::spawn_blocking(move || {
+        let _lease=session_lease;
         let cx = Ctx { method: method.as_str(), path: &path, query: &query, body: &body_bytes, world: &world, caller: identity.as_ref() };
         route_request(&cx)
     })
@@ -1290,7 +1469,7 @@ async fn handle_request(
 
 /// Stream container logs (kubectl logs -f). Resolves the pod among this
 /// node's own Royak containers by namespace + pod label.
-async fn handle_log_stream(path: &str, query: &HashMap<String, String>, world: Arc<RwLock<DesiredWorld>>) -> hyper::Response<BoxedBody> {
+async fn handle_log_stream(path: &str, query: &HashMap<String, String>, world: Arc<RwLock<DesiredWorld>>, identity:crate::auth::Identity,lease:crate::pod_sessions::Lease) -> hyper::Response<BoxedBody> {
     let Some((ns, _, Some(pod), _)) = crate::auth::parse_k8s_path(path) else {
         return json_response(400, &status_json(400, "BadRequest", "pod log path expected"));
     };
@@ -1299,36 +1478,76 @@ async fn handle_log_stream(path: &str, query: &HashMap<String, String>, world: A
     let tail: u32 = query.get("tailLines").or(query.get("tail")).and_then(|s| s.parse().ok()).unwrap_or(100);
     let container = query.get("container").cloned();
     let (ns2, pod2) = (ns.clone(), pod.clone());
+    let world2=world.clone();
+    let resolve_lease=lease.hold();
     let found = tokio::task::spawn_blocking(move || {
-        let w = world.read().unwrap_or_else(|e| e.into_inner());
-        find_pod_container(&w, &ns2, &pod2, container.as_deref()).map(|c| c.id[..12.min(c.id.len())].to_string())
+        let _lease=resolve_lease;
+        let w = world2.read().unwrap_or_else(|e| e.into_inner());
+        find_pod_container(&w, &ns2, &pod2, container.as_deref()).map(|c|pod_access_permit(&w,Some(&identity),&c,"get","log",&ns2,&pod2))
     }).await.ok().flatten();
-    let Some(cid) = found else {
+    let Some(permit) = found else {
         let msg = match find_remote_pod(&ns, &pod) {
             Some((node, _)) => format!("pod {ns}/{pod} runs on node {node}; follow its logs through that node's API"),
             None => format!("pods \"{pod}\" not found in namespace \"{ns}\""),
         };
         return json_response(404, &status_json(404, "NotFound", &msg));
     };
+    let permit=match permit{Ok(p)=>p,Err((status,body))=>return json_response(status,&body)};
     eprintln!("  [stream] logs -f {ns}/{pod} (tail={tail})");
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
-    tokio::task::spawn_blocking(move || {
-        docker::stream_logs_to_channel(&cid, tail, tx);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let cancellation=Arc::new(docker::SocketCancellation::default());
+    tokio::spawn(async move {
+        let (raw_tx,mut raw_rx)=tokio::sync::mpsc::channel(4);
+        let cid=permit.container_id.clone();let cancel2=cancellation.clone();
+        let worker_lease=lease.hold();
+        let future=async move {
+            tokio::task::spawn_blocking(move ||{let _lease=worker_lease;docker::stream_logs_to_channel(&cid,tail,raw_tx,&cancel2)});
+            loop {tokio::select!{
+                _=tx.closed()=>return,
+                chunk=raw_rx.recv()=>match chunk{Some(chunk)=>if tx.send(chunk).await.is_err(){return;},None=>return}
+            }}
+        };
+        run_pod_session(world,permit,cancellation,lease,future).await;
     });
     stream_response("text/plain; charset=utf-8", rx)
 }
 
-/// Watch resource changes (kubectl get -w). `ns` limits the stream to one
-/// namespace (the request's namespace; authorization already checked it).
-async fn handle_watch(path: &str, _query: &HashMap<String, String>, world: Arc<RwLock<DesiredWorld>>, ns: Option<String>) -> hyper::Response<BoxedBody> {
+/// The open stream is not a permanent authorization grant. Recheck both RBAC
+/// and namespace incarnation under the SAME read lock as the next snapshot.
+/// Even a rapid delete/recreate/regrant must not retarget an old watch.
+#[derive(Clone)]
+struct WatchPermit {
+    identity:crate::auth::Identity,
+    attrs:crate::auth::Attrs,
+    namespace_uid:Option<crate::storage_identity::Uid>,
+}
+
+fn authorized_watch_snapshot(kind:&str,world:&Arc<RwLock<DesiredWorld>>,permit:&WatchPermit)
+    -> Option<std::collections::BTreeMap<String,serde_json::Value>> {
+    let w=world.read().unwrap_or_else(|e|e.into_inner());
+    if !crate::auth::authorize(&w,&permit.identity,&permit.attrs) {return None;}
+    if let Some(ns)=&permit.attrs.namespace {
+        if w.storage_identities.namespaces.get(ns)!=permit.namespace_uid.as_ref() {return None;}
+    }
+    Some(watch_objects_in(kind,&w,permit.attrs.namespace.as_deref()))
+}
+
+/// Watch resource changes (kubectl get -w), with bounded reauthorization at
+/// every two-second snapshot. Already transmitted bytes cannot be recalled.
+async fn handle_watch(path: &str, _query: &HashMap<String, String>, world: Arc<RwLock<DesiredWorld>>, permit:WatchPermit) -> hyper::Response<BoxedBody> {
     let kind = crate::auth::parse_k8s_path(path).map(|(_, r, _, _)| r.to_string()).unwrap_or_default();
-    eprintln!("  [watch] {kind} ns={}", ns.as_deref().unwrap_or("*"));
+    eprintln!("  [watch] {kind} ns={}", permit.attrs.namespace.as_deref().unwrap_or("*"));
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
-        let snap = |world: Arc<RwLock<DesiredWorld>>, kind: String, ns: Option<String>| async move {
-            tokio::task::spawn_blocking(move || watch_objects(&kind, &world, ns.as_deref())).await.unwrap_or_default()
+        let snap = |world: Arc<RwLock<DesiredWorld>>, kind: String, permit:WatchPermit| async move {
+            tokio::task::spawn_blocking(move || authorized_watch_snapshot(&kind, &world, &permit)).await.ok().flatten()
         };
-        let mut last = snap(world.clone(), kind.clone(), ns.clone()).await;
+        let denied=Bytes::from(format!("{}\n",serde_json::json!({"type":"ERROR","object":{
+            "kind":"Status","apiVersion":"v1","status":"Failure","code":403,
+            "reason":"Forbidden","message":"watch authorization or namespace incarnation changed"}})));
+        let Some(mut last)=snap(world.clone(),kind.clone(),permit.clone()).await else {
+            let _=tx.send(denied).await;return;
+        };
         for obj in last.values() {
             let line = format!("{}\n", serde_json::json!({"type": "ADDED", "object": obj}));
             if tx.send(Bytes::from(line)).await.is_err() { return; }
@@ -1337,9 +1556,21 @@ async fn handle_watch(path: &str, _query: &HashMap<String, String>, world: Arc<R
         loop {
             interval.tick().await;
             if tx.is_closed() { return; }
-            let cur = snap(world.clone(), kind.clone(), ns.clone()).await;
+            let Some(cur)=snap(world.clone(),kind.clone(),permit.clone()).await else {
+                let _=tx.send(denied).await;return;
+            };
             for (key, obj) in &cur {
-                let ty = match last.get(key) { None => "ADDED", Some(o) if o != obj => "MODIFIED", _ => continue };
+                let ty = match last.get(key) {
+                    None => "ADDED",
+                    Some(old) if old["metadata"]["uid"] != obj["metadata"]["uid"] => {
+                        // A same-name replacement is a different object, not an
+                        // update that may inherit the old volume's authority.
+                        let line=format!("{}\n",serde_json::json!({"type":"DELETED","object":old}));
+                        if tx.send(Bytes::from(line)).await.is_err() { return; }
+                        "ADDED"
+                    },
+                    Some(o) if o != obj => "MODIFIED", _ => continue
+                };
                 let line = format!("{}\n", serde_json::json!({"type": ty, "object": obj}));
                 if tx.send(Bytes::from(line)).await.is_err() { return; }
             }
@@ -1356,8 +1587,13 @@ async fn handle_watch(path: &str, _query: &HashMap<String, String>, world: Arc<R
 }
 
 /// Current objects of a kind, keyed by `ns/name`, for watch diffs.
+#[cfg(test)]
 fn watch_objects(kind: &str, world: &Arc<RwLock<DesiredWorld>>, ns: Option<&str>) -> std::collections::BTreeMap<String, serde_json::Value> {
     let w = world.read().unwrap_or_else(|e| e.into_inner());
+    watch_objects_in(kind,&w,ns)
+}
+
+fn watch_objects_in(kind:&str,w:&DesiredWorld,ns:Option<&str>)->std::collections::BTreeMap<String,serde_json::Value> {
     let in_ns = |n: &str| ns.map(|q| q == n).unwrap_or(true);
     let mut out = std::collections::BTreeMap::new();
     match kind {
@@ -1378,7 +1614,13 @@ fn watch_objects(kind: &str, world: &Arc<RwLock<DesiredWorld>>, ns: Option<&str>
             out.insert(format!("{}/{}/{}", e.namespace, e.object, e.reason), event_json(e));
         },
         "namespaces" if ns.is_none() => for n in w.namespaces.iter() {
-            out.insert(n.to_string(), serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": n}, "status": {"phase": "Active"}}));
+            out.insert(n.to_string(), serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": n,"uid":storage_resource_uid(&w,"Namespace",n,"")}, "status": {"phase": "Active"}}));
+        },
+        "persistentvolumeclaims" => for c in w.pvcs.values().filter(|c| in_ns(&c.namespace)) {
+            out.insert(crate::store::obj_key(&c.namespace,&c.name),pvc_json(&w,c));
+        },
+        "persistentvolumes" if ns.is_none() => for pv in w.pvs.values() {
+            out.insert(pv.name.clone(),pv_json(&w,pv));
         },
         _ => {}
     }
@@ -1389,19 +1631,22 @@ fn watch_objects(kind: &str, world: &Arc<RwLock<DesiredWorld>>, ns: Option<&str>
 /// `container=`) to the short id of a RUNNING container of that pod on this
 /// node. Err carries the HTTP answer (404, or a hint when the pod runs on a
 /// peer).
-async fn resolve_ws_container(path: &str, full_url: &str, world: Arc<RwLock<DesiredWorld>>) -> Result<String, hyper::Response<BoxedBody>> {
+async fn resolve_ws_container(path: &str, full_url: &str, world: Arc<RwLock<DesiredWorld>>, identity:crate::auth::Identity,lease:&crate::pod_sessions::Lease) -> Result<crate::pod_access::Permit, hyper::Response<BoxedBody>> {
     let Some((ns, _, Some(pod), _)) = crate::auth::parse_k8s_path(path) else {
         return Err(json_response(400, &status_json(400, "BadRequest", "pod path expected")));
     };
     let ns = ns.unwrap_or(crate::store::DEFAULT_NS).to_string();
     let pod = pod.to_string();
     let container = query_all(full_url.to_string(), "container").into_iter().next();
+    let sub=if path.ends_with("/exec"){"exec"}else{"portforward"};
     let (ns2, pod2) = (ns.clone(), pod.clone());
+    let resolve_lease=lease.hold();
     let found = tokio::task::spawn_blocking(move || {
+        let _lease=resolve_lease;
         let w = world.read().unwrap_or_else(|e| e.into_inner());
         find_pod_container(&w, &ns2, &pod2, container.as_deref())
             .filter(|c| c.state == "running")
-            .map(|c| c.id[..12.min(c.id.len())].to_string())
+            .map(|c|pod_access_permit(&w,Some(&identity),&c,"create",sub,&ns2,&pod2))
     }).await.ok().flatten();
     found.ok_or_else(|| {
         let msg = match find_remote_pod(&ns, &pod) {
@@ -1409,7 +1654,76 @@ async fn resolve_ws_container(path: &str, full_url: &str, world: Arc<RwLock<Desi
             None => format!("pods \"{pod}\" not found (or not running) in namespace \"{ns}\""),
         };
         json_response(404, &status_json(404, "NotFound", &msg))
-    })
+    })?.map_err(|(status,body)|json_response(status,&body))
+}
+
+struct CancelPodSockets {
+    cancel:Arc<docker::SocketCancellation>,
+    lease:crate::pod_sessions::Lease,
+}
+impl Drop for CancelPodSockets {
+    fn drop(&mut self){
+        self.cancel.cancel();
+        if !self.cancel.has_execs(){return;}
+        let Ok(runtime)=tokio::runtime::Handle::try_current() else{
+            eprintln!("  [session] runtime unavailable for foreground cleanup; node recovery required");return;
+        };
+        let (cancellation,closing_lease)=(self.cancel.clone(),self.lease.hold());
+        // Also runs when the HTTP/service future is dropped, not only when a
+        // normal select branch returns. Process-crash recovery is a separate
+        // durable-node concern; it is not claimed by this in-memory registry.
+        runtime.spawn(async move{
+            let mut warned=false;
+            loop{
+                let (cancel,worker_lease)=(cancellation.clone(),closing_lease.hold());
+                let finished=tokio::task::spawn_blocking(move||{let _lease=worker_lease;cancel.finish_execs()}).await;
+                match finished{
+                    Ok(Ok(true))=>return,
+                    Ok(Err(e)) if !warned=>{eprintln!("  [session] foreground exec cleanup unverified: {e}; admission retained");warned=true;},
+                    _=>{},
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
+}
+struct AbortPodTasks(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for AbortPodTasks {fn drop(&mut self){for task in &self.0{task.abort();}}}
+
+/// A live connection is not a permanent authorization grant. A busy state
+/// lock is also fail-closed: the check has a two-second observation bound.
+async fn run_pod_session<F:std::future::Future>(world:Arc<RwLock<DesiredWorld>>,permit:crate::pod_access::Permit,
+    cancellation:Arc<docker::SocketCancellation>,lease:crate::pod_sessions::Lease,future:F)->Option<F::Output> {
+    let _close=CancelPodSockets{cancel:cancellation,lease:lease.hold()};
+    let revoked=async move {
+        let mut interval=tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let (world,permit)=(world.clone(),permit.clone());
+            let worker_lease=lease.hold();
+            let check=tokio::task::spawn_blocking(move||{let _lease=worker_lease;permit.valid(&world.read().unwrap_or_else(|e|e.into_inner()))});
+            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),check).await,Ok(Ok(true))){return;}
+        }
+    };
+    tokio::select!{value=future=>Some(value),_=revoked=>None}
+}
+
+async fn handle_exec_json(path:&str,full_url:&str,world:Arc<RwLock<DesiredWorld>>,identity:crate::auth::Identity,
+    lease:crate::pod_sessions::Lease)->hyper::Response<BoxedBody>{
+    let pod=crate::auth::parse_k8s_path(path).and_then(|(_,_,pod,_)|pod).unwrap_or("").to_string();
+    let permit=match resolve_ws_container(path,full_url,world.clone(),identity,&lease).await{Ok(p)=>p,Err(r)=>return r};
+    let mut command=query_all(full_url.to_string(),"command");if command.is_empty(){command.push("sh".into());}
+    let cancel=Arc::new(docker::SocketCancellation::default());let cancel2=cancel.clone();
+    let cid=permit.container_id.clone();let worker_lease=lease.hold();
+    let future=tokio::task::spawn_blocking(move||{
+        let _lease=worker_lease;let refs:Vec<_>=command.iter().map(String::as_str).collect();docker::exec_capture(&cid,&refs,&cancel2)
+    });
+    match run_pod_session(world,permit,cancel,lease,future).await{
+        Some(Ok(Ok((code,mut out,err))))=>{out.extend_from_slice(&err);json_response(200,&serde_json::json!({"kind":"ExecResult","pod":pod,"exitCode":code,"output":String::from_utf8_lossy(&out)}).to_string())},
+        Some(Ok(Err(e)))=>{let status=if e.contains("exceeds 4 MiB"){413}else{500};json_response(status,&status_json(status,"ExecutionFailed",&e))},
+        Some(Err(_))=>json_response(500,&status_json(500,"InternalError","exec worker failed")),
+        None=>json_response(403,&status_json(403,"Forbidden","Pod execution authorization changed; transport closed and output withheld")),
+    }
 }
 
 /// Docker name of a container (without the leading slash).
@@ -1437,19 +1751,14 @@ async fn serve_impl(port: u16, world: Arc<RwLock<DesiredWorld>>, use_tls: bool) 
         std::process::exit(2);
     };
     let tls_acceptor = if use_tls {
-        let (cert_pem, key_pem) = generate_tls_cert().unwrap_or_else(|e| tls_fail(format!("cert generation: {e}")));
+        let (cert_pem, key_pem) = crate::tls_identity::for_state().unwrap_or_else(|e| tls_fail(e));
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let cert_path = format!("{home}/.kube/royak-ca.pem");
         if let Err(e) = crate::persist::atomic_write(&cert_path, cert_pem.as_bytes()) {
             eprintln!("  ⚠ could not write {cert_path}: {e}");
         }
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes()).filter_map(|r| r.ok()).collect();
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes()).ok().flatten()
-            .unwrap_or_else(|| tls_fail("key parse failed".into()));
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap_or_else(|e| tls_fail(format!("config: {e}")));
+        let config = crate::tls_identity::server_config(&cert_pem, &key_pem)
+            .unwrap_or_else(|e| tls_fail(e));
         println!("  ✓ TLS cert: {cert_path}");
         Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
     } else {
@@ -1469,20 +1778,24 @@ async fn serve_impl(port: u16, world: Arc<RwLock<DesiredWorld>>, use_tls: bool) 
     println!("  ✓ API server listening on {addr}{}", if tls_acceptor.is_some() { " (HTTPS)" } else { "" });
 
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, remote) = match listener.accept().await {
             Ok(conn) => conn,
             Err(_) => continue,
         };
 
         let world = world.clone();
         let tls = tls_acceptor.clone();
+        let local=match stream.local_addr(){Ok(addr)=>addr.ip(),Err(_)=>continue};
+        let peer_transport=crate::connect::PeerTransport{local,remote:remote.ip()};
 
         tokio::spawn(async move {
             if let Some(acceptor) = tls {
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         let io = TokioIo::new(tls_stream);
-                        let service = hyper::service::service_fn(move |req| {
+                        let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                            req.extensions_mut().insert(crate::connect::SecureTransport);
+                            req.extensions_mut().insert(peer_transport.clone());
                             let w = world.clone();
                             async move { handle_request(req, w).await }
                         });
@@ -1492,7 +1805,8 @@ async fn serve_impl(port: u16, world: Arc<RwLock<DesiredWorld>>, use_tls: bool) 
                 }
             } else {
                 let io = TokioIo::new(stream);
-                let service = hyper::service::service_fn(move |req| {
+                let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                    req.extensions_mut().insert(peer_transport.clone());
                     let w = world.clone();
                     async move { handle_request(req, w).await }
                 });
@@ -1532,6 +1846,8 @@ fn api_v1_resources() -> String {
         "resources": [
             {"name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod", "verbs": ["get", "list", "create", "delete"]},
             {"name": "namespaces", "singularName": "namespace", "namespaced": false, "kind": "Namespace", "verbs": ["get", "list", "create", "delete"]},
+            {"name": "persistentvolumes", "singularName": "persistentvolume", "namespaced": false, "kind": "PersistentVolume", "verbs": ["get", "list", "watch", "create", "delete"]},
+            {"name": "persistentvolumeclaims", "singularName": "persistentvolumeclaim", "namespaced": true, "kind": "PersistentVolumeClaim", "verbs": ["get", "list", "watch", "create", "delete"]},
             {"name": "configmaps", "singularName": "configmap", "namespaced": true, "kind": "ConfigMap", "verbs": ["get", "list", "create", "delete"]},
             {"name": "secrets", "singularName": "secret", "namespaced": true, "kind": "Secret", "verbs": ["get", "list", "create", "delete"]},
             {"name": "services", "singularName": "service", "namespaced": true, "kind": "Service", "verbs": ["get", "list"]},
@@ -1975,6 +2291,20 @@ fn kind_schemas(kinds: &[KindDef]) -> serde_json::Value {
     // Full pod-template schemas with strategic-merge hints. kubectl's
     // client-side apply walks these to compute its patch; without
     // spec.template it errors with "unable to find api field template".
+    let identity_security = serde_json::json!({
+        "runAsUser": {"type":"integer","format":"int64","minimum":0,"maximum":4294967294u64},
+        "runAsGroup": {"type":"integer","format":"int64","minimum":0,"maximum":4294967294u64},
+        "runAsNonRoot": {"type":"boolean"}
+    });
+    let mut container_security = identity_security.as_object().unwrap().clone();
+    container_security.insert("readOnlyRootFilesystem".into(), serde_json::json!({"type":"boolean"}));
+    container_security.insert("allowPrivilegeEscalation".into(), serde_json::json!({"type":"boolean"}));
+    container_security.insert("privileged".into(), serde_json::json!({"type":"boolean","enum":[false]}));
+    container_security.insert("capabilities".into(), serde_json::json!({"type":"object","additionalProperties":false,"properties":{
+        "add":{"type":"array","items":{"type":"string"}},"drop":{"type":"array","items":{"type":"string"}}
+    }}));
+    schemas.insert("io.k8s.api.core.v1.SecurityContext".into(), serde_json::json!({"type":"object","additionalProperties":false,"properties":container_security}));
+    schemas.insert("io.k8s.api.core.v1.PodSecurityContext".into(), serde_json::json!({"type":"object","additionalProperties":false,"properties":identity_security}));
     schemas.insert("io.k8s.api.core.v1.Container".into(), serde_json::json!({
         "type": "object",
         "required": ["name"],
@@ -2009,11 +2339,13 @@ fn kind_schemas(kinds: &[KindDef]) -> serde_json::Value {
             "livenessProbe": {"type": "object"},
             "readinessProbe": {"type": "object"},
             "startupProbe": {"type": "object"},
+            "securityContext": {"$ref":"#/components/schemas/io.k8s.api.core.v1.SecurityContext"},
         }
     }));
     schemas.insert("io.k8s.api.core.v1.PodSpec".into(), serde_json::json!({
         "type": "object",
         "properties": {
+            "securityContext": {"$ref":"#/components/schemas/io.k8s.api.core.v1.PodSecurityContext"},
             "containers": {
                 "type": "array",
                 "items": {"$ref": "#/components/schemas/io.k8s.api.core.v1.Container"},
@@ -2134,16 +2466,72 @@ fn pod_json(name: &str, ns: &str, image: &str, phase: &str, running: bool) -> se
         "spec": {"containers": [{"name": "main", "image": image}]},
         "status": {
             "phase": phase,
-            "containerStatuses": [{"name": "main", "ready": running, "restartCount": 0, "image": image}]
+            "containerStatuses": [{"name": "main", "ready": running, "restartCount": 0, "image": image}],
+            "conditions": [{"type":"Ready","status":if running { "True" } else { "False" },
+                "reason":if running { "ContainersReady" } else { "ContainersNotReady" }}]
         }
     })
+}
+
+fn pv_json(world: &DesiredWorld, pv: &reconcile::StoredPV) -> serde_json::Value {
+    let mut value=serde_json::json!({
+        "apiVersion":"v1","kind":"PersistentVolume",
+        "metadata":{"name":pv.name,"uid":storage_resource_uid(world,"PersistentVolume",&pv.name,""),"resourceVersion":current_rv()},
+        "spec":{"capacity":{"storage":pv.capacity},"storageClassName":pv.storage_class,
+            "accessModes":[pv.access_mode],"hostPath":{"path":pv.host_path}},
+        "status":{"phase":match pv.status { reconcile::PVStatus::Available=>"Available",reconcile::PVStatus::Bound=>"Bound",reconcile::PVStatus::Released=>"Released" }}
+    });
+    if let Some(volume)=world.storage_identities.lifecycle.for_pv(&world.storage_identities,&pv.name) {
+        value["spec"].as_object_mut().unwrap().remove("hostPath");
+        value["metadata"]["annotations"]=serde_json::json!({
+            "royak.io/storage-provisioner":crate::storage_lifecycle::PROVISIONER,
+            "royak.io/volume-uid":volume.uid().as_str(),"royak.io/storage-phase":volume.phase().label()});
+        if matches!(volume.phase(),crate::storage_lifecycle::Phase::PendingProvision|crate::storage_lifecycle::Phase::Provisioning) {
+            value["status"]["phase"]="Pending".into();
+        } else if matches!(volume.phase(),crate::storage_lifecycle::Phase::Released|crate::storage_lifecycle::Phase::Deleted) {
+            value["status"]["phase"]="Released".into();
+        }
+    }
+    if let Some((claim,identity))=pv.bound_to.as_ref().and_then(|key|
+        world.pvcs.get(key).zip(world.storage_identities.claims.get(key))) {
+        if pv.status==reconcile::PVStatus::Bound && claim.bound_pv.as_deref()==Some(pv.name.as_str()) {
+            value["spec"]["claimRef"]=serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim",
+                "namespace":claim.namespace,"name":claim.name,"uid":identity.uid.as_str()});
+        }
+    }
+    value
+}
+
+fn pvc_json(world: &DesiredWorld, claim: &reconcile::StoredPVC) -> serde_json::Value {
+    let identity=world.storage_identities.claims.get(&crate::store::obj_key(&claim.namespace,&claim.name));
+    let mut value=serde_json::json!({
+        "apiVersion":"v1","kind":"PersistentVolumeClaim",
+        "metadata":{"name":claim.name,"namespace":claim.namespace,
+            "uid":storage_resource_uid(world,"PersistentVolumeClaim",&claim.name,&claim.namespace),"resourceVersion":current_rv(),
+            "annotations":{"royak.io/namespace-uid":identity.map(|i|i.namespace_uid.as_str())}},
+        "spec":{"storageClassName":claim.storage_class,"accessModes":[claim.access_mode],
+            "resources":{"requests":{"storage":claim.requested}},"volumeName":claim.bound_pv},
+        "status":{"phase":if claim.bound_pv.is_some(){"Bound"}else{"Pending"}}
+    });
+    if let Some(volume)=claim.bound_pv.as_ref().and_then(|pv|world.storage_identities.lifecycle.for_pv(&world.storage_identities,pv)) {
+        value["status"]["royakStorage"]=serde_json::json!({"volumeUID":volume.uid().as_str(),
+            "phase":volume.phase().label(),"attachmentEpoch":volume.epoch(),"assignment":volume.assignment(),"operationUID":volume.operation().as_str()});
+        if matches!(volume.phase(),crate::storage_lifecycle::Phase::PendingProvision|crate::storage_lifecycle::Phase::Provisioning) {
+            value["status"]["phase"]="Pending".into();
+            value["status"]["conditions"]=serde_json::json!([{"type":"Provisioned","status":"False",
+                "reason":"AwaitingVerifiedStorageDriver","message":"metadata reserved; backend creation and workload attachment are not yet enabled"}]);
+        } else if matches!(volume.phase(),crate::storage_lifecycle::Phase::Released|crate::storage_lifecycle::Phase::Deleted) {
+            value["status"]["phase"]="Lost".into();
+        }
+    }
+    value
 }
 
 fn list_namespaces(world: &DesiredWorld) -> String {
     let items: Vec<serde_json::Value> = world.namespaces.iter().map(|ns| {
         serde_json::json!({
             "apiVersion": "v1", "kind": "Namespace",
-            "metadata": {"name": ns, "uid": resource_uid("Namespace", ns, ""), "resourceVersion": current_rv(), "creationTimestamp": now_rfc3339()},
+            "metadata": {"name": ns, "uid": storage_resource_uid(world,"Namespace", ns, ""), "resourceVersion": current_rv(), "creationTimestamp": now_rfc3339()},
             "status": {"phase": "Active"}
         })
     }).collect();
@@ -2154,7 +2542,7 @@ fn get_namespace(world: &DesiredWorld, name: &str) -> (u16, String) {
     if world.namespaces.contains(&name.to_string()) {
         (200, serde_json::json!({
             "apiVersion": "v1", "kind": "Namespace",
-            "metadata": {"name": name, "uid": resource_uid("Namespace", name, ""), "resourceVersion": current_rv(), "creationTimestamp": now_rfc3339()},
+            "metadata": {"name": name, "uid": storage_resource_uid(world,"Namespace", name, ""), "resourceVersion": current_rv(), "creationTimestamp": now_rfc3339()},
             "status": {"phase": "Active"}
         }).to_string())
     } else {
@@ -2325,20 +2713,19 @@ pub async fn serve_ingress(port: u16, world: Arc<RwLock<DesiredWorld>>, use_tls:
     let addr = format!("0.0.0.0:{port}");
 
     let tls_acceptor = if use_tls {
-        match generate_tls_cert() {
+        match crate::tls_identity::for_state() {
             Ok((cert_pem, key_pem)) => {
-                let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-                    .filter_map(|r| r.ok())
-                    .collect();
-                if let Ok(Some(key)) = rustls_pemfile::private_key(&mut key_pem.as_bytes()) {
-                    rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(certs, key)
-                        .ok()
-                        .map(|cfg| tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
-                } else { None }
+                let config = crate::tls_identity::server_config(&cert_pem, &key_pem)
+                    .unwrap_or_else(|error| {
+                        eprintln!("  ✗ ingress TLS configuration failed: {error} — refusing plaintext fallback");
+                        std::process::exit(2);
+                    });
+                Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
             }
-            Err(_) => None,
+            Err(error) => {
+                eprintln!("  ✗ ingress TLS identity unavailable: {error} — refusing plaintext fallback");
+                std::process::exit(2);
+            }
         }
     } else { None };
 
@@ -2394,6 +2781,7 @@ async fn handle_ingress(
         .split(':').next().unwrap_or("")
         .to_string();
     let path = req.uri().path().to_string();
+    let forward_path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
 
     // ACME HTTP-01 challenge response (Let's Encrypt)
     if path.starts_with("/.well-known/acme-challenge/") {
@@ -2411,14 +2799,14 @@ async fn handle_ingress(
     // no per-request Docker call. This is what keeps the ingress concurrent even
     // while the reconcile loop holds the write lock during a tick. Falls through
     // to the live path if the route isn't in the snapshot yet.
-    if let Some((ip, port, pod, pod_port)) = snapshot_backend(&host, &path) {
+    if let Some(backends) = snapshot_backends(&host, &path) {
         let method = req.method().clone();
         let req_headers = req.headers().clone();
         let body_bytes = match req.collect().await {
             Ok(c) => c.to_bytes(),
-            Err(_) => Bytes::new(),
+            Err(_) => return Ok(typed_response(400, "invalid or incomplete request body", "text/plain")),
         };
-        return Ok(match proxy_request_async(&ip, port, &pod, pod_port, method.as_str(), &path, &req_headers, &body_bytes).await {
+        return Ok(match proxy_backends(&backends, method.as_str(), &forward_path, &req_headers, &body_bytes).await {
             Ok((status, body, resp_headers)) => {
                 let mut builder = hyper::Response::builder().status(status);
                 for (k, v) in resp_headers { builder = builder.header(k, v); }
@@ -2440,7 +2828,7 @@ async fn handle_ingress(
     // Read incoming request body (for POST/PUT/PATCH forwarding).
     let body_bytes = match req.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => Bytes::new(),
+        Err(_) => return Ok(typed_response(400, "invalid or incomplete request body", "text/plain")),
     };
 
     let resp = match backend {
@@ -2471,7 +2859,7 @@ async fn handle_ingress(
             eprintln!("  [ingress] {} {host}{path} → {route_label}", method.as_str());
             match proxy_request_async(
                 &target_host, target_port, "", 0,
-                method.as_str(), &path, &req_headers, &body_bytes,
+                method.as_str(), &forward_path, &req_headers, &body_bytes,
             ).await {
                 Ok((status, body, resp_headers)) => {
                     let mut builder = hyper::Response::builder().status(status);
@@ -2652,9 +3040,25 @@ pub fn publish_ingress_snapshot(world: &DesiredWorld) {
 }
 
 /// Longest-prefix lookup in the published snapshot. Lock-free (Arc clone).
-/// Round-robins across ALL backends — local and remote — so a refresh lands on
-/// a different pod, possibly on a different node. Returns (ip, port, target_pod).
-fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16, String, u16)> {
+/// Round-robins the starting point across local and remote backends, retaining
+/// alternatives for safe pre-transmission connection failover.
+type IngressBackend = (String, u16, String, u16);
+
+fn backend_failures() -> &'static std::sync::Mutex<std::collections::HashMap<IngressBackend, std::time::Instant>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<IngressBackend, std::time::Instant>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn mark_backend_failed(backend: &IngressBackend) {
+    if let Ok(mut failures) = backend_failures().lock() {
+        failures.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(2));
+        if failures.len() < 1024 {
+            failures.insert(backend.clone(), std::time::Instant::now());
+        }
+    }
+}
+
+fn snapshot_backends(host: &str, path: &str) -> Option<Vec<IngressBackend>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RR: AtomicUsize = AtomicUsize::new(0);
     let snap = ingress_snapshot().lock().ok()?.clone();
@@ -2663,7 +3067,58 @@ fn snapshot_backend(host: &str, path: &str) -> Option<(String, u16, String, u16)
         .max_by_key(|r| r.path.len())?;
     if route.backends.is_empty() { return None; }
     let n = RR.fetch_add(1, Ordering::Relaxed);
-    Some(route.backends[n % route.backends.len()].clone())
+    let mut backends = route.backends.clone();
+    let len = backends.len();
+    backends.rotate_left(n % len);
+    Some(backends)
+}
+
+/// Retry safe reads on a different endpoint after transport failure. Writes may
+/// select another endpoint only before connecting/transmitting; an uncertain
+/// response after sending a write is returned to the caller, never replayed.
+async fn proxy_backends(
+    backends: &[IngressBackend], method: &str, path: &str, headers: &HeaderMap, body: &[u8],
+) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
+    proxy_backends_until(backends, method, path, headers, body,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(15)).await
+}
+
+async fn proxy_backends_until(
+    backends: &[IngressBackend], method: &str, path: &str, headers: &HeaderMap, body: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
+    let safe_read = matches!(method, "GET" | "HEAD") && body.is_empty();
+    let mut last = "no reachable, non-quarantined backend".to_string();
+    let candidates: Vec<_> = {
+        let mut failures = backend_failures().lock().unwrap_or_else(|e| e.into_inner());
+        failures.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(2));
+        backends.iter().filter(|b| !failures.contains_key(*b)).take(8).cloned().collect()
+    };
+    for backend in candidates {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("ingress request deadline exceeded".into());
+        }
+        let (ip, port, pod, pod_port) = &backend;
+        let addr = format!("{ip}:{port}");
+        let connect_deadline = deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(500));
+        match tokio::time::timeout_at(connect_deadline, tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => {
+                match tokio::time::timeout_at(deadline,
+                    proxy_request_connected(stream, ip, *port, pod, *pod_port, method, path, headers, body)).await {
+                    Ok(Ok(value)) => return Ok(value),
+                    Ok(Err(error)) => last = error,
+                    Err(_) => last = "ingress request deadline exceeded".into(),
+                }
+                mark_backend_failed(&backend);
+                if !safe_read { return Err(last); }
+            }
+            error => {
+                last = format!("connect {addr}: {error:?}");
+                mark_backend_failed(&backend);
+            }
+        }
+    }
+    Err(last)
 }
 
 // ─── Consolidated demo dashboard snapshot (lock-free read model) ───
@@ -2927,8 +3382,18 @@ async fn proxy_request_async(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
+    let addr = format!("{service}:{port}");
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(&addr)).await
+        .map_err(|_| format!("connect {addr}: timeout"))?
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    proxy_request_connected(stream, service, port, target_pod, pod_port, method, path, headers, body).await
+}
+
+async fn proxy_request_connected(
+    mut stream: tokio::net::TcpStream, service: &str, port: u16, target_pod: &str, pod_port: u16,
+    method: &str, path: &str, headers: &HeaderMap, body: &[u8],
+) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     let addr = format!("{service}:{port}");
 
@@ -2961,21 +3426,14 @@ async fn proxy_request_async(
     let raw = if !target_pod.is_empty() {
         // Peer hop: sealed with the cluster secret — the peer's mesh accepts
         // nothing else in cluster mode.
-        crate::cluster_mesh::sealed_exchange(&addr, &wire, std::time::Duration::from_secs(15)).await?
+        crate::cluster_mesh::sealed_exchange_connected(stream, &addr, &wire, std::time::Duration::from_secs(15)).await?
     } else {
-        let mut stream = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| format!("connect {addr}: timeout"))?
-        .map_err(|e| format!("connect {addr}: {e}"))?;
         stream.write_all(&wire).await.map_err(|e| format!("write: {e}"))?;
         // Read everything until EOF (connection: close guarantees this).
         let mut raw = Vec::with_capacity(4096);
         tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            stream.read_to_end(&mut raw),
+            stream.take((MAX_PROXY_RESPONSE_BYTES + 1) as u64).read_to_end(&mut raw),
         )
         .await
         .map_err(|_| "read: timeout".to_string())?
@@ -2983,37 +3441,173 @@ async fn proxy_request_async(
         raw
     };
 
-    // Split response into head + body. We need to forward status, headers,
-    // and binary body separately (body may be non-UTF8).
-    let sep = b"\r\n\r\n";
-    let (head_bytes, body_bytes): (&[u8], &[u8]) = raw.windows(sep.len())
-        .position(|w| w == sep)
-        .map(|p| (&raw[..p], &raw[p + sep.len()..]))
-        .ok_or_else(|| "response has no header/body separator".to_string())?;
+    decode_proxy_response(raw, method).await
+}
 
-    let head_str = std::str::from_utf8(head_bytes).map_err(|_| "non-utf8 response head".to_string())?;
-    let mut lines = head_str.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status: u16 = status_line.split_whitespace().nth(1)
-        .and_then(|s| s.parse().ok()).unwrap_or(502);
+pub(crate) const MAX_PROXY_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-    let mut resp_headers = Vec::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim();
-            let v = v.trim();
-            let lk = k.to_ascii_lowercase();
-            // Drop hop-by-hop + content-length (we compute our own).
-            if matches!(lk.as_str(),
-                "connection" | "keep-alive" | "proxy-authenticate" |
-                "proxy-authorization" | "te" | "trailer" | "transfer-encoding" |
-                "upgrade" | "content-length"
-            ) { continue; }
-            resp_headers.push((k.to_string(), v.to_string()));
+/// Parse the buffered wire response with Hyper's HTTP/1 client parser, including
+/// chunk framing, extensions, trailers, interim responses and premature EOF.
+/// The duplex is purely in-memory: its synthetic request is NEVER transmitted
+/// to a backend, so parsing cannot replay a POST or create another side effect.
+/// This proxy remains buffered (not an SSE/upgrade implementation).
+async fn decode_proxy_response(raw: Vec<u8>, method: &str) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if raw.len() > MAX_PROXY_RESPONSE_BYTES { return Err("upstream response exceeds 32 MiB limit".into()); }
+    let method: hyper::Method = method.parse().map_err(|_| "invalid request method".to_string())?;
+    let (client, mut feeder) = tokio::io::duplex(8192);
+    // JoinSet aborts both tasks on return, error, timeout AND caller cancellation.
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 512];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match feeder.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+            if request.len() > 8192 { return; }
+        }
+        let _ = feeder.write_all(&raw).await;
+        let _ = feeder.shutdown().await;
+    });
+    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(64 * 1024).max_headers(100)
+        .handshake::<_, http_body_util::Empty<Bytes>>(TokioIo::new(client)).await
+        .map_err(|e| format!("response parser: {e}"))?;
+    tasks.spawn(async move { let _ = conn.await; });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let req = Request::builder().method(method.clone()).uri("/")
+            .header("Host", "response-decoder.invalid").header("Connection", "close")
+            .body(http_body_util::Empty::<Bytes>::new()).map_err(|e| e.to_string())?;
+        let mut response = sender.send_request(req).await.map_err(|e| format!("invalid upstream response: {e}"))?;
+        if response.status() == 101 { return Err("upstream protocol upgrades are unsupported".into()); }
+        let mut connection_headers = Vec::new();
+        for value in response.headers().get_all("connection") {
+            if let Ok(value) = value.to_str() { connection_headers.extend(value.split(',').map(|s| s.trim().to_ascii_lowercase())); }
+        }
+        if let Some(value) = response.headers().get("transfer-encoding") {
+            if !value.to_str().map(|s| s.eq_ignore_ascii_case("chunked")).unwrap_or(false) {
+                return Err("unsupported upstream transfer coding".into());
+            }
+        }
+        let mut headers = Vec::new();
+        for (name, value) in response.headers() {
+            let name = name.as_str();
+            if name == "content-length" && (method == hyper::Method::HEAD || response.status().as_u16() == 304) {
+                let value = value.to_str().map_err(|_| "invalid representation length".to_string())?;
+                value.parse::<u64>().map_err(|_| "invalid representation length".to_string())?;
+                headers.push((name.to_string(), value.to_string()));
+                continue;
+            }
+            if matches!(name, "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" |
+                "te" | "trailer" | "transfer-encoding" | "upgrade" | "content-length")
+                || connection_headers.iter().any(|h| h == name) { continue; }
+            headers.push((name.to_string(), value.to_str().map_err(|_| "invalid upstream header value".to_string())?.to_string()));
+        }
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            let frame = frame.map_err(|e| format!("invalid/truncated upstream body: {e}"))?;
+            if let Some(data) = frame.data_ref() {
+                if body.len().saturating_add(data.len()) > MAX_PROXY_RESPONSE_BYTES { return Err("upstream body exceeds limit".into()); }
+                body.extend_from_slice(data);
+            }
+            // Trailers are parsed/validated, not appended to the application
+            // body. As a buffered proxy we don't advertise/forward trailers.
+        }
+        Ok((status, body, headers))
+    }).await.map_err(|_| "upstream response parser timeout".to_string())?;
+    result
+}
+
+#[cfg(test)]
+#[path = "ingress_lab.rs"]
+mod ingress_lab;
+
+#[cfg(test)]
+#[path = "ingress_retry_tests.rs"]
+mod ingress_retry_tests;
+
+#[cfg(test)]
+mod ingress_failover_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn chunk_extensions_binary_body_and_trailers_are_decoded() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Check\r\nConnection: close, X-Private\r\nX-Private: hop\r\nContent-Type: application/octet-stream\r\n\r\n3;foo=bar\r\n\x00\xffx\r\n2\r\nOK\r\n0\r\nX-Check: yes\r\n\r\n";
+        let (status, body, headers) = decode_proxy_response(wire.to_vec(), "GET").await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"\x00\xffxOK");
+        for forbidden in ["transfer-encoding", "trailer", "content-length", "x-private"] {
+            assert!(!headers.iter().any(|(name, _)| name == forbidden));
         }
     }
 
-    Ok((status, body_bytes.to_vec(), resp_headers))
+    #[tokio::test]
+    async fn malformed_or_truncated_upstream_never_becomes_a_success_body() {
+        for wire in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\nhello\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhey"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhey"[..],
+        ] { assert!(decode_proxy_response(wire.to_vec(), "GET").await.is_err()); }
+        assert!(decode_proxy_response(vec![0; MAX_PROXY_RESPONSE_BYTES + 1], "GET").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn head_and_interim_responses_use_standard_http_framing() {
+        let (_, body, headers) = decode_proxy_response(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n".to_vec(), "HEAD").await.unwrap();
+        assert!(body.is_empty());
+        assert!(headers.contains(&("content-length".into(), "999".into())));
+        let (status, body, _) = decode_proxy_response(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(), "POST").await.unwrap();
+        assert_eq!((status, body), (200, b"ok".to_vec()));
+    }
+
+    async fn receive_request(listener: TcpListener, reply: bool) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            request.extend_from_slice(&buf[..n]);
+            if request.ends_with(b"payload") { break; }
+        }
+        if reply {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn post_can_fail_over_before_connect_without_replaying() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        let healthy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = healthy.local_addr().unwrap().port();
+        drop(dead);
+        let task = tokio::spawn(receive_request(healthy, true));
+        let backends = vec![("127.0.0.1".into(), dead_port, "".into(), 0), ("127.0.0.1".into(), port, "".into(), 0)];
+        let result = proxy_backends(&backends, "POST", "/write", &HeaderMap::new(), b"payload").await.unwrap();
+        assert_eq!(result.0, 200);
+        assert_eq!(result.1, b"ok");
+        assert!(task.await.unwrap().starts_with(b"POST /write HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_post_is_never_replayed_to_an_alternative() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let task = tokio::spawn(receive_request(first, false));
+        let backends = vec![("127.0.0.1".into(), first_port, "".into(), 0), ("127.0.0.1".into(), other_port, "".into(), 0)];
+        assert!(proxy_backends(&backends, "POST", "/write", &HeaderMap::new(), b"payload").await.is_err());
+        assert!(task.await.unwrap().ends_with(b"payload"));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), other.accept()).await.is_err());
+    }
 }
 
 
@@ -3095,13 +3689,16 @@ async fn handle_exec_ws(
     full_url: &str,
     headers: &HeaderMap,
     world: Arc<RwLock<DesiredWorld>>,
+    identity:crate::auth::Identity,
+    lease:crate::pod_sessions::Lease,
 ) -> hyper::Response<BoxedBody> {
     // The pod's container among this node's own Royak containers, by
     // namespace + pod label (never a name substring of foreign containers).
-    let pod_name = match resolve_ws_container(path, full_url, world).await {
+    let permit = match resolve_ws_container(path, full_url, world.clone(),identity,&lease).await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    let pod_name=permit.container_id.clone();
 
     // Repeated command params: ?command=sh&command=-c&command=...
     let cmd: Vec<String> = full_url.split_once('?')
@@ -3140,22 +3737,28 @@ async fn handle_exec_ws(
         let cmd2 = cmd.clone();
         tokio::spawn(async move {
             let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
-            exec_interactive_bridge(upgraded, pod2, cmd2, wants_tty).await;
+            let cancel=Arc::new(docker::SocketCancellation::default());
+            let future=exec_interactive_bridge(upgraded,pod2,cmd2,wants_tty,cancel.clone(),lease.hold());
+            run_pod_session(world,permit,cancel,lease,future).await;
         });
         return response;
     }
 
     tokio::spawn(async move {
         let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
+        let cancel=Arc::new(docker::SocketCancellation::default());let cancel2=cancel.clone();
+        let worker_lease=lease.hold();
+        let future=async move {
         let mut io = hyper_util::rt::TokioIo::new(upgraded);
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Resolve container + run the command off the reactor.
         let cmd_owned: Vec<String> = cmd.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let _lease=worker_lease;
             let short = pod_name;
             let refs: Vec<&str> = cmd_owned.iter().map(|s| s.as_str()).collect();
-            crate::docker::exec_capture(&short, &refs).ok()
+            crate::docker::exec_capture(&short, &refs,&cancel2).ok()
         }).await.ok().flatten();
 
         match result {
@@ -3188,6 +3791,8 @@ async fn handle_exec_ws(
         let _ = io.flush().await;
         let mut sink = [0u8; 1024];
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), io.read(&mut sink)).await;
+        };
+        run_pod_session(world,permit,cancel,lease,future).await;
     });
 
     response
@@ -3495,6 +4100,11 @@ mod ws_tests {
     use super::*;
 
     #[test]
+    fn json_exec_keeps_repeated_ordered_and_encoded_arguments() {
+        assert_eq!(query_all("/api/v1/namespaces/lab/pods/p/exec?command=cat&command=%2Fdata%2Fa%26b".into(),"command"),vec!["cat","/data/a&b"]);
+    }
+
+    #[test]
     fn sha1_known_vector() {
         let d = sha1(b"abc");
         let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
@@ -3568,8 +4178,10 @@ async fn exec_interactive_bridge(
     pod_name: String,
     cmd: Vec<String>,
     tty: bool,
+    cancellation:Arc<docker::SocketCancellation>,
+    lease:crate::pod_sessions::Lease,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let io = hyper_util::rt::TokioIo::new(upgraded);
     let (mut ws_rd, ws_wr) = tokio::io::split(io);
@@ -3577,9 +4189,12 @@ async fn exec_interactive_bridge(
 
     // 1. Create the exec instance + hijack its start stream (blocking IO).
     let short = pod_name.clone();
+    let worker_lease=lease.hold();
+    let setup_cancellation=cancellation.clone();
     let setup = tokio::task::spawn_blocking(move || {
+        let _lease=worker_lease;
         let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        crate::docker::exec_hijack(&short, &refs, tty).ok()
+        crate::docker::exec_hijack(&short, &refs, tty,&setup_cancellation).ok()
     }).await.ok().flatten();
 
     let Some((exec_id, unix_stream)) = setup else {
@@ -3592,7 +4207,7 @@ async fn exec_interactive_bridge(
 
     let exec_id_for_status = exec_id.clone();
     let us_read = unix_stream.try_clone().ok();
-    let (docker_tx, mut docker_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (docker_tx, mut docker_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::pod_sessions::PIPE_DEPTH);
     // Docker routes writes to the process stdin only after the hijack upgrade
     // completes. The reader signals `upgraded` once it has seen the 101 head;
     // the stdin writer blocks on it so early keystrokes are not lost.
@@ -3600,28 +4215,33 @@ async fn exec_interactive_bridge(
 
     // 2. Blocking thread: docker → channel
     if let Some(mut us_r) = us_read {
-        std::thread::spawn(move || {
+        let reader_lease=lease.hold();
+        if std::thread::Builder::new().name("rk-exec-rd".into()).spawn(move || {
+            let _lease=reader_lease;
             use std::io::Read;
             let mut buf = [0u8; 8192];
             loop {
                 match us_r.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if docker_tx.send(buf[..n].to_vec()).is_err() { break; }
+                        if docker_tx.blocking_send(buf[..n].to_vec()).is_err() { break; }
                     }
                     Err(_) => break,
                 }
             }
             // channel drop signals EOF
-        });
+        }).is_err(){return;}
     }
 
     // 3. Blocking writer thread: stdin bytes → docker socket
-    let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::pod_sessions::PIPE_DEPTH);
     let mut stdin_tx = Some(stdin_tx);
     let mut us_w = unix_stream;
     let barrier_in = std::sync::Arc::clone(&upgraded_barrier);
-    std::thread::spawn(move || {
+    let writer_lease=lease.hold();
+    let writer_cancel=cancellation.clone();let stdin_exec_id=exec_id.clone();
+    if std::thread::Builder::new().name("rk-exec-wr".into()).spawn(move || {
+        let _lease=writer_lease;
         use std::io::Write;
         // Wait until the hijack upgrade is confirmed (bounded), then flush stdin.
         {
@@ -3632,18 +4252,26 @@ async fn exec_interactive_bridge(
                 ready = g;
                 if to.timed_out() { break; }
             }
+            if !*ready{return;}
         }
-        while let Ok(chunk) = stdin_rx.recv() {
+        while let Some(chunk) = stdin_rx.blocking_recv() {
+            if writer_cancel.check().is_err(){break;}
             if us_w.write_all(&chunk).is_err() { break; }
             let _ = us_w.flush();
         }
-        // Best-effort half-close so the exec'd process sees stdin EOF.
-        let _ = us_w.shutdown(std::net::Shutdown::Write);
-    });
+        // A premature half-close can abort the daemon before Start records
+        // Running/ExitCode. Keep the admitted existing worker, no new task,
+        // and preserve normal explicit v5 stdin EOF once start is witnessed.
+        while writer_cancel.check().is_ok(){
+            if matches!(writer_cancel.try_exec_stdin_eof(&stdin_exec_id),Ok(true)){break;}
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }).is_err(){return;}
 
     // 4. Task: docker output → WS frames (TTY = raw on ch1; else demux)
     let wr_out = std::sync::Arc::clone(&ws_wr);
     let barrier_out = std::sync::Arc::clone(&upgraded_barrier);
+    let out_lease=lease.hold();
     let out_task = tokio::spawn(async move {
         // Docker's hijacked stream starts with an HTTP response head — strip it.
         let mut head_done = false;
@@ -3656,11 +4284,13 @@ async fn exec_interactive_bridge(
             };
             if !head_done {
                 if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if !crate::docker::exec_upgrade_head_valid(&data[..pos+4]){return;}
                     data = data.split_off(pos + 4);
                     head_done = true;
                     { let (m, cv) = &*barrier_out; *m.lock().unwrap() = true; cv.notify_all(); }
                     if data.is_empty() { continue; }
                 } else {
+                    if data.len()>8192{return;}
                     carry = data;
                     continue;
                 }
@@ -3675,6 +4305,7 @@ async fn exec_interactive_bridge(
                     if carry.len() < 8 { break; }
                     let stype = carry[0];
                     let len = u32::from_be_bytes([carry[4], carry[5], carry[6], carry[7]]) as usize;
+                    if ![1,2].contains(&stype) || carry[1..4]!=[0,0,0] || len>crate::pod_sessions::DOCKER_FRAME_LIMIT{return;}
                     if carry.len() < 8 + len { break; }
                     let payload: Vec<u8> = carry[8..8 + len].to_vec();
                     let rest = carry.split_off(8 + len);
@@ -3685,7 +4316,8 @@ async fn exec_interactive_bridge(
             }
         }
         // Docker side finished: exit code + status + close.
-        let exit = tokio::task::spawn_blocking(move || crate::docker::exec_exit_code(&exec_id_for_status))
+        let exit_lease=out_lease.hold();
+        let exit = tokio::task::spawn_blocking(move || {let _lease=exit_lease;crate::docker::exec_exit_code(&exec_id_for_status)})
             .await.ok().flatten().unwrap_or(-1);
         let status = if exit == 0 {
             serde_json::json!({"metadata": {}, "status": "Success"})
@@ -3702,10 +4334,12 @@ async fn exec_interactive_bridge(
         let _ = w.write_all(&ws_close_frame(1000)).await;
         let _ = w.flush().await;
     });
+    let mut tasks=AbortPodTasks(vec![out_task]);
 
     // 5. This task: WS frames → stdin / resize / control
     loop {
-        let Some((opcode, payload)) = ws_read_frame(&mut ws_rd).await else { break };
+        let frame=tokio::select!{frame=ws_read_frame(&mut ws_rd)=>frame,_=&mut tasks.0[0]=>break};
+        let Some((opcode, payload)) = frame else { break };
         match opcode {
             0x8 => break, // close
             0x9 => { // ping → pong
@@ -3717,7 +4351,9 @@ async fn exec_interactive_bridge(
                 let data = &payload[1..];
                 match ch {
                     0 => {
-                        if let Some(tx) = stdin_tx.as_ref() { let _ = tx.send(data.to_vec()); }
+                        if let Some(tx) = stdin_tx.as_ref() {
+                            for chunk in data.chunks(crate::pod_sessions::PIPE_CHUNK){if tx.send(chunk.to_vec()).await.is_err(){break;}}
+                        }
                     }
                     // v5 close message: payload byte names the closed channel.
                     255 => {
@@ -3731,9 +4367,11 @@ async fn exec_interactive_bridge(
                             let w_ = v["Width"].as_u64().unwrap_or(80);
                             let h = v["Height"].as_u64().unwrap_or(24);
                             let eid = exec_id.clone();
-                            tokio::task::spawn_blocking(move || {
+                            let resize_lease=lease.hold();
+                            let _=tokio::task::spawn_blocking(move || {
+                                let _lease=resize_lease;
                                 crate::docker::exec_resize(&eid, w_ as u32, h as u32)
-                            });
+                            }).await;
                         }
                     }
                     _ => {}
@@ -3743,7 +4381,6 @@ async fn exec_interactive_bridge(
         }
     }
     stdin_tx.take(); // stdin EOF to the process
-    let _ = out_task.await;
 }
 
 // ─── kubectl port-forward over WebSocket ───
@@ -3766,20 +4403,14 @@ async fn handle_portforward_ws(
     full_url: &str,
     headers: &HeaderMap,
     world: Arc<RwLock<DesiredWorld>>,
+    identity:crate::auth::Identity,
+    lease:crate::pod_sessions::Lease,
 ) -> hyper::Response<BoxedBody> {
-    let pod_name = match resolve_ws_container(path, full_url, world).await {
+    let ports=match crate::pod_sessions::forward_ports(full_url){Ok(p)=>p,Err(e)=>return json_response(400,&status_json(400,"BadRequest",&e))};
+    let permit = match resolve_ws_container(path, full_url, world.clone(),identity,&lease).await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
-
-    // ?ports=8080,9090 or repeated ?ports=
-    let ports: Vec<u16> = full_url.split_once('?')
-        .map(|(_, q)| q.split('&')
-            .filter_map(|kv| kv.strip_prefix("ports="))
-            .flat_map(|v| url_decode(v).split(',').filter_map(|p| p.trim().parse::<u16>().ok()).collect::<Vec<_>>())
-            .collect())
-        .unwrap_or_default();
-
     let key = headers.get("sec-websocket-key").and_then(|v| v.to_str().ok()).unwrap_or("");
     if key.is_empty() || ports.is_empty() {
         return json_response(400, r#"{"kind":"Status","status":"Failure","message":"port-forward needs a websocket upgrade and at least one ports= param","code":400}"#);
@@ -3800,27 +4431,24 @@ async fn handle_portforward_ws(
 
     tokio::spawn(async move {
         let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
+        let cancellation=Arc::new(docker::SocketCancellation::default());
+        let backend_lease=lease.hold();
+        let endpoint_world=world.clone();let endpoint_permit=permit.clone();
+        let future=async move {
+        let world=endpoint_world;let permit=endpoint_permit;
+        let mut tasks=AbortPodTasks(vec![]);
         let io = hyper_util::rt::TokioIo::new(upgraded);
         let (mut ws_rd, ws_wr) = tokio::io::split(io);
         let ws_wr = std::sync::Arc::new(tokio::sync::Mutex::new(ws_wr));
         use tokio::io::AsyncWriteExt;
 
         // Resolve each requested port to a reachable host:port off the reactor.
-        let pod2 = pod_name.clone();
         let ports2 = ports.clone();
-        let endpoints: Vec<Option<String>> = tokio::task::spawn_blocking(move || {
-            let cid = Some(pod2);
-            ports2.iter().map(|p| {
-                let cid = cid.as_ref()?;
-                // Linux: container IP is host-routable.
-                if cfg!(target_os = "linux") {
-                    if let Ok(ip) = crate::docker::container_ip(cid) {
-                        return Some(format!("{ip}:{p}"));
-                    }
-                }
-                // Fallback (macOS): published ephemeral host port.
-                crate::docker::container_host_port(cid, *p).map(|hp| format!("127.0.0.1:{hp}"))
-            }).collect()
+        let endpoint_lease=backend_lease.hold();
+        let (resolve_world,resolve_permit)=(world.clone(),permit.clone());
+        let endpoints: Vec<Option<crate::pod_forward::Binding>> = tokio::task::spawn_blocking(move || {
+            let _lease=endpoint_lease;
+            ports2.iter().map(|p|crate::pod_forward::snapshot(&resolve_world,&resolve_permit,*p).ok()).collect()
         }).await.unwrap_or_default();
 
         // Send the port-number prefix on data + error channels for each port.
@@ -3860,14 +4488,16 @@ async fn handle_portforward_ws(
                             let _ = w.write_all(&ws_binary_frame((2 * idx + 1) as u8, msg.as_bytes())).await;
                             continue;
                         };
-                        match tokio::net::TcpStream::connect(endpoint).await {
+                        match crate::pod_forward::connect(&world,&permit,ports[idx],endpoint,&backend_lease).await {
                             Ok(tcp) => {
                                 let (mut rd, wr) = tcp.into_split();
                                 *guard = Some(wr);
                                 // Pump backend → data channel.
                                 let ws_back = std::sync::Arc::clone(&ws_wr);
                                 let ch_data = (2 * idx) as u8;
-                                tokio::spawn(async move {
+                                let pump_lease=backend_lease.hold();
+                                tasks.0.push(tokio::spawn(async move {
+                                    let _lease=pump_lease;
                                     use tokio::io::AsyncReadExt;
                                     let mut buf = [0u8; 8192];
                                     loop {
@@ -3880,13 +4510,13 @@ async fn handle_portforward_ws(
                                             Err(_) => break,
                                         }
                                     }
-                                });
+                                }));
                             }
                             Err(e) => {
                                 let mut w = ws_wr.lock().await;
-                                let msg = format!("connect {}: {e}", endpoints[idx].as_deref().unwrap_or("?"));
+                                let msg = format!("Pod forwarding stopped: {e}");
                                 let _ = w.write_all(&ws_binary_frame((2 * idx + 1) as u8, msg.as_bytes())).await;
-                                continue;
+                                return; // drop every owned pump/socket on stale authority
                             }
                         }
                     }
@@ -3898,6 +4528,8 @@ async fn handle_portforward_ws(
                 _ => {}
             }
         }
+        };
+        run_pod_session(world,permit,cancellation,lease,future).await;
     });
 
     response
@@ -3909,11 +4541,15 @@ async fn handle_portforward_ws(
 /// Fail policy), return the denial JSON; None means admitted.
 async fn admission_gate(world: &Arc<RwLock<DesiredWorld>>, body: &[u8]) -> Option<String> {
     // Snapshot the webhook set (cheap clone) so we don't hold the lock across await.
-    let hooks: Vec<crate::reconcile::AdmissionWebhook> = {
-        let w = world.read().unwrap();
-        if w.admission_webhooks.is_empty() { return None; }
+    let hook_world = world.clone();
+    let hooks: Vec<crate::reconcile::AdmissionWebhook> = match tokio::task::spawn_blocking(move || {
+        let w = hook_world.read().unwrap_or_else(|e| e.into_inner());
         w.admission_webhooks.values().cloned().collect()
+    }).await {
+        Ok(hooks) => hooks,
+        Err(_) => return Some("admission state unavailable".into()),
     };
+    if hooks.is_empty() { return None; }
     let body_str = String::from_utf8_lossy(body);
     let resources = if body_str.trim_start().starts_with('{') {
         serde_json::from_str::<serde_json::Value>(&body_str).ok()
@@ -4003,6 +4639,46 @@ mod namespaced_get_tests {
     use super::*;
     use crate::reconcile::{StoredConfigMap, StoredSecret};
 
+    #[test]
+    fn watch_is_pinned_to_namespace_incarnation_even_if_authority_still_allows() {
+        let mut w=DesiredWorld::new();
+        let r:spec::Resource=serde_json::from_value(serde_json::json!({"kind":"Namespace","metadata":{"name":"a"}})).unwrap();
+        w.apply(&r).unwrap();
+        let permit=WatchPermit{
+            identity:crate::auth::Identity{user:"admin".into(),groups:vec![crate::auth::MASTERS_GROUP.into()]},
+            attrs:crate::auth::Attrs{verb:"watch".into(),resource:"persistentvolumeclaims".into(),
+                subresource:None,namespace:Some("a".into()),name:None},
+            namespace_uid:Some(w.storage_identities.namespaces["a"].clone()),
+        };
+        let shared=Arc::new(RwLock::new(w));
+        assert!(authorized_watch_snapshot("persistentvolumeclaims",&shared,&permit).is_some());
+        {let mut w=shared.write().unwrap();w.delete_resource("namespace","","a").unwrap();w.apply(&r).unwrap();}
+        assert!(authorized_watch_snapshot("persistentvolumeclaims",&shared,&permit).is_none());
+        let mut refreshed=permit.clone();refreshed.namespace_uid=shared.read().unwrap().storage_identities.namespaces.get("a").cloned();
+        assert!(authorized_watch_snapshot("persistentvolumeclaims",&shared,&refreshed).is_some());
+    }
+
+    #[test]
+    fn storage_json_and_watch_use_persisted_incarnations_not_name_hashes() {
+        let mut w=DesiredWorld::new();
+        for (kind,ns,name) in [("PersistentVolume","","disk"),("PersistentVolumeClaim","a","data")] {
+            let r=serde_json::from_value(serde_json::json!({"kind":kind,"metadata":{"name":name,"namespace":ns,"uid":"untrusted"},"spec":{}})).unwrap();
+            w.apply(&r).unwrap();
+        }
+        let first=pvc_json(&w,&w.pvcs["a/data"]);
+        assert_eq!(first["metadata"]["uid"],w.storage_identities.claims["a/data"].uid.as_str());
+        assert_eq!(first["metadata"]["annotations"]["royak.io/namespace-uid"],w.storage_identities.namespaces["a"].as_str());
+        assert_eq!(pv_json(&w,&w.pvs["disk"])["metadata"]["uid"],w.storage_identities.volumes["disk"].as_str());
+        let shared=Arc::new(RwLock::new(w.clone()));
+        assert_eq!(watch_objects("persistentvolumeclaims",&shared,Some("a"))["a/data"],first);
+        assert!(watch_objects("persistentvolumeclaims",&shared,Some("b")).is_empty());
+        let old_ns=get_namespace(&w,"a").1;
+        w.delete_resource("namespace","","a").unwrap();
+        let r=serde_json::from_value(serde_json::json!({"kind":"Namespace","metadata":{"name":"a"}})).unwrap();w.apply(&r).unwrap();
+        let old:serde_json::Value=serde_json::from_str(&old_ns).unwrap();let new:serde_json::Value=serde_json::from_str(&get_namespace(&w,"a").1).unwrap();
+        assert_ne!(old["metadata"]["uid"],new["metadata"]["uid"]);
+    }
+
     // Regression: single-object GETs looked objects up by bare name after keys
     // became `namespace/name`, so every ConfigMap/Secret GET returned 404.
     #[test]
@@ -4022,5 +4698,24 @@ mod namespaced_get_tests {
         }
         assert_eq!(get_configmap(&w, "page", "c").0, 404);
         assert_eq!(get_secret(&w, "cred", "c").0, 404);
+    }
+}
+
+#[cfg(test)]
+mod host_access_commit_regressions {
+    use super::*;
+    #[test]
+    fn revoked_host_permission_between_preflight_and_commit_is_not_authority() {
+        let mut w=DesiredWorld::new();let caller=crate::auth::Identity{user:"alice".into(),groups:vec![]};
+        let binding=|namespace|crate::reconcile::RbacBinding{name:"grant".into(),namespace,role_kind:"ClusterRole".into(),role_name:"admin".into(),
+            subjects:vec![crate::reconcile::RbacSubject{kind:"User".into(),name:"alice".into(),namespace:None}]};
+        w.rbac_bindings.insert("a/editor".into(),binding(Some("a".into())));
+        w.rbac_bindings.insert("global".into(),binding(None));
+        let mut resources=crate::spec::parse_yaml("kind: Pod\nmetadata: {name: app, namespace: a}\nspec:\n  containers:\n  - {name: main, image: busybox:1.36, volumeMounts: [{name: data, mountPath: /app}]}\n  volumes:\n  - {name: data, hostPath: {path: /srv/app}}\n").unwrap();
+        bind_and_authorize(&w,&caller,"create",Some("a"),None,&mut resources).unwrap();
+        w.rbac_bindings.remove("global");let before=serde_json::to_value(w.to_state()).unwrap();
+        let world=Arc::new(RwLock::new(w));
+        let (code,body)=commit_apply(&world,resources,vec![],&caller,"create",Some("a"),None);
+        assert_eq!(code,403,"{body}");assert_eq!(serde_json::to_value(world.read().unwrap().to_state()).unwrap(),before);
     }
 }

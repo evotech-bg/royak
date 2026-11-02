@@ -311,6 +311,10 @@ fn read_image_config(image_dir: &Path) -> (Vec<String>, Vec<String>) {
 
 #[cfg(target_os = "linux")]
 fn spawn_isolated(rootfs: &Path, cmd: &[String], env: &[String], hostname: &str, log_path: &Path) -> Result<u32, String> {
+    spawn_isolated_in_net(rootfs,cmd,env,hostname,log_path,None)
+}
+#[cfg(target_os = "linux")]
+fn spawn_isolated_in_net(rootfs: &Path, cmd: &[String], env: &[String], _hostname: &str, log_path: &Path, netns:Option<&str>) -> Result<u32, String> {
     // Try unshare (full isolation) first, fall back to chroot, then direct exec
     let log_file = std::fs::File::create(log_path).map_err(|e| format!("log: {e}"))?;
     let log_err = log_file.try_clone().map_err(|e| format!("log clone: {e}"))?;
@@ -320,7 +324,7 @@ fn spawn_isolated(rootfs: &Path, cmd: &[String], env: &[String], hostname: &str,
 
     let child = if has_unshare && nix_is_root() {
         // Full container isolation: PID + mount + UTS namespaces
-        let mut args = vec!["--pid", "--mount", "--uts", "--fork", "--mount-proc"];
+        let args = vec!["--pid", "--mount", "--uts", "--fork", "--kill-child=KILL", "--mount-proc"];
         let rootfs_str = rootfs.to_str().unwrap_or(".");
         // unshare ... chroot rootfs cmd...
         let mut full_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -328,8 +332,9 @@ fn spawn_isolated(rootfs: &Path, cmd: &[String], env: &[String], hostname: &str,
         full_args.push(rootfs_str.to_string());
         full_args.extend(cmd.iter().cloned());
 
-        std::process::Command::new("unshare")
-            .args(&full_args)
+        let mut command=std::process::Command::new(if netns.is_some(){"ip"}else{"unshare"});
+        if let Some(namespace)=netns{command.args(["netns","exec",namespace,"unshare"]);}
+        command.args(&full_args)
             .envs(env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k, v)))
             .stdout(log_file).stderr(log_err)
             .spawn().map_err(|e| format!("unshare: {e}"))?
@@ -575,6 +580,8 @@ pub struct NeuroPod {
     pub mount_path: String,
     pub pid: Option<u32>,
     pub overlay_mounted: bool,
+    pub owner: Option<crate::neuropod_gc::Owner>,
+    pub network: Option<PodNetwork>,
 }
 
 impl NeuroPod {
@@ -588,7 +595,21 @@ impl NeuroPod {
     ///
     /// 10 pods from same image = 1 rootfs copy + 10 tiny overlay dirs.
     pub fn create(name: &str, image: &str, disk_size_mb: u64, mount_path: &str) -> Result<Self, String> {
+        Self::create_inner(name,image,disk_size_mb,mount_path,None)
+    }
+    pub fn create_owned(name:&str,image:&str,disk_size_mb:u64,mount_path:&str,owner:crate::neuropod_gc::Owner)->Result<Self,String>{
+        if !cfg!(target_os="linux"){return Err("managed NeuroPod requires Linux".into());}
+        Self::create_inner(name,image,disk_size_mb,mount_path,Some(owner))
+    }
+    fn create_inner(name:&str,image:&str,disk_size_mb:u64,mount_path:&str,owner:Option<crate::neuropod_gc::Owner>)->Result<Self,String>{
+        if !crate::neuropod_gc::safe_component(name) || !crate::neuropod_gc::safe_mount_path(mount_path) {return Err("unsafe NeuroPod name or data mount".into());}
         let base = dirs_or_home().join(".royak").join("pods").join(name);
+        std::fs::create_dir_all(base.parent().ok_or("invalid pod base")?).map_err(|e|e.to_string())?;
+        std::fs::create_dir(&base).map_err(|e|format!("pod path already exists or unavailable: {e}"))?;
+        let mut meta=serde_json::json!({"name":name,"image":image,"diskSizeMB":disk_size_mb,"mountPath":mount_path,
+            "created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()});
+        if let Some(ref o)=owner {meta["owner"]=serde_json::to_value(o).map_err(|e|e.to_string())?;}
+        crate::neuropod_gc::write_meta(&base,&meta)?;
         let upper_dir = base.join("upper");
         let work_dir = base.join("work");
         let merged = base.join("merged");
@@ -634,6 +655,8 @@ impl NeuroPod {
         #[cfg(not(target_os = "linux"))]
         let overlay_mounted = false;
 
+        if owner.is_some() && !overlay_mounted {return Err("managed NeuroPod requires a private OverlayFS rootfs".into());}
+
         // Effective rootfs: merged (overlay) or shared image (fallback)
         let effective_rootfs = if overlay_mounted {
             merged.clone()
@@ -645,7 +668,9 @@ impl NeuroPod {
         if !data_img.exists() {
             let disk_bytes = disk_size_mb * 1024 * 1024;
             eprintln!("  [neuropod] creating sparse disk: {}MB (thin)", disk_size_mb);
-            let f = std::fs::File::create(&data_img).map_err(|e| format!("create disk: {e}"))?;
+            let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
+            #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
+            let f = options.open(&data_img).map_err(|e| format!("create disk: {e}"))?;
             f.set_len(disk_bytes).map_err(|e| format!("truncate: {e}"))?;
 
             // Format as ext4 on Linux
@@ -659,14 +684,7 @@ impl NeuroPod {
         }
 
         // Save metadata
-        let meta = serde_json::json!({
-            "name": name, "image": image,
-            "diskSizeMB": disk_size_mb,
-            "mountPath": mount_path,
-            "created": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        });
-        std::fs::write(base.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap_or_default()).ok();
+        crate::neuropod_gc::write_meta(&base,&meta)?;
 
         Ok(NeuroPod {
             name: name.to_string(),
@@ -680,11 +698,36 @@ impl NeuroPod {
             mount_path: mount_path.to_string(),
             pid: None,
             overlay_mounted,
+            owner,
+            network:None,
         })
+    }
+
+    pub fn set_network(&mut self,network:PodNetwork)->Result<(),String>{
+        let mut meta=crate::neuropod_gc::read_meta(&self.base_dir)?;
+        meta["network"]=serde_json::to_value(&network).map_err(|e|e.to_string())?;
+        crate::neuropod_gc::write_meta(&self.base_dir,&meta)?;
+        self.network=Some(network);Ok(())
     }
 
     /// Mount the data disk and start the NeuroPod
     pub fn start(&mut self, cmd: Option<&[&str]>, env: &[String]) -> Result<u32, String> {
+        #[cfg(target_os="linux")]
+        if self.owner.is_some() {
+            use std::os::unix::fs::{FileTypeExt,MetadataExt,PermissionsExt};
+            let dev=self.rootfs.join("dev");std::fs::create_dir_all(&dev).map_err(|e|e.to_string())?;
+            if std::fs::symlink_metadata(&dev).map_err(|e|e.to_string())?.file_type().is_symlink(){return Err("symlink device directory refused".into());}
+            for (name,minor) in [("null",3),("zero",5),("random",8),("urandom",9)] {
+                let path=dev.join(name);let device=libc::makedev(1,minor);
+                if let Ok(meta)=std::fs::symlink_metadata(&path) {
+                    if !meta.file_type().is_char_device() || meta.rdev()!=device {return Err("unexpected rootfs device".into());}
+                }else{
+                    let c=std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_|"invalid device path")?;
+                    if unsafe{libc::mknod(c.as_ptr(),libc::S_IFCHR|0o666,device)}!=0{return Err(format!("create private device: {}",std::io::Error::last_os_error()));}
+                    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o666)).map_err(|e|e.to_string())?;
+                }
+            }
+        }
         // Mount data disk via loop device (Linux)
         #[cfg(target_os = "linux")]
         {
@@ -748,8 +791,17 @@ impl NeuroPod {
         setup_pod_dns(&self.rootfs, &self.name, "10.42.0.2", &peers);
 
         let log_path = self.base_dir.join("neuropod.log");
+        #[cfg(target_os="linux")]
+        let pid=spawn_isolated_in_net(&self.rootfs,&run_cmd_vec,&run_env,&self.name,&log_path,self.network.as_ref().map(|n|n.namespace.as_str()))?;
+        #[cfg(not(target_os="linux"))]
         let pid = spawn_isolated(&self.rootfs, &run_cmd_vec, &run_env, &self.name, &log_path)?;
         self.pid = Some(pid);
+        if self.owner.is_some() {
+            let identity=crate::neuropod_gc::process_identity(pid)?;
+            let mut meta=crate::neuropod_gc::read_meta(&self.base_dir)?;
+            meta["process"]=serde_json::to_value(identity).map_err(|e|e.to_string())?;
+            if let Err(error)=crate::neuropod_gc::write_meta(&self.base_dir,&meta){kill_pid(pid);return Err(error);}
+        }
         eprintln!("  [neuropod] {} started (pid={pid})", self.name);
         Ok(pid)
     }
@@ -826,7 +878,7 @@ impl NeuroPod {
                             (used, max)
                         } else { (0, 0) };
                         // Check if running
-                        let running = false; // would need PID tracking
+                        let running = crate::neuropod_gc::process_running(&meta);
                         result.push((name, image, running, used, max));
                     }
                 }
@@ -843,6 +895,7 @@ const BRIDGE_SUBNET: &str = "10.42.0";
 const BRIDGE_IP: &str = "10.42.0.1";
 
 /// Pod network state
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PodNetwork {
     pub pod_name: String,
     pub namespace: String,     // Linux network namespace name
@@ -850,6 +903,16 @@ pub struct PodNetwork {
     pub veth_host: String,     // veth end on host side
     pub veth_pod: String,      // veth end inside pod
     pub exposed_ports: Vec<(u16, u16)>, // (host_port, container_port)
+}
+
+pub fn pod_network_names(name:&str)->(String,String,String){
+    use sha2::{Digest,Sha256};
+    let hash=format!("{:x}",Sha256::digest(name.as_bytes()));
+    (format!("rk-np-{}",&hash[..16]),format!("vh{}",&hash[..11]),format!("vp{}",&hash[..11]))
+}
+
+pub fn next_pod_network_index(used:&std::collections::HashSet<String>)->Option<u32>{
+    (0..=252).find(|index|!used.contains(&format!("{BRIDGE_SUBNET}.{}",index+2)))
 }
 
 /// Ensure the NeuroPod bridge network exists (once per host)
@@ -885,15 +948,19 @@ pub fn ensure_pod_bridge() -> Result<(), String> {
 pub fn create_pod_network(name: &str, pod_index: u32, ports: &[(u16, u16)]) -> Result<PodNetwork, String> {
     ensure_pod_bridge()?;
 
-    let ns_name = format!("rk-{name}");
+    let (ns_name,veth_host,veth_pod)=pod_network_names(name);
     let ip = format!("{BRIDGE_SUBNET}.{}", pod_index + 2); // .2, .3, .4, ...
-    let veth_host = format!("veth-{}", &name[..name.len().min(8)]);
-    let veth_pod = format!("vp-{}", &name[..name.len().min(10)]);
 
     eprintln!("  [neuropod-net] creating network namespace {ns_name} ({ip})");
 
+    if std::path::Path::new("/var/run/netns").join(&ns_name).exists() || std::path::Path::new("/sys/class/net").join(&veth_host).exists() {
+        return Err("pod network name already occupied; refusing adoption".into());
+    }
+
     // Create network namespace
     run_cmd("ip", &["netns", "add", &ns_name])?;
+
+    let result=(|| {
 
     // Create veth pair
     run_cmd("ip", &["link", "add", &veth_host, "type", "veth", "peer", "name", &veth_pod])?;
@@ -927,12 +994,19 @@ pub fn create_pod_network(name: &str, pod_index: u32, ports: &[(u16, u16)]) -> R
 
     Ok(PodNetwork {
         pod_name: name.to_string(),
-        namespace: ns_name,
+        namespace: ns_name.clone(),
         ip,
-        veth_host,
+        veth_host:veth_host.clone(),
         veth_pod,
         exposed_ports: ports.to_vec(),
     })
+    })();
+    if result.is_err(){
+        // Only resources created after the successful exclusive namespace add.
+        let _=run_cmd("ip",&["link","del",&veth_host]);
+        let _=run_cmd("ip",&["netns","del",&ns_name]);
+    }
+    result
 }
 
 #[cfg(not(target_os = "linux"))]

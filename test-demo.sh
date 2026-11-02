@@ -60,7 +60,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:alpine
+        image: nginx:1.28-alpine
         resources:
           limits:
             cpu: "500m"
@@ -93,7 +93,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:latest
+        image: nginx:1.29-alpine
         resources:
           limits:
             cpu: "500m"
@@ -130,7 +130,7 @@ echo "2. Get"
 echo "──────"
 OUT=$($BIN get pods 2>&1)
 check "get pods shows 2 pods" "echo '$OUT' | grep -q '2 pod(s)'"
-check "pods show nginx:alpine" "echo '$OUT' | grep -q 'nginx:alpine'"
+check "pods show nginx:1.28-alpine" "echo '$OUT' | grep -q 'nginx:1.28-alpine'"
 
 OUT=$($BIN get deployments 2>&1)
 check "get deployments shows READY" "echo '$OUT' | grep -q 'READY'"
@@ -176,8 +176,8 @@ check "Rolling update triggered" "echo '$OUT' | grep -q 'rolling update\|rollout
 check "Rolling update completed" "echo '$OUT' | grep -q 'Rolling update complete\|COMPLETE'"
 
 OUT=$($BIN get pods 2>&1)
-check "Pods now on nginx:latest" "echo '$OUT' | grep -q 'nginx:latest'"
-check "No pods on nginx:alpine" "echo '$OUT' | grep -v 'IMAG' | grep -qv 'nginx:alpine'"
+check "Pods now on nginx:1.29-alpine" "echo '$OUT' | grep -q 'nginx:1.29-alpine'"
+check "No pods on nginx:1.28-alpine" "echo '$OUT' | grep -v 'IMAG' | grep -qv 'nginx:1.28-alpine'"
 
 # ═══════════════════════════════════════════
 echo ""
@@ -188,7 +188,7 @@ check "Rollback started" "echo '$OUT' | grep -q 'Rolling back\|rollout'"
 check "Rollback completed" "echo '$OUT' | grep -q 'COMPLETE'"
 
 OUT=$($BIN get pods 2>&1)
-check "Pods back on nginx:alpine" "echo '$OUT' | grep -q 'nginx:alpine'"
+check "Pods back on nginx:1.28-alpine" "echo '$OUT' | grep -q 'nginx:1.28-alpine'"
 
 # ═══════════════════════════════════════════
 echo ""
@@ -983,10 +983,19 @@ spec:
 YAML
 $BIN watch --interval 1 > /tmp/rk-watch4.log 2>&1 &
 WATCH_PID=$!
-sleep 12
+# Pull/create can take longer than the probe period on a loaded isolated host.
+# Wait for an actual threshold/restart, not a fixed wall-clock installation gap.
+for _ in $(seq 1 45); do
+    grep -qi 'Liveness probe failure threshold reached' /tmp/rk-watch4.log && break
+    kill -0 "$WATCH_PID" 2>/dev/null || break
+    sleep 1
+done
 kill -TERM "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
-check "Liveness failure logged" "grep -qi 'probe\\|liveness\\|unhealthy\\|restart' /tmp/rk-watch4.log"
+check "Liveness failure threshold triggers restart" "grep -qi 'Liveness probe failure threshold reached' /tmp/rk-watch4.log"
+if ! grep -qi 'Liveness probe failure threshold reached' /tmp/rk-watch4.log; then
+    tail -n 35 /tmp/rk-watch4.log
+fi
 $BIN delete deployment/sickapp >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════

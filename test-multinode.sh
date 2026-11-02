@@ -52,6 +52,12 @@ C=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ADMIN_TOK
 check "an admin bearer token is not a node identity → 401" "[ '$C' = 401 ]"
 C=$(curl -sk -o /dev/null -w '%{http_code}' -X POST -H 'x-royak-node: ci-n2' -H "x-royak-timestamp: $(date +%s)" -H "x-royak-nonce: n$RANDOM" -H "x-royak-signature: $(rand_hex 32)" -d '{}' "https://127.0.0.1:$P/royak/v1/create-pod")
 check "forged signature → 401" "[ '$C' = 401 ]"
+for V in v2 v3; do
+    C=$(curl -sk -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "https://127.0.0.1:$P/royak/$V/create-pod")
+    check "$V unsigned launch → 401" "[ '$C' = 401 ]"
+    C=$(curl -sk -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{}' "https://127.0.0.1:$P/royak/$V/create-pod")
+    check "$V admin bearer cannot replace signed node identity → 401" "[ '$C' = 401 ]"
+done
 C=$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:$P/api/v1/namespaces")
 check "anonymous API read → 401" "[ '$C' = 401 ]"
 
@@ -135,6 +141,58 @@ if [ -n "$REMOTE" ]; then
         "echo \"\$RLOGS\" | grep -qx 'hello-from-cfg s3cr3t-value literal-mode'"
     echo "$RLOGS" | grep -qx 'hello-from-cfg s3cr3t-value literal-mode' || echo "    got: $(echo "$RLOGS" | head -c 300)"
 fi
+
+echo ""
+echo "3b. tcpSocket readiness of pods on every node (seen through the leader)"
+PNS=ci-mn-probe
+cat > "$WORK/probe.yaml" <<YAML
+apiVersion: v1
+kind: Namespace
+metadata: {name: $PNS}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tcp, namespace: $PNS}
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: main
+        image: alpine:3.22
+        command: ["sleep", "100000"]
+        readinessProbe:
+          tcpSocket: {port: 7000}
+          periodSeconds: 1
+YAML
+check "apply a tcpSocket-probed deployment" "api $L POST /apis/apps/v1/namespaces/$PNS/deployments $WORK/probe.yaml | code_of | grep -Eq '20[01]'"
+end=$((SECONDS+90))
+while [ $SECONDS -lt $end ] && [ "$(running_in $PNS | wc -l)" -lt 3 ]; do sleep 1; done
+# api_ready POD — readiness as the leader's API reports it (local or census).
+api_ready() {
+    api "$L" GET "/api/v1/namespaces/$PNS/pods" | python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read().rsplit('\nHTTP',1)[0])
+for p in d['items']:
+    if p['metadata']['name']=='$1': print(str(p['status']['containerStatuses'][0]['ready']).lower())"
+}
+wait_until() { local end=$((SECONDS + $1)); shift; while [ $SECONDS -lt $end ]; do eval "$1" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+PR=$(running_in $PNS | awk -v l="ci-n$L" '$2 != l {print $1; exit}')
+PL=$(running_in $PNS | awk -v l="ci-n$L" '$2 == l {print $1; exit}')
+check "a probed pod runs on a non-leader node" "[ -n '$PR' ]"
+if [ -n "$PR" ]; then
+    sleep 4
+    check "remote pod with the port closed → NotReady" "wait_until 20 '[ \"\$(api_ready $PR)\" = false ]'"
+    docker exec -d "$PR" sh -c 'nc -lk -p 7000 -e echo up'
+    check "remote pod: port opened → Ready through the census" "wait_until 30 '[ \"\$(api_ready $PR)\" = true ]'"
+    [ -n "$PL" ] && check "the leader's own probed pod stays NotReady" "[ \"\$(api_ready $PL)\" = false ]"
+    docker exec "$PR" pkill -f 'nc -lk -p 7000'
+    check "remote pod: port closed again → NotReady" "wait_until 30 '[ \"\$(api_ready $PR)\" = false ]'"
+fi
+C=$(api "$L" DELETE /apis/apps/v1/namespaces/$PNS/deployments/tcp | code_of)
+end=$((SECONDS+60))
+while [ $SECONDS -lt $end ] && [ -n "$(running_in $PNS)" ]; do sleep 0.5; done
+check "probed deployment removed" "[ '$C' = 200 ] && [ -z \"\$(running_in $PNS)\" ]"
 
 echo ""
 echo "4. RBAC through any node"

@@ -4,13 +4,62 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Royak Dashboard</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/dashboard.css">
+<script defer src="/dashboard-topology.js"></script>
 <style>
   @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .pulse { animation: pulse-dot 2s ease-in-out infinite; }
   body { background: #0a0e1a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
   .card { background: #111827; border: 1px solid #1e293b; border-radius: 12px; }
   .glow { box-shadow: 0 0 20px rgba(99, 102, 241, 0.1); }
+  .topology { margin-bottom: 24px; padding: 20px; background: #111827; border: 1px solid #334155; border-radius: 12px; }
+  .topology h2 { font-size: 20px; font-weight: 650; color: #e2e8f0; }
+  .topology p, .topology summary { color: #b6c3d5; font-size: 13px; line-height: 1.6; }
+  .topology label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: #cbd5e1; }
+  .topology input, .topology select, .topology button { font: inherit; color: #e2e8f0; background: #192438; border: 1px solid #475569; border-radius: 6px; padding: 9px 12px; min-height: 42px; }
+  .topology input { min-width: 0; width: 100%; caret-color: #a5b4fc; }
+  .topology input::placeholder { color: #a6b4c8; }
+  .topology button { cursor: pointer; font-size: 13px; }
+  .topology button:hover { background: #26354d; }
+  .topology button:disabled { opacity: .55; cursor: wait; }
+  .topology :focus-visible { outline: 3px solid #a5b4fc; outline-offset: 3px; }
+  .topology button[aria-pressed=true] { border-color: #a5b4fc; background: #293656; }
+  .topology ::selection { background: #4f46e5; color: #fff; }
+  .topology ::-webkit-scrollbar { width: 10px; height: 10px; }
+  .topology ::-webkit-scrollbar-thumb { background: #52627a; border: 2px solid #111827; border-radius: 6px; }
+  .topo-auth, .topo-tools { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .topo-auth label:first-child { flex: 1 1 220px; }
+  .topo-auth label:nth-child(2) { flex: 1 1 160px; }
+  .topo-tools label:first-child { flex: 1 1 180px; }
+  .topo-tools label { flex: 0 1 150px; }
+  .topo-message { padding: 12px 0; color: #cbd5e1; font-size: 13px; }
+  .topo-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 20px; border-top: 1px solid #334155; padding-top: 16px; }
+  .topo-viewport { position: relative; overflow: auto; height: 430px; background: #0d1524; border: 1px solid #334155; border-radius: 8px; }
+  .topo-canvas { position: relative; }
+  .topo-stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  .topo-stage svg { position: absolute; inset: 0; pointer-events: none; }
+  .topo-stage path { fill: none; stroke: #61748f; stroke-width: 1.5; }
+  .topo-stage path.related { stroke: #a5b4fc; stroke-width: 3; }
+  .topo-stage path.muted { opacity: .2; }
+  .topo-column { position: absolute; top: 12px; font-size: 12px; color: #afbed3; }
+  .topology .topo-node { position: absolute; width: 178px; height: 72px; text-align: left; padding: 8px 10px; overflow: hidden; border-color: #52627a; }
+  .topo-node span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #b5c4d9; }
+  .topo-node strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; margin: 2px 0; }
+  .topology .topo-node.related { border-color: #a5b4fc; }
+  .topology .topo-node.selected { background: #2b3b60; border-color: #a5b4fc; box-shadow: 0 3px 12px #0005; }
+  .topo-node .good { color: #6ee7b7; } .topo-node .warn { color: #fcd68a; } .topo-node .bad { color: #fda4af; }
+  .topo-detail { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+  .topo-detail h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  .topo-detail dt { color: #aebdd2; margin-top: 10px; } .topo-detail dd { color: #e2e8f0; }
+  .topo-detail ul { margin-top: 8px; } .topo-detail li { margin-bottom: 8px; }
+  .topology .topo-neighbour { width: 100%; text-align: left; font-size: 12px; }
+  .topo-list { max-height: 430px; overflow: auto; }
+  .topo-list-item { padding: 8px 0; border-bottom: 1px solid #334155; }
+  .topo-list-item p { margin-top: 5px; }
+  .topo-foot { display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; margin-top: 12px; color: #b6c3d5; font-size: 12px; }
+  .topology [hidden] { display: none !important; }
+  @media (max-width: 800px) { .topo-workspace { grid-template-columns: minmax(0, 1fr); } .topo-auth label, .topo-tools label { flex: 1 1 100%; } .topology { padding: 14px; } body { padding: 12px !important; } }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } * { scroll-behavior: auto !important; } }
 </style>
 </head>
 <body class="min-h-screen p-6">
@@ -24,11 +73,45 @@
       <p class="text-slate-500 text-sm mt-1">v0.4-beta — Container Orchestrator</p>
     </div>
     <div class="flex items-center gap-3">
-      <span class="pulse inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
-      <span class="text-slate-400 text-sm" id="status">Connected</span>
+      <span class="text-slate-400 text-sm" id="status">Not connected</span>
       <span class="text-slate-600 text-xs" id="last-update"></span>
     </div>
   </div>
+
+  <section class="topology" aria-labelledby="topology-title">
+    <h2 id="topology-title">Cluster map</h2>
+    <p>Follow routing, ownership and placement. Read-only; declared links are not proof of successful traffic.</p>
+    <form id="topo-auth" class="topo-auth">
+      <label>Bearer token <input id="topo-token" type="password" autocomplete="off" placeholder="Kept in memory only" aria-describedby="topo-auth-note"></label>
+      <label>Namespace <input id="topo-namespace" placeholder="All permitted namespaces" autocomplete="off" spellcheck="false"></label>
+      <button type="submit" id="topo-connect">Connect / apply scope</button>
+      <button type="button" id="topo-disconnect" hidden>Disconnect</button>
+    </form>
+    <p id="topo-auth-note">Use a read-only token. Leave Namespace blank for cluster-wide scope; namespace-limited roles must name their namespace.</p>
+    <p id="topo-session" role="status" aria-live="polite">No applied session. A blank token will reuse the in-memory token only after you connect.</p>
+    <div class="topo-tools">
+      <label>Find a resource <input id="topo-search" type="search" placeholder="Name, namespace or kind"></label>
+      <label>Resource kind <select id="topo-kind"><option value="">All kinds</option></select></label>
+      <label>State <select id="topo-state"><option value="">All states</option><option value="attention">Needs attention</option><option value="Ready">Ready</option><option value="Unknown">Unknown</option></select></label>
+      <button type="button" id="topo-view" aria-pressed="false">List view</button>
+      <button type="button" id="topo-refresh">Refresh</button>
+      <button type="button" id="topo-zoom-out" aria-label="Zoom out">−</button>
+      <button type="button" id="topo-zoom-in" aria-label="Zoom in">+</button>
+      <button type="button" id="topo-reset">Reset view</button>
+      <button type="button" id="topo-fit">Fit map</button>
+    </div>
+    <div id="topo-message" class="topo-message" role="status" aria-live="polite">Connect to load actual cluster resources.</div>
+    <p id="topo-navigation">Map: scroll horizontally or vertically, or focus it and use arrow keys. Use Fit map for an overview and List view for readable relationships.</p>
+    <div class="topo-workspace">
+      <div>
+        <div id="topo-viewport" class="topo-viewport" role="region" aria-label="Cluster relationship map; use List view for textual relationships" aria-describedby="topo-navigation" tabindex="0"><div id="topo-canvas" class="topo-canvas"><div id="topo-stage" class="topo-stage"></div></div></div>
+        <div id="topo-list" class="topo-list" aria-label="Cluster resources and relationships" hidden></div>
+      </div>
+      <aside id="topo-detail" class="topo-detail" aria-label="Selected resource"><h3>Inspect a resource</h3><p>Select a node or use the list to see its evidence and neighbours.</p></aside>
+    </div>
+    <div class="topo-foot"><span id="topo-count">No data loaded</span><span id="topo-time">Not observed</span></div>
+    <details id="topo-warnings"><summary>Evidence and permission limits</summary><ul id="topo-warning-list"></ul></details>
+  </section>
 
   <!-- Stats Row -->
   <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
@@ -45,7 +128,7 @@
       <div class="text-2xl font-bold text-purple-400 mt-1" id="stat-services">-</div>
     </div>
     <div class="card p-4">
-      <div class="text-slate-500 text-xs uppercase tracking-wide">Namespaces</div>
+      <div class="text-slate-500 text-xs uppercase tracking-wide">Namespaces (cluster)</div>
       <div class="text-2xl font-bold text-amber-400 mt-1" id="stat-ns">-</div>
     </div>
     <div class="card p-4">
@@ -95,7 +178,7 @@
     <div class="card p-5">
       <h2 class="text-lg font-semibold text-slate-300 mb-4">Neural Brain</h2>
       <div class="space-y-3" id="brain-info">
-        <div class="flex justify-between"><span class="text-slate-500">Status</span><span class="text-emerald-400">Active</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Status</span><span id="brain-status">Unknown</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Train Steps</span><span id="brain-steps">-</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Loss</span><span id="brain-loss">-</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Anomalies</span><span id="brain-anomalies">-</span></div>
@@ -111,17 +194,23 @@
 
   <!-- Footer -->
   <div class="mt-8 text-center text-slate-700 text-xs">
-    Royak v0.4-beta &mdash; 16K lines of Rust, 5.2 MB binary, zero etcd &mdash; by Ivo Gergov & Velko
+    Royak &mdash; read-only cluster diagnostics &mdash; by Ivo Gergov & Velko
   </div>
 </div>
 
 <script>
 const API = window.location.origin;
+function escapeHTML(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 async function fetchJSON(path) {
   try {
-    const r = await fetch(API + path);
-    return await r.json();
+    const session = window.RoyakSession;
+    if (!session?.active()) return null;
+    const epoch = session.epoch();
+    const r = await fetch(API + session.path(path), {headers: session.headers(), signal: AbortSignal.timeout(8000), credentials: 'omit'});
+    if (!r.ok || epoch !== session.epoch()) return null;
+    const data = await r.json();
+    return epoch === session.epoch() ? data : null;
   } catch(e) { return null; }
 }
 
@@ -129,31 +218,38 @@ function statusBadge(phase) {
   const colors = { Running: 'bg-emerald-500/20 text-emerald-400', Pending: 'bg-amber-500/20 text-amber-400',
     Failed: 'bg-red-500/20 text-red-400', Succeeded: 'bg-blue-500/20 text-blue-400' };
   const c = colors[phase] || 'bg-slate-500/20 text-slate-400';
-  return `<span class="px-2 py-0.5 rounded-full text-xs ${c}">${phase}</span>`;
+  return `<span class="px-2 py-0.5 rounded-full text-xs ${c}">${escapeHTML(phase)}</span>`;
 }
 
 async function refresh() {
+  const session = window.RoyakSession;
+  if (!session?.active()) return;
+  const startingEpoch = session.epoch();
+  const current = () => session.active() && session.epoch() === startingEpoch;
   // Pods
   const pods = await fetchJSON('/api/v1/pods');
+  if (!current()) return;
   const tb = document.getElementById('pods-table');
   const pe = document.getElementById('pods-empty');
   if (pods && pods.items && pods.items.length > 0) {
     tb.innerHTML = pods.items.map(p => `<tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
-      <td class="py-2 px-2 font-mono text-xs">${p.metadata.name}</td>
-      <td class="py-2 text-slate-400 text-xs">${p.spec.containers[0]?.image || '?'}</td>
+      <td class="py-2 px-2 font-mono text-xs">${escapeHTML(p.metadata.name)}</td>
+      <td class="py-2 text-slate-400 text-xs">${escapeHTML(p.spec.containers[0]?.image || '?')}</td>
       <td class="py-2">${statusBadge(p.status.phase)}</td>
-      <td class="py-2 px-2 text-right text-slate-500 text-xs">${p.metadata.namespace}</td>
+      <td class="py-2 px-2 text-right text-slate-500 text-xs">${escapeHTML(p.metadata.namespace)}</td>
     </tr>`).join('');
     pe.classList.add('hidden');
     document.getElementById('stat-pods').textContent = pods.items.length;
   } else {
     tb.innerHTML = '';
     pe.classList.remove('hidden');
-    document.getElementById('stat-pods').textContent = '0';
+    pe.textContent = pods?.items ? 'No pods running' : 'Pod data unavailable for this scope';
+    document.getElementById('stat-pods').textContent = pods?.items ? '0' : '—';
   }
 
   // Deployments
   const deps = await fetchJSON('/apis/apps/v1/deployments');
+  if (!current()) return;
   const dg = document.getElementById('deploys-grid');
   const de = document.getElementById('deploys-empty');
   if (deps && deps.items && deps.items.length > 0) {
@@ -164,12 +260,12 @@ async function refresh() {
       const barColor = pct === 100 ? 'bg-emerald-500' : pct > 50 ? 'bg-amber-500' : 'bg-red-500';
       return `<div class="bg-slate-800/50 rounded-lg p-3">
         <div class="flex justify-between items-center mb-2">
-          <span class="font-mono text-sm">${d.metadata.name}</span>
-          <span class="text-xs text-slate-500">${d.metadata.namespace}</span>
+          <span class="font-mono text-sm">${escapeHTML(d.metadata.name)}</span>
+          <span class="text-xs text-slate-500">${escapeHTML(d.metadata.namespace)}</span>
         </div>
         <div class="flex justify-between text-xs text-slate-400 mb-1">
           <span>${ready}/${desired} ready</span>
-          <span>${d.spec.template.spec.containers[0]?.image || '?'}</span>
+          <span>${escapeHTML(d.spec.template.spec.containers[0]?.image || '?')}</span>
         </div>
         <div class="w-full bg-slate-700 rounded-full h-1.5">
           <div class="${barColor} h-1.5 rounded-full transition-all" style="width:${pct}%"></div>
@@ -181,11 +277,13 @@ async function refresh() {
   } else {
     dg.innerHTML = '';
     de.classList.remove('hidden');
-    document.getElementById('stat-deploys').textContent = '0';
+    de.textContent = deps?.items ? 'No deployments' : 'Deployment data unavailable for this scope';
+    document.getElementById('stat-deploys').textContent = deps?.items ? '0' : '—';
   }
 
   // Events
   const events = await fetchJSON('/api/v1/events');
+  if (!current()) return;
   const el = document.getElementById('events-list');
   const ee = document.getElementById('events-empty');
   if (events && events.items && events.items.length > 0) {
@@ -195,27 +293,32 @@ async function refresh() {
       return `<div class="flex gap-2 text-xs py-1.5 border-b border-slate-800/50">
         <span class="${color}">${icon}</span>
         <div>
-          <span class="text-slate-300">${e.reason}</span>
-          <span class="text-slate-600 ml-1">${e.involvedObject?.name || ''}</span>
-          <div class="text-slate-500 mt-0.5">${e.message?.substring(0, 80) || ''}</div>
+          <span class="text-slate-300">${escapeHTML(e.reason)}</span>
+          <span class="text-slate-600 ml-1">${escapeHTML(e.involvedObject?.name || '')}</span>
+          <div class="text-slate-500 mt-0.5">${escapeHTML(e.message?.substring(0, 80) || '')}</div>
         </div>
       </div>`;
     }).join('');
     ee.classList.add('hidden');
   } else {
     el.innerHTML = '';
+    ee.textContent = events?.items ? 'No events' : 'Events unavailable in this scope';
     ee.classList.remove('hidden');
   }
 
   // Namespaces + Services
   const ns = await fetchJSON('/api/v1/namespaces');
-  document.getElementById('stat-ns').textContent = ns?.items?.length || '-';
+  if (!current()) return;
+  document.getElementById('stat-ns').textContent = ns?.items?.length ?? '—';
   const svc = await fetchJSON('/api/v1/services');
-  document.getElementById('stat-services').textContent = svc?.items?.length || '0';
+  if (!current()) return;
+  document.getElementById('stat-services').textContent = svc?.items?.length ?? '—';
 
   // Brain
   const brain = await fetchJSON('/royak/v1/brain');
-  if (brain) {
+  if (!current()) return;
+  if (brain?.training && brain?.cluster) {
+    document.getElementById('brain-status').textContent = 'Available';
     document.getElementById('stat-loss').textContent = brain.training?.loss?.toFixed(4) || '-';
     document.getElementById('brain-steps').textContent = brain.training?.steps || '0';
     document.getElementById('brain-loss').textContent = brain.training?.loss?.toFixed(6) || '-';
@@ -224,13 +327,16 @@ async function refresh() {
     document.getElementById('ca-fp').textContent = brain.security?.ca_fingerprint?.substring(0, 16) || '-';
     document.getElementById('net-count').textContent = brain.security?.networks || '-';
     document.getElementById('audit-count').textContent = brain.security?.audit_events || '-';
+  } else {
+    document.getElementById('brain-status').textContent = 'Unavailable in this scope';
+    for (const id of ['stat-loss','stat-certs','brain-steps','brain-loss','brain-anomalies','ca-fp','net-count','audit-count']) document.getElementById(id).textContent = '—';
   }
 
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
 }
 
-refresh();
-setInterval(refresh, 3000);
+window.addEventListener('royak-session', refresh);
+setInterval(() => { if (window.RoyakSession?.active() && !document.hidden) refresh(); }, 5000);
 </script>
 </body>
 </html>

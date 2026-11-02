@@ -193,6 +193,8 @@ pub fn authenticate(authorization: Option<&str>) -> Option<Identity> {
     }
 }
 
+pub fn secure_user_auth() -> bool { matches!(MODE.get(), Some(Mode::Tokens(_))) }
+
 // ─── Request classification ────────────────────────────────────────────────
 
 /// What a request does, in RBAC terms.
@@ -206,7 +208,7 @@ pub struct Attrs {
 }
 
 impl Attrs {
-    fn new(verb: &str, resource: &str, sub: Option<&str>, ns: Option<&str>, name: Option<&str>) -> Attrs {
+    pub(crate) fn new(verb: &str, resource: &str, sub: Option<&str>, ns: Option<&str>, name: Option<&str>) -> Attrs {
         Attrs {
             verb: verb.into(),
             resource: resource.into(),
@@ -266,6 +268,15 @@ pub fn parse_k8s_path(path: &str) -> Option<(Option<&str>, &str, Option<&str>, O
     }
 }
 
+/// Cluster-scoped collections cannot be smuggled through a namespaced URL.
+/// Otherwise a namespace RoleBinding could authorize a global list operation.
+pub fn invalid_resource_scope(path: &str) -> bool {
+    matches!(parse_k8s_path(path), Some((Some(_), resource, _, _)) if matches!(resource,
+        "namespaces" | "nodes" | "persistentvolumes" | "storageclasses" | "clusterroles" |
+        "clusterrolebindings" | "ingressclasses" | "validatingwebhookconfigurations" |
+        "mutatingwebhookconfigurations" | "customresourcedefinitions"))
+}
+
 /// A Function trigger may only live on a path whose authorization IS the
 /// functions/invoke permission. Anything the gate maps to another decision
 /// (a Kubernetes resource, discovery, health, node or Royak endpoints) can
@@ -296,10 +307,13 @@ fn query_get<'a>(query: &'a HashMap<String, String>, k: &str) -> Option<&'a str>
 /// to exactly one decision here; anything unknown requires cluster-admin-level
 /// access to a pseudo-resource (deny by default for non-masters).
 pub fn classify(method: &str, path: &str, query: &HashMap<String, String>, websocket: bool) -> Access {
+    if path.starts_with("/royak/v1/connect/node/") { return Access::Node; }
+    if path.starts_with("/royak/v1/connect/") { return Access::Authenticated; }
     let ns_q = query_get(query, "namespace");
     match (method, path) {
+        ("GET","/royak/v1/pod-access/usage")=>return Access::Rbac(Attrs::new("get","podaccess",None,None,None)),
         ("GET", "/healthz" | "/readyz" | "/livez" | "/version") => return Access::Public,
-        ("GET", "/" | "/dashboard") => return Access::Public,
+        ("GET", "/" | "/dashboard" | "/dashboard.css" | "/dashboard-topology.js") => return Access::Public,
         ("GET", "/demo/state" | "/demo/info") | ("POST", "/demo/scale" | "/demo/kill") if demo_enabled() => return Access::Public,
         _ => {}
     }
@@ -307,8 +321,8 @@ pub fn classify(method: &str, path: &str, query: &HashMap<String, String>, webso
         return Access::Node;
     }
     match (method, path) {
-        ("POST", "/royak/v1/heartbeat") | ("POST", "/royak/v1/create-pod")
-        | ("POST", "/royak/v1/delete-pod") | ("GET", "/royak/v1/pods") => return Access::Node,
+        ("POST", "/royak/v1/heartbeat") | ("POST", "/royak/v1/create-pod") | ("POST", "/royak/v2/create-pod") | ("POST", "/royak/v3/create-pod") | ("POST", "/royak/v4/create-pod") | ("POST", "/royak/v5/create-pod")
+        | ("POST", "/royak/v1/delete-pod") | ("POST", "/royak/v2/pod-logs") | ("GET", "/royak/v1/pods") => return Access::Node,
         ("GET", p) if p.starts_with("/royak/v1/pod-logs/") => return Access::Node,
         ("GET", "/api" | "/apis" | "/api/v1" | "/openapi/v2" | "/openapi/v3") => return Access::Authenticated,
         ("GET", p) if is_group_discovery(p) => return Access::Authenticated,
@@ -318,6 +332,7 @@ pub fn classify(method: &str, path: &str, query: &HashMap<String, String>, webso
     // Royak's own (non-Kubernetes) endpoints
     let rb = |verb: &str, res: &str, sub: Option<&str>, ns: Option<&str>, name: Option<&str>| Access::Rbac(Attrs::new(verb, res, sub, ns, name));
     match (method, path) {
+        ("GET", "/royak/v1/topology") => return rb("list", "pods", None, ns_q, None),
         ("GET", "/demo/state" | "/demo/info") => return rb("get", "deployments", None, ns_q, None),
         ("POST", "/demo/scale" | "/demo/kill") => return rb("update", "deployments", Some("scale"), Some(crate::store::DEFAULT_NS), None),
         ("GET", "/royak/v1/raft/status") => return rb("get", "nodes", None, None, None),
@@ -742,6 +757,17 @@ mod tests {
     }
 
     #[test]
+    fn cluster_resources_cannot_be_addressed_inside_a_namespace() {
+        for path in ["/api/v1/namespaces/a/namespaces", "/api/v1/namespaces/a/nodes/n1",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/a/clusterroles", "/apis/storage.k8s.io/v1/namespaces/a/storageclasses"] {
+            assert!(invalid_resource_scope(path), "{path}");
+        }
+        for path in ["/api/v1/namespaces", "/api/v1/nodes/n1", "/api/v1/namespaces/a/pods", "/apis/apps/v1/namespaces/a/deployments"] {
+            assert!(!invalid_resource_scope(path), "{path}");
+        }
+    }
+
+    #[test]
     fn namespace_status_is_a_namespace_subresource() {
         assert_eq!(parse_k8s_path("/api/v1/namespaces/team/status"), Some((None, "namespaces", Some("team"), Some("status"))));
         assert_eq!(parse_k8s_path("/api/v1/namespaces/team/pods"), Some((Some("team"), "pods", None, None)));
@@ -776,6 +802,8 @@ subjects: [{kind: Group, name: team-a-deployers}]
         assert!(matches!(classify("GET", "/api/v1/namespaces/a/pods", &wq, false), Access::Rbac(a) if a.verb == "watch"));
         assert_eq!(classify("GET", "/healthz", &q(), false), Access::Public);
         assert_eq!(classify("POST", "/royak/v1/create-pod", &q(), false), Access::Node);
+        assert_eq!(classify("POST", "/royak/v2/create-pod", &q(), false), Access::Node);
+        assert_eq!(classify("POST", "/royak/v3/create-pod", &q(), false), Access::Node);
         assert_eq!(classify("POST", "/royak/v1/raft/append-entries", &q(), false), Access::Node);
         assert_eq!(classify("GET", "/api", &q(), false), Access::Authenticated);
         // unknown paths are never public
@@ -783,6 +811,15 @@ subjects: [{kind: Group, name: team-a-deployers}]
         assert!(matches!(classify("POST", "/hooks/x", &q(), false), Access::Rbac(_)));
     }
 
+    #[test]
+    fn native_launch_data_route_requires_exact_node_signed_post_not_a_route_family(){
+        assert_eq!(classify("POST","/royak/v5/create-pod",&q(),false),Access::Node);
+        for(method,path)in[("GET","/royak/v5/create-pod"),("DELETE","/royak/v5/create-pod"),
+            ("POST","/royak/v5/create-pod/extra"),("POST","/royak/v5/other")]{
+            assert_ne!(classify(method,path,&q(),false),Access::Node);
+            assert_ne!(classify(method,path,&q(),false),Access::Public);
+        }
+    }
     #[test]
     fn viewer_reads_only_and_never_secrets() {
         let w = world(BINDINGS);

@@ -413,14 +413,20 @@ async fn handle_conn(
     if let Some(pod) = parse_header(&head, "x-royak-pod") {
         // Only a pod THIS node runs for Royak may be targeted — never an
         // arbitrary container on the host's Docker daemon.
-        if !is_our_local_pod(&world, &local_node, &pod) {
+        let check_world = world.clone();
+        let check_node = local_node.clone();
+        let check_pod = pod.clone();
+        let owned = tokio::task::spawn_blocking(move || is_our_local_pod(&check_world, &check_node, &check_pod))
+            .await.map_err(|e| format!("mesh target validation: {e}"))?;
+        if !owned {
             return reply_status(&mut client, 404, "no such Royak pod on this node").await;
         }
         // The sending ingress resolved the pod's Service targetPort and carried
         // it in X-Royak-Port; dial that, not a hardcoded :80. Absent header (old
         // peer) → 80.
         let port = parse_pod_port(&head);
-        match docker::container_ip(&pod) {
+        match tokio::task::spawn_blocking(move || docker::container_ip(&pod))
+            .await.map_err(|e| format!("mesh target address: {e}"))? {
             Ok(ip) if !ip.is_empty() => {
                 let addr = format!("{ip}:{port}");
                 let mut upstream = TcpStream::connect(&addr).await
@@ -442,20 +448,24 @@ async fn handle_conn(
     // Resolve via Router (snapshot of world + cross-node census, then drop the
     // guard). The census makes a service whose pods live on a peer resolve to
     // Endpoint::Remote instead of always falling back to Local.
-    let endpoint = {
-        let w = world.read().unwrap();
-        Router::with_peers(&w, &local_node, crate::api::peer_pods()).resolve(&service, &namespace)
-    };
+    let route_world = world.clone();
+    let route_service = service.clone();
+    let route_namespace = namespace.clone();
+    let host_port = parse_host_port(&head);
+    // Reconcile holds this synchronous lock while inspecting Docker. Neither
+    // waiting for it nor Unix-socket Docker IO may park the Raft/TCP workers.
+    let (endpoint, pod_port) = tokio::task::spawn_blocking(move || {
+        let w = route_world.read().unwrap_or_else(|e| e.into_inner());
+        (Router::with_peers(&w, &local_node, crate::api::peer_pods()).resolve(&route_service, &route_namespace),
+         service_target_port(&w, &route_service, &route_namespace, host_port))
+    }).await.map_err(|e| format!("mesh route snapshot: {e}"))?;
 
     match endpoint {
         Endpoint::Local { pod_name } => {
             // Host-routed hop (no X-Royak-Port header): resolve the Service's
             // targetPort from the world so we dial the pod's real port, not :80.
-            let pod_port = {
-                let w = world.read().unwrap();
-                service_target_port(&w, &service, &namespace, parse_host_port(&head))
-            };
-            let ip = docker::container_ip(&pod_name)
+            let ip = tokio::task::spawn_blocking(move || docker::container_ip(&pod_name))
+                .await.map_err(|e| format!("mesh local address: {e}"))?
                 .map_err(|_| "no container ip".to_string());
             let upstream_addr = match ip {
                 Ok(ip) => format!("{ip}:{pod_port}"),
@@ -473,10 +483,6 @@ async fn handle_conn(
             // this Host against, so we hand it the answer: inject X-Royak-Pod
             // (which local-to-the-peer pod) + X-Royak-Port (the pod's Service
             // targetPort). The peer's handoff fast-path then dials it directly.
-            let pod_port = {
-                let w = world.read().unwrap();
-                service_target_port(&w, &service, &namespace, parse_host_port(&head))
-            };
             let framed = inject_handoff(&buf[..n], &pod_name, pod_port);
             // Encrypt only when enabled AND we actually hold a cluster secret.
             // No secret → fail SAFE to plaintext with a visible warning, never
@@ -619,38 +625,7 @@ async fn serve_encrypted_peer(
     // container + port to hand off to. A worker node has no service/deployment
     // definitions to re-resolve against, so this is how autonomous Host-routed
     // cross-node traffic (and cross-node ingress) reaches the pod living here.
-    let upstream_addr = if let Some(pod) = parse_header(&plain_head, "x-royak-pod") {
-        if !is_our_local_pod(&world, &local_node, &pod) {
-            return Err(format!("peer: handoff target {pod} is not a Royak pod of this node"));
-        }
-        let port = parse_pod_port(&plain_head);
-        match docker::container_ip(&pod) {
-            Ok(ip) if !ip.is_empty() => format!("{ip}:{port}"),
-            _ => return Err("peer: handoff pod not on this node".into()),
-        }
-    } else {
-        // No handoff header — resolve the Host ourselves (only works when we
-        // hold the service/deployment definitions, e.g. control-plane node).
-        let host = parse_host_header(&plain_head);
-        let (service, namespace) = parse_ns(&host);
-        let (endpoint, pod_port) = {
-            let w = world.read().unwrap();
-            let ep = Router::new(&w, &local_node).resolve(&service, &namespace);
-            // Encrypted Host-routed hop carries no X-Royak-Port; resolve the
-            // Service's targetPort from the world so we dial the pod's real port.
-            let port = service_target_port(&w, &service, &namespace, parse_host_port(&plain_head));
-            (ep, port)
-        };
-        match endpoint {
-            Endpoint::Local { pod_name } => match docker::container_ip(&pod_name) {
-                Ok(ip) => format!("{ip}:{pod_port}"),
-                Err(_) => return Err("peer: no container ip".into()),
-            },
-            // A peer only forwards to us because WE host the pod; anything else
-            // is a routing error — don't double-hop.
-            _ => return Err("peer: service not local".into()),
-        }
-    };
+    let upstream_addr = peer_upstream(world, local_node, plain_head).await?;
 
     let upstream = TcpStream::connect(&upstream_addr).await
         .map_err(|e| format!("connect {upstream_addr}: {e}"))?;
@@ -687,6 +662,45 @@ async fn serve_encrypted_peer(
     Ok(())
 }
 
+async fn peer_upstream(world: Arc<RwLock<DesiredWorld>>, local_node: String, plain_head: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+    let upstream_addr = if let Some(pod) = parse_header(&plain_head, "x-royak-pod") {
+        if !is_our_local_pod(&world, &local_node, &pod) {
+            return Err(format!("peer: handoff target {pod} is not a Royak pod of this node"));
+        }
+        let port = parse_pod_port(&plain_head);
+        match docker::container_ip(&pod) {
+            Ok(ip) if !ip.is_empty() => format!("{ip}:{port}"),
+            _ => return Err("peer: handoff pod not on this node".into()),
+        }
+    } else {
+        // No handoff header — resolve the Host ourselves (only works when we
+        // hold the service/deployment definitions, e.g. control-plane node).
+        let host = parse_host_header(&plain_head);
+        let (service, namespace) = parse_ns(&host);
+        let (endpoint, pod_port) = {
+            let w = world.read().unwrap();
+            let ep = Router::new(&w, &local_node).resolve(&service, &namespace);
+            // Encrypted Host-routed hop carries no X-Royak-Port; resolve the
+            // Service's targetPort from the world so we dial the pod's real port.
+            let port = service_target_port(&w, &service, &namespace, parse_host_port(&plain_head));
+            (ep, port)
+        };
+        match endpoint {
+            Endpoint::Local { pod_name } => match docker::container_ip(&pod_name) {
+                Ok(ip) => format!("{ip}:{pod_port}"),
+                Err(_) => return Err("peer: no container ip".into()),
+            },
+            // A peer only forwards to us because WE host the pod; anything else
+            // is a routing error — don't double-hop.
+            _ => return Err("peer: service not local".into()),
+        }
+    };
+
+    Ok(upstream_addr)
+    }).await.map_err(|e| format!("mesh peer address: {e}"))?
+}
+
 /// Only a pod THIS node runs for this cluster may be a handoff target — never
 /// an arbitrary container on the host's Docker daemon.
 fn is_our_local_pod(world: &Arc<RwLock<DesiredWorld>>, local_node: &str, pod: &str) -> bool {
@@ -701,25 +715,44 @@ fn is_our_local_pod(world: &Arc<RwLock<DesiredWorld>>, local_node: &str, pod: &s
 /// goes out as frames sealed with the cluster key, the reply comes back sealed
 /// and is opened here. Without a cluster secret there is no peer hop at all.
 pub async fn sealed_exchange(peer: &str, request: &[u8], timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    let stream = tokio::time::timeout(timeout, TcpStream::connect(peer)).await
+        .map_err(|_| format!("connect {peer}: timed out"))?
+        .map_err(|e| format!("connect {peer}: {e}"))?;
+    sealed_exchange_connected(stream, peer, request, timeout).await
+}
+
+/// Exchange on the actual socket selected by ingress. A failed connect may try
+/// another backend BEFORE any request bytes are sent. Once this function starts,
+/// a failure is ambiguous and ingress must not replay the request.
+pub(crate) async fn sealed_exchange_connected(
+    mut s: TcpStream, peer: &str, request: &[u8], timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     use crate::mesh_crypto::{MESH_MAGIC, mesh_key, seal_frame, open_frame};
     let secret = crate::auth::cluster_secret().ok_or("cross-node hop needs the cluster secret")?;
     let key = mesh_key(&String::from_utf8_lossy(secret));
     let fut = async {
-        let mut s = TcpStream::connect(peer).await.map_err(|e| format!("connect {peer}: {e}"))?;
         let mut out = MESH_MAGIC.to_vec();
         out.extend_from_slice(&seal_frame(&key, request, rand_nonce()));
         s.write_all(&out).await.map_err(|e| format!("write {peer}: {e}"))?;
         let mut acc = Vec::new();
         let mut plain = Vec::new();
+        let mut received = 0usize;
         let mut b = [0u8; 16384];
         loop {
             match s.read(&mut b).await {
                 Ok(0) => break,
                 Ok(m) => {
+                    received += m;
+                    if received > 64 * 1024 * 1024 { return Err("sealed upstream response exceeds wire limit".into()); }
                     acc.extend_from_slice(&b[..m]);
                     loop {
                         match open_frame(&key, &acc) {
-                            Ok(Some((pt, used))) => { plain.extend_from_slice(&pt); acc.drain(..used); }
+                            Ok(Some((pt, used))) => {
+                                if plain.len().saturating_add(pt.len()) > crate::api::MAX_PROXY_RESPONSE_BYTES {
+                                    return Err("sealed upstream response exceeds body limit".into());
+                                }
+                                plain.extend_from_slice(&pt); acc.drain(..used);
+                            }
                             Ok(None) => break,
                             Err(e) => return Err(format!("{peer}: bad sealed frame: {e}")),
                         }
@@ -1167,6 +1200,53 @@ mod tests {
         // And the peer can read them straight back out.
         assert_eq!(parse_header(&s, "x-royak-pod").as_deref(), Some("rk-web-1"));
         assert_eq!(parse_pod_port(&s), 8080);
+    }
+
+    #[tokio::test]
+    async fn host_routing_under_reconcile_contention_keeps_async_timers_live() {
+        let world = Arc::new(RwLock::new(empty_world()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: absent.default\r\n\r\n").await.unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = world.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let routing = tokio::spawn(handle_conn(server, world, "n1".into(), "test".into(), false));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let elapsed = started.elapsed();
+        routing.await.unwrap().unwrap();
+        writer.join().unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        assert!(elapsed < std::time::Duration::from_millis(250), "mesh routing parked the async runtime for {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn sealed_peer_routing_under_contention_keeps_async_timers_live() {
+        let world = Arc::new(RwLock::new(empty_world()));
+        let held = world.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let route = tokio::spawn(peer_upstream(world, "n1".into(), "GET / HTTP/1.1\r\nHost: absent.default\r\n\r\n".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let elapsed = started.elapsed();
+        assert_eq!(route.await.unwrap().unwrap_err(), "peer: service not local");
+        writer.join().unwrap();
+        assert!(elapsed < std::time::Duration::from_millis(250), "sealed peer routing parked the runtime for {elapsed:?}");
     }
 
     #[tokio::test]

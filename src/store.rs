@@ -189,6 +189,9 @@ pub struct DesiredState {
     pub generation: u64,
     pub cluster_id: String,
     pub namespaces: Vec<String>,
+    pub storage_identities: crate::storage_identity::Identities,
+    pub(crate) storage_node_directory: crate::storage_node_directory::Registry,
+    pub backup_registry: crate::backup_engine::Registry,
     pub manifests: BTreeMap<String, serde_json::Value>,
     pub deployments: BTreeMap<String, reconcile::StoredDeployment>,
     pub daemonsets: BTreeMap<String, reconcile::StoredDaemonSet>,
@@ -236,6 +239,9 @@ impl DesiredWorld {
             generation: self.generation,
             cluster_id: self.cluster_id.clone(),
             namespaces: self.namespaces.clone(),
+            storage_identities: self.storage_identities.clone(),
+            storage_node_directory: self.storage_node_directory.clone(),
+            backup_registry: self.backup_registry.clone(),
             manifests: to_b(&self.manifests),
             deployments: to_b(&self.deployments),
             daemonsets: to_b(&self.daemonsets),
@@ -273,6 +279,9 @@ impl DesiredWorld {
         self.generation = s.generation;
         self.cluster_id = s.cluster_id;
         self.namespaces = s.namespaces;
+        self.storage_identities = s.storage_identities;
+        self.storage_node_directory = s.storage_node_directory;
+        self.backup_registry = s.backup_registry;
         if !self.namespaces.iter().any(|n| n == DEFAULT_NS) {
             self.namespaces.insert(0, DEFAULT_NS.to_string());
         }
@@ -304,6 +313,7 @@ impl DesiredWorld {
         self.admission_webhooks = to_h(s.admission_webhooks);
         self.config = s.config;
         self.pending_rollouts = to_h(s.pending_rollouts);
+        crate::connect::state_installed(self);
     }
 
     /// A detached world holding only `s` — the scratch copy a mutation runs on.
@@ -399,6 +409,7 @@ pub fn commit<T>(
     let base = { world.read().unwrap_or_else(|e| e.into_inner()).to_state() };
     let mut scratch = DesiredWorld::from_state(base.clone());
     let out = mutate(&mut scratch).map_err(|(c, m)| CommitError::Rejected(c, m))?;
+    scratch.synchronize_storage_identities().map_err(|e| CommitError::Rejected(409,e))?;
     let mut next = scratch.to_state();
     if next.same_content(&base) {
         return Ok(out); // no-op write: nothing to make durable
@@ -416,6 +427,16 @@ pub fn commit_state(
     base_generation: u64,
     next: DesiredState,
 ) -> Result<(), CommitError> {
+    next.storage_identities.validate(&next).map_err(CommitError::Unavailable)?;
+    next.storage_node_directory.validate_state(&next).map_err(CommitError::Unavailable)?;
+    world.read().unwrap_or_else(|e|e.into_inner()).storage_node_directory
+        .require_unchanged(&next.storage_node_directory).map_err(CommitError::Unavailable)?;
+    next.backup_registry.validate_state(&next).map_err(CommitError::Unavailable)?;
+    crate::host_access::validate_state(&next).map_err(CommitError::Unavailable)?;
+    world.read().unwrap_or_else(|e|e.into_inner()).storage_identities.lifecycle
+        .validate_transition(&next.storage_identities.lifecycle).map_err(CommitError::Unavailable)?;
+    world.read().unwrap_or_else(|e|e.into_inner()).backup_registry
+        .validate_transition(&next.backup_registry).map_err(CommitError::Unavailable)?;
     match durability() {
         Durability::File { path } => {
             if !owns_state() {
@@ -471,7 +492,7 @@ mod tests {
     fn legacy_owner_does_not_confuse_prefix_sharing_names() {
         let c = crate::docker::DockerContainer {
             id: "x".into(), names: vec!["/rk-web-api-1".into()], image: "i".into(),
-            state: "running".into(), status: "".into(), labels: Default::default(),
+            state: "running".into(), status: "".into(), labels: Default::default(), ports: vec![],
         };
         let o = pod_owner(&c, &["web", "web-api"]).unwrap();
         assert_eq!(o.deployment, "web-api");
@@ -485,7 +506,7 @@ mod tests {
         labels.insert(LABEL_NODE.to_string(), "n1".to_string());
         let c = crate::docker::DockerContainer {
             id: "x".into(), names: vec!["/rk-web-1".into()], image: "i".into(),
-            state: "running".into(), status: "".into(), labels,
+            state: "running".into(), status: "".into(), labels, ports: vec![],
         };
         assert!(!container_is_ours(&c, "mine", Some("n1")));
         assert!(!container_is_ours(&c, "mine", None));
@@ -496,13 +517,13 @@ mod tests {
         assert!(container_is_ours(&mine, "mine", None));
         let unlabelled = crate::docker::DockerContainer {
             id: "y".into(), names: vec!["/rk-web-1".into()], image: "i".into(),
-            state: "running".into(), status: "".into(), labels: Default::default(),
+            state: "running".into(), status: "".into(), labels: Default::default(), ports: vec![],
         };
         assert!(!container_is_ours(&unlabelled, "mine", Some("n1")), "explicit clusters never adopt unlabelled pods");
         assert!(container_is_ours(&unlabelled, LEGACY_CLUSTER_ID, None));
         let network_proxy = crate::docker::DockerContainer {
             id: "z".into(), names: vec!["/network-proxy".into()], image: "i".into(),
-            state: "running".into(), status: "".into(), labels: Default::default(),
+            state: "running".into(), status: "".into(), labels: Default::default(), ports: vec![],
         };
         assert!(!container_is_ours(&network_proxy, LEGACY_CLUSTER_ID, None),
             "substring 'rk-' inside another name is not a Royak pod");

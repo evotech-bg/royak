@@ -93,12 +93,11 @@ pub fn local_views(desired: &DesiredWorld, ours: &[&docker::DockerContainer]) ->
         .filter(|d| d.namespace == store::DEFAULT_NS).map(|d| d.name.as_str()).collect();
     let mut views = workload::local_pod_views(ours, &store::node_name(), &default_deps);
     for v in views.iter_mut() {
-        if v.kind != "deployment" || !v.running { continue; }
-        let Some(dep) = desired.deployments.get(&obj_key(&v.namespace, &v.owner)) else { continue };
-        let main = dep.containers.first();
-        let started = main.and_then(|c| c.startup_probe.as_ref()).is_none() || desired.startup_ok.contains(&v.pod);
-        let ready_ok = main.and_then(|c| c.readiness_probe.as_ref()).is_none() || desired.pod_ready.contains(&v.pod);
-        v.ready = started && ready_ok;
+        if !v.running { continue; }
+        let Ok(specs) = pod_health_spec(desired, &v.kind, &v.namespace, &v.owner, &v.pod, ours) else { v.ready = false; continue; };
+        if specs.is_empty() { continue; }
+        let all_running = specs.iter().all(|spec| health_container(ours, &v.namespace, &v.pod, &spec.docker_name).map(|c| c.state == "running").unwrap_or(false));
+        v.ready = all_running && (!specs.iter().any(|c| c.health.configured()) || desired.pod_ready.contains(&v.pod));
     }
     views
 }
@@ -191,6 +190,10 @@ fn choose_node(ctx: &Ctx, ns: &str, owner: &str, existing: &[PodView], host_loca
 
 /// Remove one pod wherever it runs.
 fn remove_view(p: &PodView, ctx: &mut Ctx, ours: &[&docker::DockerContainer], log: &mut Vec<String>) -> bool {
+    if ctx.clustered && !crate::raft_node::is_cluster_scheduler() { return false; }
+    if workload::requires_managed_drain(ours,&p.namespace,&p.pod){
+        log.push(format!("    [storage] {}: exact managed drain required; no removal/placement forget",p.pod));return false;
+    }
     placement::forget(&p.pod);
     if p.pending {
         return false; // in flight; cannot be removed yet
@@ -230,6 +233,7 @@ fn create_pod(
     log: &mut Vec<String>,
     events: &mut Vec<(String, String, String, String, String)>,
 ) -> bool {
+    if ctx.clustered && src.kind != "daemonset" && !crate::raft_node::is_cluster_scheduler() { return false; }
     let host_local = workload::needs_host_local(src.containers, src.init_containers);
     let node = choose_node(ctx, src.namespace, src.owner, existing, host_local);
     let plan = match workload::plan_pod(desired, src, pod, ordinal, &node) {
@@ -246,7 +250,26 @@ fn create_pod(
         pod: pod.to_string(), node: node.clone(), namespace: src.namespace.to_string(),
         kind: src.kind.to_string(), owner: src.owner.to_string(), template: plan.template.clone(),
         image: main_image, running: false, ready: false, pending: true,
+        published: plan.containers.first().map(|c| c.publish.clone()),
     };
+    if workload::managed::has_managed(&plan){
+        if node!=ctx.me{
+            log.push(format!("    [storage] {pod}: native first consumer requires its actual local acknowledged writer; remote dispatch refused"));
+            ctx.taken.remove(pod);return false;
+        }
+        return match crate::storage_driver::native_runtime::mount::consumer::submit_data(&plan){
+            Ok(receipt)=>{
+                log.push(format!("    [storage] {pod}: original managed operation {} {:?}; not a Started/Ready receipt",
+                    receipt.operation.as_str(),receipt.status));
+                ctx.local.push(view); // Pending DATA only; no true healthy count.
+                true
+            }
+            Err(reason)=>{
+                log.push(format!("    [storage] {pod}: {reason}; no managed effect accepted"));
+                ctx.taken.remove(pod);false
+            }
+        };
+    }
     if node == ctx.me {
         match workload::launch_pod(&plan) {
             Ok(()) => {
@@ -272,9 +295,10 @@ fn create_pod(
         ctx.pending.push(placement::Pending { view, dispatched: Instant::now(), acked: None });
         log.push(format!("    [multi-node] {pod} → {node} ({addr})"));
         let (p, n, ns, owner) = (pod.to_string(), node.clone(), src.namespace.to_string(), src.owner.to_string());
+        let create_path = workload::create_path(&plan);
         std::thread::spawn(move || {
             let body = serde_json::json!({ "sealed": sealed }).to_string();
-            match node_post(&addr, "/royak/v1/create-pod", &body, Duration::from_secs(placement::DISPATCH_TIMEOUT.as_secs())) {
+            match node_post(&addr, create_path, &body, Duration::from_secs(placement::DISPATCH_TIMEOUT.as_secs())) {
                 Ok(_) => placement::mark_acked(&p),
                 Err(e) => {
                     placement::forget(&p);
@@ -307,7 +331,8 @@ pub fn remote_delete_pod(addr: &str, ns: &str, pod: &str) -> Result<(), String> 
 
 // ─── The tick ──────────────────────────────────────────────────────────────
 
-pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain) -> Vec<String> {
+pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain,
+    publish_health: &mut dyn FnMut(&DesiredWorld) -> bool) -> Vec<String> {
     let mut log = Vec::new();
     let mut events: Vec<(String, String, String, String, String)> = Vec::new();
     if let Ok(mut q) = deferred_events().lock() { events.append(&mut q); }
@@ -349,6 +374,32 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
         .filter(|d| d.namespace == store::DEFAULT_NS).map(|d| d.name.clone()).collect();
     let default_deps: Vec<&str> = default_deps_owned.iter().map(|s| s.as_str()).collect();
 
+    // Retire the entire owned Pod if any actual container predates the
+    // runtime authority contract. Do not infer approval from a new desired
+    // template. Persistent data is deliberately NOT deleted by this migration.
+    let mut retired = HashSet::new();
+    for c in &ours {
+        if let Some(reason) = crate::pod_access::retirement_reason(desired, c) {
+            if let Some(key) = pod_key(c, &default_deps) {
+                if retired.insert(key.clone()) {
+                    log.push(format!("  [security] retiring {}/{}: {reason}",key.0,key.1));
+                    events.push(("Pod".into(),key.1,"RuntimeContractRequired".into(),reason,"Warning".into()));
+                }
+            }
+        }
+    }
+    for c in &ours {
+        if pod_key(c,&default_deps).is_some_and(|k| retired.contains(&k)) {
+            match docker::retire_container_checked(&c.id) {
+                Ok(()) => {},
+                Err(e) => log.push(format!("  [security] retirement {} not confirmed: {e}",cname(c))),
+            }
+        }
+    }
+    // Exclude quarantined Pods even if Docker did not confirm removal. They
+    // must not become ready endpoints or satisfy scheduling availability.
+    let ours:Vec<_>=ours.into_iter().filter(|c|!pod_key(c,&default_deps).is_some_and(|k|retired.contains(&k))).collect();
+
     // ── 1. Crashed pods (every node, local) ──
     let mut by_pod: HashMap<(String, String), Vec<&docker::DockerContainer>> = HashMap::new();
     for c in &ours {
@@ -361,11 +412,23 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
         });
         let Some((kind, owner)) = owner else { continue };
         if kind == "job" || kind == "cronjob" { continue; } // run-to-completion, handled below
+        if workload::requires_managed_drain(&ours,ns,pod){
+            continue; // Actual consumer actor owns lifecycle; no legacy repair/rollback.
+        }
         if kind == "deployment" && desired.deployments.get(&obj_key(ns, &owner)).map(|d| d.paused).unwrap_or(false) {
             continue; // hibernated pods are stopped on purpose
         }
         let crashed: Vec<&&docker::DockerContainer> = cs.iter().filter(|c| c.state == "exited" || c.state == "dead").collect();
-        if crashed.is_empty() { continue; }
+        // A disappeared sidecar must heal as a whole pod too. Use the pod's
+        // launch snapshot, never the latest desired template during a rollout.
+        // Allow the non-atomic Docker create sequence to finish first.
+        let missing = cs.iter().find(|c| cname(c) == *pod && c.state == "running")
+            .and_then(|main| main.labels.get(crate::probes::LABEL_HEALTH_SPEC).map(|raw| (main, raw)))
+            .and_then(|(main, raw)| crate::probes::decode_spec(raw, pod).ok().map(|specs| (main, specs)))
+            .filter(|(main, _)| docker::container_incarnation(&main.id).map(|(_, age)| age >= Duration::from_secs(10)).unwrap_or(false))
+            .map(|(_, specs)| specs.iter().any(|s| !cs.iter().any(|c| cname(c) == s.docker_name)))
+            .unwrap_or(false);
+        if crashed.is_empty() && !missing { continue; }
         // Crash history is per pod template: a fixed template starts fresh
         // instead of waiting out the crashes of the broken one.
         let tmpl = cs.iter().find_map(|c| c.labels.get(crate::workload::LABEL_TEMPLATE).cloned()).unwrap_or_default();
@@ -373,7 +436,7 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
         record_crash(&wkey);
         let count = desired.restart_count.entry(pod.clone()).or_insert(0);
         *count += 1;
-        let detail = crashed.iter().map(|c| format!("{} {}", cname(c), c.status)).collect::<Vec<_>>().join(", ");
+        let detail = if missing { "regular container missing from launch snapshot".to_string() } else { crashed.iter().map(|c| format!("{} {}", cname(c), c.status)).collect::<Vec<_>>().join(", ") };
         log.push(format!("  [cleanup] {pod}: {detail} — removing pod (restart #{count})"));
         events.push(("Pod".into(), pod.clone(), "BackOff".into(), format!("container exited: {detail}"), "Warning".into()));
         let refs: Vec<&docker::DockerContainer> = cs.to_vec();
@@ -392,6 +455,13 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
             continue; // created for a newer state than this node has seen yet
         }
         let pod = c.labels.get(LABEL_POD).cloned().unwrap_or_else(|| cname(c));
+        if workload::requires_managed_drain(&ours,&ns,&pod){
+            match crate::storage_driver::native_runtime::mount::consumer::terminal::submit_retirement_data(&ns,&pod,&c.id){
+                Ok(receipt)=>log.push(format!("  [storage] {pod}: original retirement DATA {} accepted; physical status {} (no legacy GC)",receipt.terminal.as_str(),receipt.status)),
+                Err(error)=>log.push(format!("  [storage] {pod}: original retirement not accepted: {error}; no legacy GC")),
+            }
+            continue;
+        }
         if gc_done.insert(pod.clone()) {
             log.push(format!("  [gc] {pod}: {kind}/{owner} no longer exists in namespace {ns} — removing"));
         }
@@ -403,7 +473,11 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
     for pod in &gc_done {
         let ns_dirs = std::fs::read_dir(format!("{}/pods", royak_data_dir())).ok();
         if let Some(rd) = ns_dirs {
-            for e in rd.flatten() { let _ = std::fs::remove_dir_all(e.path().join(pod)); }
+            for e in rd.flatten() {
+                let ns=e.file_name().to_string_lossy().into_owned();
+                if workload::requires_managed_drain(&ours,&ns,pod){continue;}
+                let _ = std::fs::remove_dir_all(e.path().join(pod));
+            }
         }
     }
     let ours: Vec<&docker::DockerContainer> = ours.into_iter()
@@ -412,6 +486,15 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
 
     // ── 3. Probes for local deployment pods ──
     run_probes(desired, &ours, &default_deps, &mut log, &mut events);
+
+    // The readiness decision authorizing retirement must be visible BEFORE
+    // slow destructive operations. Otherwise readers can see the old pod gone
+    // while the replacement's successful probe is still hidden in this tick.
+    // Publish runtime health only, under a brief generation-checked lock.
+    if !publish_health(desired) {
+        log.push("  [warn] probe snapshot superseded; scheduling deferred".into());
+        return log;
+    }
 
     let me = store::node_name();
     let clustered = crate::raft_node::is_clustered();
@@ -517,6 +600,36 @@ pub(super) fn reconcile_docker(desired: &mut DesiredWorld, brain: &mut OrinBrain
     log
 }
 
+/// All regular containers of any workload represented by the shared launch contract.
+fn probe_containers<'a>(desired: &'a DesiredWorld, kind: &str, ns: &str, owner: &str) -> Vec<&'a StoredContainer> {
+    let key = obj_key(ns, owner);
+    match kind {
+        "deployment" => desired.deployments.get(&key).map(|d| d.containers.iter().collect()).unwrap_or_default(),
+        "daemonset" => desired.daemonsets.get(&key).map(|d| vec![&d.container]).unwrap_or_default(),
+        "job" => desired.jobs.get(&key).map(|d| vec![&d.container]).unwrap_or_default(),
+        "cronjob" => desired.cronjobs.get(&key).map(|d| vec![&d.container]).unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+fn health_container<'a>(ours: &[&'a docker::DockerContainer], ns: &str, pod: &str, expected: &str) -> Option<&'a docker::DockerContainer> {
+    ours.iter().copied().find(|c| cname(c) == expected
+        && c.labels.get(LABEL_NAMESPACE).map(|s| s.as_str()).unwrap_or(store::DEFAULT_NS) == ns
+        && c.labels.get(LABEL_POD).map(|p| p == pod).unwrap_or(true)
+        && c.labels.get(store::LABEL_ROLE).map(|s| s != "init").unwrap_or(!c.labels.contains_key("royak.init")))
+}
+
+fn pod_health_spec(desired: &DesiredWorld, kind: &str, ns: &str, owner: &str, pod: &str, ours: &[&docker::DockerContainer]) -> Result<Vec<crate::probes::HealthEntry>, String> {
+    if let Some(raw) = health_container(ours, ns, pod, pod).and_then(|c| c.labels.get(crate::probes::LABEL_HEALTH_SPEC)) {
+        return crate::probes::decode_spec(raw, pod);
+    }
+    // Compatibility for pods created before the immutable launch contract.
+    Ok(probe_containers(desired, kind, ns, owner).iter().enumerate().map(|(i, c)| crate::probes::HealthEntry {
+        docker_name: if i == 0 { pod.into() } else { format!("{pod}-{}", c.name) },
+        health: crate::probes::ContainerHealth::from(*c),
+    }).collect())
+}
+
 fn run_probes(
     desired: &mut DesiredWorld,
     ours: &[&docker::DockerContainer],
@@ -524,64 +637,127 @@ fn run_probes(
     log: &mut Vec<String>,
     events: &mut Vec<(String, String, String, String, String)>,
 ) {
-    let mut startup_passed = Vec::new();
-    let mut startup_fail = Vec::new();
-    let mut ready_now: HashSet<String> = HashSet::new();
-    let mut probed: HashSet<String> = HashSet::new();
-    for c in ours.iter().filter(|c| c.state == "running") {
-        let role = c.labels.get(store::LABEL_ROLE).map(|s| s.as_str()).unwrap_or("main");
-        if role != "main" { continue; }
-        let Some(o) = store::pod_owner(c, default_deps) else { continue };
-        let Some(dep) = desired.deployments.get(&obj_key(&o.namespace, &o.deployment)) else { continue };
-        let Some(main) = dep.containers.first() else { continue };
-        let (liveness, readiness, startup) = (main.liveness_probe.as_ref(), main.readiness_probe.as_ref(), main.startup_probe.as_ref());
-        if liveness.is_none() && readiness.is_none() && startup.is_none() { continue; }
-        let pod = o.pod.clone();
-        probed.insert(pod.clone());
+    let views = workload::local_pod_views(ours, &store::node_name(), default_deps);
+    let mut live_containers = HashSet::new();
+    let mut live_pods = HashSet::new();
+    for v in views {
+        live_pods.insert(v.pod.clone());
+        let specs = match pod_health_spec(desired, &v.kind, &v.namespace, &v.owner, &v.pod, ours) {
+            Ok(specs) => specs,
+            Err(e) => { desired.pod_ready.remove(&v.pod); desired.startup_ok.remove(&v.pod); log.push(format!("  [probe] {}: {e}", v.pod)); continue; }
+        };
+        if specs.is_empty() { continue; }
+        let mut ready = true;
+        let mut started = true;
+        for spec in &specs {
+            let Some(c) = health_container(ours, &v.namespace, &v.pod, &spec.docker_name).filter(|c| c.state == "running") else {
+                ready = false; started = false; continue;
+            };
+            if !spec.health.configured() { continue; }
+            live_containers.insert(c.id.clone());
+            let (container_ready, container_started) = run_container_probes(desired, c, &v.pod, &spec.health, log, events);
+            ready &= container_ready;
+            started &= container_started;
+        }
+        if ready { desired.pod_ready.insert(v.pod.clone()); } else { desired.pod_ready.remove(&v.pod); }
+        if started { desired.startup_ok.insert(v.pod.clone()); } else { desired.startup_ok.remove(&v.pod); }
+    }
+    desired.pod_health.retain(|id, _| live_containers.contains(id));
+    desired.pod_ready.retain(|pod| live_pods.contains(pod));
+    desired.startup_ok.retain(|pod| live_pods.contains(pod));
+}
+
+fn run_container_probes(
+    desired: &mut DesiredWorld, c: &docker::DockerContainer, pod: &str, spec: &crate::probes::ContainerHealth,
+    log: &mut Vec<String>, events: &mut Vec<(String, String, String, String, String)>,
+) -> (bool, bool) {
+        let (liveness, readiness, startup) = (spec.liveness.as_ref(), spec.readiness.as_ref(), spec.startup.as_ref());
+        let (incarnation, age, now) = match crate::probes::observe_incarnation(|| docker::container_incarnation(&c.id)) {
+            Ok(value) => value,
+            Err(e) => {
+                desired.pod_health.remove(&c.id);
+                log.push(format!("  [probe] {pod}: cannot establish container incarnation: {e}"));
+                return (false, false);
+            }
+        };
+        let health = desired.pod_health.entry(c.id.clone()).or_insert_with(|| crate::probes::PodHealth::new(incarnation.clone(), now, age));
+        if health.incarnation != incarnation {
+            *health = crate::probes::PodHealth::new(incarnation, now, age);
+        }
+        let mut restart = false;
         if let Some(probe) = startup {
-            if !desired.startup_ok.contains(&pod) {
-                if check_probe(short(&c.id), probe) {
-                    startup_passed.push(pod.clone());
-                    log.push(format!("  [startup] {pod}: started ✓"));
-                } else {
-                    let key = format!("startup:{pod}");
-                    let n = desired.restart_count.get(&key).copied().unwrap_or(0) + 1;
-                    startup_fail.push(key);
-                    if n >= probe.failure_threshold {
-                        log.push(format!("  [startup] {pod}: failed {n}x — restarting"));
-                        events.push(("Pod".into(), pod.clone(), "Unhealthy".into(), "Startup probe failed — restarting".into(), "Warning".into()));
-                        docker::stop_container(&c.id).ok();
-                        docker::start_container(&c.id).ok();
+            if health.startup_passed.is_none() {
+                if health.startup.due(now, health.started, probe) {
+                    let Some(passed) = check_probe(&c.id, probe) else {
+                        health.startup.record_unknown(Instant::now());
+                        return (false, false);
+                    };
+                    restart = health.startup.record(Instant::now(), passed, probe);
+                    if passed {
+                        health.startup_passed = Some(Instant::now());
+                        log.push(format!("  [startup] {pod}: started ✓"));
                     }
                 }
-                continue;
+                if restart { restart_after_probe(desired, c, pod, "Startup", log, events); }
+                return (false, false);
             }
         }
+        let origin = health.startup_passed.unwrap_or(health.started);
         if let Some(probe) = liveness {
-            if !check_probe(short(&c.id), probe) {
-                log.push(format!("  [health] {pod}: liveness FAILED — restarting"));
-                events.push(("Pod".into(), pod.clone(), "Unhealthy".into(), "Liveness probe failed — restarting".into(), "Warning".into()));
-                docker::stop_container(&c.id).ok();
-                docker::start_container(&c.id).ok();
-                continue;
+            if health.liveness.due(now, origin, probe) {
+                let Some(passed) = check_probe(&c.id, probe) else {
+                    health.liveness.record_unknown(Instant::now());
+                    return (false, false);
+                };
+                restart = health.liveness.record(Instant::now(), passed, probe);
+            }
+            if restart {
+                restart_after_probe(desired, c, pod, "Liveness", log, events);
+                return (false, false);
             }
         }
-        match readiness {
+        let ready = match readiness {
             Some(probe) => {
-                if check_probe(short(&c.id), probe) { ready_now.insert(pod.clone()); }
-                else { log.push(format!("  [ready] {pod}: NOT ready")); }
+                if health.readiness.due(Instant::now(), origin, probe) {
+                    match check_probe(&c.id, probe) {
+                        Some(passed) => { health.readiness.record(Instant::now(), passed, probe); },
+                        None => health.readiness.record_unknown(Instant::now()),
+                    }
+                }
+                health.readiness.healthy
             }
-            None => { ready_now.insert(pod.clone()); }
+            None => true,
+        };
+        (ready, true)
+}
+
+fn restart_after_probe(
+    desired: &mut DesiredWorld, c: &docker::DockerContainer, pod: &str, kind: &str,
+    log: &mut Vec<String>, events: &mut Vec<(String, String, String, String, String)>,
+) {
+    desired.pod_health.remove(&c.id);
+    desired.pod_ready.remove(pod);
+    desired.startup_ok.remove(pod);
+    desired.restart_count.remove(&format!("startup:{pod}"));
+    log.push(format!("  [health] {pod}: {kind} probe failure threshold reached — restarting"));
+    events.push(("Pod".into(), pod.into(), "Unhealthy".into(), format!("{kind} probe failed — restarting"), "Warning".into()));
+    match docker::stop_container(&c.id) {
+        Ok(()) => {
+            if let Err(e) = docker::start_container(&c.id) { log.push(format!("  [probe] {pod}: restart failed: {e}")); }
         }
+        Err(e) => log.push(format!("  [probe] {pod}: stop failed: {e}")),
     }
-    for p in startup_passed {
-        desired.restart_count.remove(&format!("startup:{p}"));
-        desired.startup_ok.insert(p);
+}
+
+/// Does a pod publish every port the NodePort/LoadBalancer Services need?
+/// Pods that are not running yet, still pending, or whose ports are unknown
+/// are not judged.
+fn publishes_all(p: &PodView, required: &[u16]) -> bool {
+    if required.is_empty() || !p.running || p.pending { return true; }
+    match &p.published {
+        Some(have) => required.iter().all(|r| have.contains(r)),
+        None => true,
     }
-    for k in startup_fail { *desired.restart_count.entry(k).or_insert(0) += 1; }
-    // Readiness is re-evaluated every tick for probed pods.
-    desired.pod_ready.retain(|p| !probed.contains(p));
-    desired.pod_ready.extend(ready_now);
 }
 
 fn schedule_deployment(
@@ -602,7 +778,14 @@ fn schedule_deployment(
     let main_image = dep.containers.first().map(|c| normalize_image(&c.image)).unwrap_or_default();
     let stem = store::pod_stem(ns, name);
     let pods = ctx.pods_of(ns, "deployment", name);
-    let is_current = |p: &PodView| p.template == tmpl || (p.template.is_empty() && normalize_image(&p.image) == main_image);
+    // Docker binds host ports only at container create, so a running pod that
+    // lacks a port a NodePort/LoadBalancer Service now targets is replaced
+    // through the normal (readiness-gated) rollout. Extra ports never are.
+    let required_publish = desired.nodeport_publish_ports(ns, name);
+    let is_current = |p: &PodView| {
+        (p.template == tmpl || (p.template.is_empty() && normalize_image(&p.image) == main_image))
+            && publishes_all(p, &required_publish)
+    };
     let (cur, old): (Vec<PodView>, Vec<PodView>) = pods.iter().cloned().partition(|p| is_current(p));
     let target = dep.replicas as usize;
     let surge = match dep.strategy { Some(DeployStrategy::BlueGreen { .. }) => target.max(1), _ => 1 };
@@ -666,7 +849,7 @@ fn schedule_deployment(
                         .or_else(|| ctx.pending.iter().find(|p| p.view.pod == pod).map(|p| p.view.node.clone()))
                         .unwrap_or_default();
                     all.push(PodView { pod, node, namespace: ns.into(), kind: "deployment".into(), owner: name.into(),
-                        template: tmpl.clone(), image: String::new(), running: false, ready: false, pending: true });
+                        template: tmpl.clone(), image: String::new(), running: false, ready: false, pending: true, published: None });
                 }
             }
         }
@@ -802,11 +985,31 @@ fn run_hpa(desired: &mut DesiredWorld, brain: &mut OrinBrain, ctx: &Ctx, ours: &
     }
 }
 
+fn legacy_restart_requires_native_drain(desired:&DesiredWorld,c:&docker::DockerContainer)->bool{
+    let ns=c.labels.get(LABEL_NAMESPACE).map(String::as_str).unwrap_or(store::DEFAULT_NS);
+    let fallback=cname(c);
+    let pod=c.labels.get(store::LABEL_POD).map(String::as_str).unwrap_or(fallback.as_str());
+    desired.storage_identities.lifecycle.contains_writer_pod(ns,pod)
+        ||crate::docker::managed::registered_target(&c.id)
+        ||[workload::managed::LABEL_WRITER,workload::managed::LABEL_OPERATION,workload::managed::LABEL_NONCE]
+            .iter().any(|key|c.labels.contains_key(*key))
+}
 fn run_pause(desired: &mut DesiredWorld, brain: &OrinBrain, ours: &[&docker::DockerContainer], log: &mut Vec<String>) {
     let keys: Vec<String> = desired.deployments.keys().cloned().collect();
     for key in keys {
         let Some(dep) = desired.deployments.get(&key) else { continue };
         let threshold = match dep.pause_after_idle { Some(t) if t > 0 => t, _ => continue };
+        if desired.storage_identities.lifecycle.contains_writer_workload(&dep.namespace,&dep.name)
+            ||crate::storage::observe_unsupported_runtime_storage(desired,&dep.namespace,&dep.init_containers,&dep.containers)
+                !=crate::storage::UnsupportedRuntimeStorage::ProvenLegacy
+            ||ours.iter().any(|c|c.labels.get(store::LABEL_DEPLOYMENT)==Some(&dep.name)
+                &&c.labels.get(LABEL_NAMESPACE).map(String::as_str).unwrap_or(store::DEFAULT_NS)==dep.namespace
+                &&(crate::docker::managed::registered_target(&c.id)
+                    ||[workload::managed::LABEL_WRITER,workload::managed::LABEL_OPERATION,workload::managed::LABEL_NONCE]
+                        .iter().any(|key|c.labels.contains_key(*key)))) {
+            log.push(format!("  [pause] {key}: native/unresolved pause requires typed drain; no stop/paused success"));
+            continue;
+        }
         if dep.paused {
             log.push(format!("  [pause] {key}: hibernated 💤"));
             continue;
@@ -825,8 +1028,11 @@ fn run_pause(desired: &mut DesiredWorld, brain: &OrinBrain, ours: &[&docker::Doc
         let idle_secs = (ticks - since) * 5;
         if idle_secs >= threshold {
             log.push(format!("  [pause] {key}: idle {idle_secs}s — hibernating"));
-            for c in &pods { docker::stop_container(&c.id).ok(); }
-            d.paused = true;
+            let mut acknowledged=true;
+            for c in &pods {if let Err(error)=docker::stop_container(&c.id){
+                acknowledged=false;log.push(format!("  [pause] {key}: stop not acknowledged: {error}"));
+            }}
+            if acknowledged{d.paused = true;}
         }
     }
 }
@@ -887,9 +1093,17 @@ fn observe_and_guard(desired: &mut DesiredWorld, brain: &mut OrinBrain, ours: &[
         for (guard, action) in rules {
             match action.as_str() {
                 "restart" => if let Some(c) = container {
-                    docker::stop_container(&c.id).ok();
-                    docker::start_container(&c.id).ok();
-                    log.push(format!("    [guard/{guard}] restarted {pod} ✓"));
+                    if legacy_restart_requires_native_drain(desired,c){
+                        log.push(format!("    [guard/{guard}] native restart unsupported for {pod}; no stop/start or success claim"));
+                        continue;
+                    }
+                    match docker::stop_container(&c.id){
+                        Ok(())=>match docker::start_container(&c.id){
+                            Ok(())=>log.push(format!("    [guard/{guard}] restarted {pod} ✓")),
+                            Err(error)=>log.push(format!("    [guard/{guard}] restart not acknowledged for {pod}: {error}")),
+                        },
+                        Err(error)=>log.push(format!("    [guard/{guard}] stop not acknowledged for {pod}; no Start: {error}")),
+                    }
                 },
                 "scale_up" => if let Some(c) = container {
                     if let Some(dep) = c.labels.get(store::LABEL_DEPLOYMENT) {
@@ -905,6 +1119,45 @@ fn observe_and_guard(desired: &mut DesiredWorld, brain: &mut OrinBrain, ours: &[
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod native_pause_restart_denial_regressions{
+    use super::*;
+    #[test]
+    fn actual_pause_entrypoint_refuses_current_native_without_reporting_hibernation(){
+        let (mut world,_,_,_)=crate::storage_lifecycle::model_pod_writer_world();
+        world.deployments.get_mut("a/db").unwrap().pause_after_idle=Some(1);
+        let before=serde_json::to_value(world.to_state()).unwrap();let mut log=vec![];
+        run_pause(&mut world,&OrinBrain::new(1,1),&[],&mut log);
+        assert_eq!(serde_json::to_value(world.to_state()).unwrap(),before);
+        assert!(log.iter().any(|line|line.contains("typed drain")));
+        assert!(!log.iter().any(|line|line.contains("hibernated")||line.contains("hibernating")));
+        // Actual direct caller, with empty DATA census: no host effect even
+        // if this negative guard regresses. Not a physical pause proof.
+    }
+    #[test]
+    fn retained_writer_blocks_pause_and_restart_after_current_pvc_sources_are_erased(){
+        let (mut world,uid,node,boot)=crate::storage_lifecycle::model_pod_writer_world();
+        crate::storage_pod_writer::model_reserve_current_db_writer(&mut world,&uid,&node,&boot).unwrap();
+        let binding=world.storage_identities.lifecycle.get(&uid).unwrap().pod_writer().unwrap().clone();
+        assert_eq!((binding.namespace(),binding.workload()),("a","db"));
+        assert!(binding.check_source_current(&world).is_ok());
+        assert!(world.storage_identities.lifecycle.contains_writer_workload("a","db"));
+        let deployment=world.deployments.get_mut("a/db").unwrap();
+        deployment.pause_after_idle=Some(1);for c in &mut deployment.containers{c.volumes.clear();}
+        let mut log=vec![];run_pause(&mut world,&OrinBrain::new(1,1),&[],&mut log);
+        assert!(log.iter().any(|line|line.contains("typed drain")));
+        let row:docker::DockerContainer=serde_json::from_value(serde_json::json!({
+            "Id":"a".repeat(64),"Names":[format!("/{}",binding.pod())],"Image":"not-executed", "State":"running","Status":"Up",
+            "Labels":{"royak.namespace":"a","royak.pod":binding.pod()}})).unwrap();
+        assert!(legacy_restart_requires_native_drain(&world,&row));
+        let mut legacy=row.clone();legacy.labels.clear();legacy.names=vec!["/ordinary".into()];
+        assert!(!legacy_restart_requires_native_drain(&world,&legacy));
+        legacy.labels.insert(workload::managed::LABEL_NONCE.into(),"retained-DATA".into());
+        assert!(legacy_restart_requires_native_drain(&world,&legacy));
+        // Metadata/denial DATA only; no actual READY/FD/Stop permission.
     }
 }
 
@@ -1320,4 +1573,79 @@ fn run_pipelines(desired: &mut DesiredWorld, ours: &[&docker::DockerContainer], 
     // Clean up completed pipeline runs (keep last 10)
     desired.pipeline_runs.retain(|r| !r.is_complete());
 
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+
+    fn pod(running: bool, pending: bool, published: Option<Vec<u16>>) -> PodView {
+        PodView { pod: "rk-web-1".into(), node: "n1".into(), namespace: "default".into(), kind: "deployment".into(),
+            owner: "web".into(), template: "t".into(), image: "i".into(), running, ready: running, pending, published }
+    }
+
+    #[test]
+    fn running_pods_missing_a_service_port_are_not_current() {
+        assert!(!publishes_all(&pod(true, false, Some(vec![8080])), &[8080, 9090]), "new targetPort 9090 → replace");
+        assert!(publishes_all(&pod(true, false, Some(vec![8080, 9090])), &[9090]), "extra published ports never force a roll");
+        assert!(publishes_all(&pod(true, false, Some(vec![])), &[]));
+    }
+
+    #[test]
+    fn unknown_or_not_yet_running_pods_are_not_judged() {
+        assert!(publishes_all(&pod(true, false, None), &[8080]), "older peers report no ports — never roll on unknown");
+        assert!(publishes_all(&pod(false, false, Some(vec![])), &[8080]));
+        assert!(publishes_all(&pod(true, true, Some(vec![])), &[8080]));
+    }
+}
+
+#[cfg(test)]
+mod container_probe_coverage_tests {
+    use super::*;
+    fn world() -> DesiredWorld {
+        let mut w = DesiredWorld::new();
+        for r in crate::spec::parse_yaml("kind: Deployment\nmetadata: {name: web, namespace: lab}\nspec:\n  template:\n    spec:\n      containers:\n      - {name: main, image: 'alpine:3.22'}\n      - name: agent\n        image: alpine:3.22\n        readinessProbe: {exec: {command: ['true']}}\n").unwrap() { w.apply(&r).unwrap(); }
+        w
+    }
+    fn container(name: &str, role: &str, owner_label: &str) -> docker::DockerContainer {
+        serde_json::from_value(serde_json::json!({"Id":name,"Names":[format!("/{name}")],"Image":"alpine:3.22","State":"running","Status":"Up",
+            "Labels":{"royak.namespace":"lab","royak.pod":"pod", "royak.role":role, owner_label:"web"}})).unwrap()
+    }
+    #[test]
+    fn all_regular_containers_participate_in_readiness() {
+        let mut w = world();
+        let main = container("pod","main",store::LABEL_DEPLOYMENT);
+        let sidecar = container("pod-agent","sidecar",store::LABEL_DEPLOYMENT);
+        assert!(!local_views(&w, &[&main,&sidecar])[0].ready);
+        w.pod_ready.insert("pod".into());
+        assert!(local_views(&w, &[&main,&sidecar])[0].ready);
+        assert!(!local_views(&w, &[&main])[0].ready, "missing sidecar cannot be Ready");
+        let mut stopped = sidecar.clone(); stopped.state = "exited".into();
+        assert!(!local_views(&w, &[&main,&stopped])[0].ready);
+    }
+    #[test]
+    fn daemonset_job_and_cronjob_use_the_same_readiness_gate() {
+        let mut w = world();
+        let c = w.deployments["lab/web"].containers[1].clone();
+        w.daemonsets.insert("lab/web".into(), StoredDaemonSet {name:"web".into(),namespace:"lab".into(),container:c.clone()});
+        w.jobs.insert("lab/web".into(), StoredJob {name:"web".into(),namespace:"lab".into(),container:c.clone(),completions:1,status:JobStatus::Running});
+        w.cronjobs.insert("lab/web".into(), StoredCronJob {name:"web".into(),namespace:"lab".into(),container:c,schedule:"* * * * *".into(),last_run:None});
+        for label in ["royak.daemonset","royak.job","royak.cronjob"] {
+            let main = container("pod","main",label);
+            assert!(!local_views(&w, &[&main])[0].ready, "{label} before probe result");
+            w.pod_ready.insert("pod".into());
+            assert!(local_views(&w, &[&main])[0].ready, "{label} after probe result");
+            w.pod_ready.clear();
+        }
+    }
+    #[test]
+    fn immutable_launch_health_survives_a_different_desired_rollout() {
+        let w = world(); // desired now has a readiness-gated sidecar
+        let mut main = container("pod", "main", store::LABEL_DEPLOYMENT);
+        let original = vec![crate::probes::HealthEntry { docker_name:"pod".into(), health:Default::default() }];
+        main.labels.insert(crate::probes::LABEL_HEALTH_SPEC.into(), serde_json::to_string(&original).unwrap());
+        assert!(local_views(&w, &[&main])[0].ready, "old pod keeps its original one-container health contract");
+        main.labels.insert(crate::probes::LABEL_HEALTH_SPEC.into(), "[]".into());
+        assert!(!local_views(&w, &[&main])[0].ready, "invalid snapshots fail closed, never fall back to desired");
+    }
 }

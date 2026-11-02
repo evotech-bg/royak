@@ -12,9 +12,24 @@
 mod brain;
 mod docker;
 mod spec;
+mod security;
+mod host_access;
+#[cfg(test)]
+mod storage_directory_vm_fixture;
+mod pod_access;
+mod pod_forward;
+mod pod_sessions;
+mod exec_process;
+mod exec_lifecycle;
+mod probes;
+mod topology;
+mod connect;
+mod connect_cli;
 mod reconcile;
 mod api;
+mod tls_identity;
 mod runtime;
+mod neuropod_gc;
 mod neural_state;
 mod net_security;
 mod microvm;
@@ -29,6 +44,16 @@ mod placement;
 mod workload;
 mod auth;
 mod persist;
+mod storage;
+mod storage_identity;
+mod storage_pod_writer;
+mod backup_engine;
+mod storage_lifecycle;
+mod storage_boot;
+mod storage_controller;
+mod storage_node_directory;
+mod storage_remote_protocol;
+mod storage_driver;
 mod node_rpc;
 
 use brain::OrinBrain;
@@ -46,6 +71,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Experimental privileged Linux storage primitives; never grants pod access
+    StorageDriver { #[command(subcommand)] action:storage_driver::Action },
+    /// Private, expiring Service access (laptop client; no Docker needed)
+    Connect { #[command(subcommand)] action: connect_cli::Action },
     /// Apply a resource spec (Deployment, Service, etc.)
     Apply { file: String },
     /// Get resources (get pods, get deployments, get deployment/web -o yaml)
@@ -64,6 +93,15 @@ enum Commands {
     Brain,
     /// Start reconcile loop (watches and fixes cluster state)
     Watch {
+        /// Root-private local storage identity; never inferred from node name/ENV
+        #[arg(long)]
+        storage_node_identity: Option<std::path::PathBuf>,
+        /// Explicit install-once approved directory; no public enrollment endpoint
+        #[arg(long)]
+        storage_directory_enrollment: Option<std::path::PathBuf>,
+        /// Optional root-private cold provisioning runtime; absent means off
+        #[arg(long)]
+        storage_native_runtime: Option<std::path::PathBuf>,
         #[arg(long, default_value = "5")]
         interval: u64,
         /// Enable UDP autodiscovery (nodes find each other automatically)
@@ -139,11 +177,11 @@ enum Commands {
     Ask {
         /// Question in natural language
         question: Vec<String>,
-        /// Ollama host
-        #[arg(long, default_value = "http://10.77.0.1:11434")]
+        /// Local LLM host (oMLX, OpenAI-compatible)
+        #[arg(long, default_value = "http://localhost:11433")]
         ollama: String,
         /// Model
-        #[arg(long, default_value = "qwen2.5:32b")]
+        #[arg(long, default_value = "mlx-community--Qwen2.5-7B-Instruct-4bit")]
         model: String,
     },
     /// Invoke a serverless function
@@ -170,7 +208,7 @@ enum Commands {
     },
     /// Rollback a deployment to its previous image
     Rollback { deployment: String },
-    /// Backup cluster state to file
+    /// Export existing offline desired state (not volume data; never overwrite)
     Backup {
         #[arg(default_value = "royak-backup.json")]
         file: String,
@@ -182,7 +220,7 @@ enum Commands {
     /// Pull an OCI image (test light runtime)
     Pull {
         image: String,
-        #[arg(long, default_value = "docker")]
+        #[arg(long, default_value = "docker", value_parser = ["docker", "neuropod", "light", "cri"])]
         runtime: String,
     },
     /// Start the mesh proxy (cross-node service routing — v0.3 MVP)
@@ -241,9 +279,8 @@ enum PipelineAction {
 
 fn main() {
     env_logger::init();
-    // Two rustls crypto backends end up in the dependency graph (ring, and
-    // aws-lc-rs via tokio-rustls defaults); without an explicit choice the
-    // first TLS handshake panics. Royak uses ring.
+    // Choose the same ring provider used by node RPC and persisted TLS
+    // identities explicitly. The dependency graph includes only that backend.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Optional: redirect output to log file (set ROYAK_LOG=/var/log/royak.log)
@@ -265,6 +302,16 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if let Commands::StorageDriver{action}=&cli.command {
+        if let Err(error)=storage_driver::run(action) {eprintln!("storage-driver: {error}");std::process::exit(2);}
+        return;
+    }
+    if let Commands::Connect { action } = &cli.command {
+        let runtime=tokio::runtime::Runtime::new().expect("Connect runtime");
+        if let Err(e)=runtime.block_on(connect_cli::run(action)) { eprintln!("Connect: {e}"); std::process::exit(2); }
+        return;
+    }
+
     println!("╔══════════════════════════════════════════════════╗");
     println!("║  Royak v0.4-beta — Container Orchestrator        ║");
     println!("║  A swarm of containers. One tiny binary.         ║");
@@ -274,8 +321,9 @@ fn main() {
     // Mesh command uses docker::container_ip to resolve local pods, so it
     // needs the daemon, but we don't make that check blocking here — the
     // proxy will just return 502 if container_ip fails.
-    let skip_docker = matches!(cli.command, Commands::Demo | Commands::Brain)
+    let skip_docker = matches!(cli.command, Commands::Demo | Commands::Brain | Commands::Backup { .. })
         || matches!(&cli.command, Commands::Watch { runtime, .. } if runtime == "neuropod")
+        || matches!(&cli.command, Commands::Pull { runtime, .. } if runtime != "docker")
         || std::env::var("ROYAK_NO_DOCKER").is_ok();
     if !skip_docker {
         if !docker::ping() {
@@ -294,6 +342,8 @@ fn main() {
     STATE_PATH.set(state_path.clone()).ok();
 
     match cli.command {
+        Commands::StorageDriver{..}=>unreachable!("handled before Docker/state initialization"),
+        Commands::Connect { .. } => unreachable!("handled before Docker/state initialization"),
         Commands::Apply { file } => {
             let resources = if file == "-" {
                 // Read from stdin (supports: cat file.yaml | royak apply -f -)
@@ -317,11 +367,19 @@ fn main() {
             let mut world = load_state(&state_path);
             let mut brain = OrinBrain::new(32, 4);
 
+            let mut admission_failed = false;
             for resource in &resources {
                 match world.apply(resource) {
                     Ok(msg) => println!("  ✓ {msg}"),
-                    Err(e) => eprintln!("  ✗ {e}"),
+                    Err(e) => { eprintln!("  ✗ {e}"); admission_failed = true; }
                 }
+            }
+            // A rejected manifest must not look successful to automation, nor
+            // commit the successful prefix of a multi-document input. Admission
+            // only mutates this detached world; no runtime/disk effects yet.
+            if admission_failed {
+                eprintln!("  Apply rejected; no resources from this input were committed");
+                std::process::exit(2);
             }
 
             // Reconcile immediately
@@ -737,6 +795,9 @@ fn main() {
                     failed = true;
                     continue;
                 }
+                if let Err(e)=world.validate_storage_delete(kind,ns,name) {
+                    eprintln!("  ✗ {kind}/{name}: {e}");failed=true;continue;
+                }
                 match world.delete_resource(kind, ns, name) {
                     Some(paths) => { cleanup.extend(paths); println!("  ✓ {kind}/{name} deleted (namespace {ns})"); }
                     None => { eprintln!("  ✗ {kind}/{name} not found in namespace {ns}"); failed = true; }
@@ -823,11 +884,12 @@ fn main() {
             println!("  No CA. No PKI. No X.509. Just matmul + AES-256-GCM.");
         }
 
-        Commands::Watch { interval, discover, tls, runtime, port, ingress_port, node_id, peers, bootstrap } => {
+        Commands::Watch { interval, discover, tls, runtime, port, ingress_port, node_id, peers, bootstrap, storage_node_identity, storage_directory_enrollment, storage_native_runtime } => {
             // Peers serve their API with the same --tls setting; node RPC follows it.
             node_rpc::set_tls(tls);
             docker::set_background_pulls(true);
             let use_neuropod = runtime == "neuropod";
+            security::set_docker_runtime(!use_neuropod);
             if use_neuropod {
                 println!("  ⚡ NeuroPod runtime [EXPERIMENTAL] — no Docker needed");
                 println!("    ⚠ Mega-beta: basic deploy/scale only. For production use --runtime docker");
@@ -848,6 +910,27 @@ fn main() {
             //    listens: no window where the API runs unauthenticated or a
             //    write is acknowledged without a durable commit path.
             let clustered = node_id.is_some();
+            if (storage_directory_enrollment.is_some() || storage_native_runtime.is_some()) && storage_node_identity.is_none()
+                || (storage_node_identity.is_some() || storage_directory_enrollment.is_some() || storage_native_runtime.is_some()) && !clustered {
+                eprintln!("  ✗ storage identity/enrollment requires explicit clustered --node-id and --storage-node-identity");
+                std::process::exit(2);
+            }
+            if let Some(path)=storage_node_identity.as_ref() {
+                if let Err(error)=storage_driver::node_identity::configure(path,node_id.unwrap()) {
+                    eprintln!("  ✗ storage local identity: {error}");std::process::exit(2);
+                }
+            }
+            let storage_enrollment=match storage_directory_enrollment.as_ref()
+                .map(|path|storage_driver::node_identity::approve_enrollment(path)).transpose() {
+                Ok(approval)=>approval,
+                Err(error)=>{eprintln!("  ✗ storage directory approval: {error}");std::process::exit(2);}
+            };
+            if storage_native_runtime.is_some(){docker::managed::requested_native_runtime();}
+            let native_runtime_configuration=match storage_native_runtime.as_ref()
+                .map(|path|storage_driver::native_runtime::configure(path,clustered,!use_neuropod,tls)).transpose() {
+                Ok(config)=>config,
+                Err(error)=>{eprintln!("  [storage-native] refused: {error}");std::process::exit(2);}
+            };
             let data_dir = reconcile::royak_data_dir();
             let admin_token = match auth::init_user_auth(&data_dir) {
                 Ok(t) => t,
@@ -863,6 +946,14 @@ fn main() {
             // Single shared world for API + reconcile loop. A corrupt or
             // unsupported state file stops the process (load_state exits).
             let world_arc = Arc::new(RwLock::new(load_state(&state_path)));
+            if use_neuropod && security::world_has_constraints(&world_arc.read().unwrap()) {
+                eprintln!("  ✗ securityContext requires Docker runtime; refusing unconstrained NeuroPod startup");
+                std::process::exit(2);
+            }
+            if use_neuropod && probes::world_has_probes(&world_arc.read().unwrap()) {
+                eprintln!("  ✗ health probes require Docker runtime; refusing silently unprobed NeuroPod startup");
+                std::process::exit(2);
+            }
             let api_port = port.unwrap_or_else(|| world_arc.read().unwrap().config.api_port);
             {
                 let mut w = world_arc.write().unwrap();
@@ -934,6 +1025,23 @@ fn main() {
                 reconcile::spawn_cluster_census(Arc::clone(&world_arc), peer_addrs);
             }
 
+            // Negative-only retained native history selection BEFORE any
+            // API/reconcile exposure; never reconstructs a live mount owner.
+            if let Err(error)=docker::managed::register_actual_store(&world_arc){
+                eprintln!("  [storage] actual legacy-denial source unavailable: {error}");std::process::exit(2);
+            }
+            // Explicit Docker node-agent mode only. Startup does not block on
+            // Docker: one fixed worker owns scan/drain, while all four Create
+            // paths and Pod diagnostics remain fast-gated until it proves ready.
+            // A file-backed standby cannot take diagnostic coordinator ownership.
+            let _diagnostic_recovery = if !use_neuropod && (clustered || store::owns_state()) {
+                let cluster = world_arc.read().unwrap_or_else(|e|e.into_inner()).cluster_id.clone();
+                match docker::start_exec_recovery(cluster, store::node_name()) {
+                    Ok(agent) => Some(agent),
+                    Err(error) => { eprintln!("  [exec-recovery] diagnostics remain closed: {error}"); None }
+                }
+            } else { None };
+
             // Start async API server (after auth + durability are in place)
             let api_world = Arc::clone(&world_arc);
             if tls {
@@ -941,6 +1049,27 @@ fn main() {
             } else {
                 rt.spawn(api::serve(api_port, api_world));
             }
+            // Exactly one explicit metadata enrollment attempt, after the API
+            // serving task is spawned so real Raft peers can reach this node.
+            // No retry/voter fallback; failure/timeout remains UNKNOWN/inactive.
+            if let Some(approval)=storage_enrollment {
+                rt.spawn(async move {
+                    match raft_node::storage_directory_authority::enroll(approval).await {
+                        Ok(())=>eprintln!("  [storage-directory] exact approved directory committed and freshly confirmed"),
+                        Err(error)=>eprintln!("  [storage-directory] UNKNOWN/inactive: {error}; no automatic re-enrollment"),
+                    }
+                });
+            }
+
+            // Dedicated opt-in WG listener/controller, never a public API route.
+            // No option = no runtime/listener/worker construction.
+            let _native_storage_runtime=match native_runtime_configuration {
+                Some(config)=>match rt.block_on(storage_driver::native_runtime::start(config,Arc::clone(&world_arc),interval)) {
+                    Ok(runtime)=>Some(runtime),
+                    Err(error)=>{eprintln!("  [storage-native] UNKNOWN/inactive: {error}");std::process::exit(2);}
+                },
+                None=>None,
+            };
 
             // Start autodiscovery if enabled
             if discover {
@@ -1032,8 +1161,8 @@ fn main() {
             let q = question.join(" ");
 
             // Use config values as defaults, CLI flags override
-            let ollama = if ollama == "http://10.77.0.1:11434" { world.config.llm_host.clone() } else { ollama };
-            let model = if model == "qwen2.5:32b" { world.config.llm_model.clone() } else { model };
+            let ollama = if ollama == "http://localhost:11433" { world.config.llm_host.clone() } else { ollama };
+            let model = if model == "mlx-community--Qwen2.5-7B-Instruct-4bit" { world.config.llm_model.clone() } else { model };
 
             // Gather cluster state for context
             let pods = cli_local_pods(&world).iter()
@@ -1079,31 +1208,33 @@ fn main() {
 
             println!("  🧠 Asking {} ({})...\n", model, ollama);
 
-            // Call Ollama API
+            // Call the local OpenAI-compatible API (oMLX)
             let payload = serde_json::json!({
                 "model": model,
-                "prompt": context,
+                "messages": [{"role": "user", "content": context}],
                 "stream": false,
-                "options": {"temperature": 0.3, "num_predict": 500}
+                "temperature": 0.3,
+                "max_tokens": 500,
+                "chat_template_kwargs": {"enable_thinking": false}
             });
 
             match std::process::Command::new("curl")
-                .args(["-s", "-m", "30", &format!("{ollama}/api/generate"),
+                .args(["-s", "-m", "30", &format!("{ollama}/v1/chat/completions"),
                     "-d", &payload.to_string()])
                 .output()
             {
                 Ok(output) => {
                     let resp = String::from_utf8_lossy(&output.stdout);
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if let Some(response) = v["response"].as_str() {
+                        if let Some(response) = v["choices"][0]["message"]["content"].as_str() {
                             println!("{response}");
-                        } else if let Some(err) = v["error"].as_str() {
-                            eprintln!("  Ollama error: {err}");
+                        } else if let Some(err) = v["error"]["message"].as_str().or(v["error"].as_str()) {
+                            eprintln!("  LLM error: {err}");
                         }
                     } else {
-                        eprintln!("  Cannot reach Ollama at {ollama}");
-                        eprintln!("  Make sure Ollama is running and the model is loaded.");
-                        eprintln!("  Try: royak ask --ollama=http://localhost:11434 --model=llama3.2:3b \"{}\"", q);
+                        eprintln!("  Cannot reach the local LLM at {ollama}");
+                        eprintln!("  Make sure oMLX is running and the model is loaded.");
+                        eprintln!("  Try: royak ask --ollama=http://localhost:11433 --model=mlx-community--Llama-3.2-3B-Instruct-4bit \"{}\"", q);
                     }
                 }
                 Err(e) => eprintln!("  Error: {e}"),
@@ -1197,6 +1328,9 @@ fn main() {
                 Err(e) => { eprintln!("  ✗ [auth] {e}"); std::process::exit(2); }
             };
             let world_arc = Arc::new(RwLock::new(load_state(&state_path)));
+            if let Err(error)=docker::managed::register_actual_store(&world_arc){
+                eprintln!("  [storage] actual legacy-denial source unavailable: {error}");std::process::exit(2);
+            }
             store::set_durability(store::Durability::File { path: state_path.clone() });
             match reconcile::try_take_ownership(&world_arc, &state_path) {
                 Ok(true) => {}
@@ -1208,6 +1342,16 @@ fn main() {
                 w.nodes.clear();
                 reconcile::register_local_node(&mut w, &OrinBrain::new(32, 4), port);
             }
+            // Start the same fixed diagnostic coordinator only after this
+            // branch owns the state and has registered its actual local node.
+            // Ready remains closed until the original recovery worker proves it.
+            let _diagnostic_recovery = {
+                let cluster = world_arc.read().unwrap_or_else(|e|e.into_inner()).cluster_id.clone();
+                match docker::start_exec_recovery(cluster, store::node_name()) {
+                    Ok(agent) => Some(agent),
+                    Err(error) => { eprintln!("  [exec-recovery] diagnostics remain closed: {error}"); None }
+                }
+            };
             match &admin_token {
                 Some(t) => generate_kubeconfig(port, t, false),
                 None => generate_kubeconfig(port, "insecure-dev", false),
@@ -1413,7 +1557,7 @@ fn main() {
                     // Not on this node — in a cluster the pod may live on a
                     // peer. Find its owner and fetch the logs from there.
                     match reconcile::find_pod_node(&world, &full_name).filter(|(_, _, pns)| *pns == ns) {
-                        Some((node, addr, pns)) => match reconcile::fetch_remote_logs(&addr, &pns, &full_name) {
+                        Some((node, addr, pns)) => match reconcile::fetch_remote_logs(&world,&addr, &pns, &full_name) {
                             Ok(logs) => {
                                 let clean: String = logs.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
                                 println!("  ── {pns}/{full_name} (on {node}){stream_label} ──");
@@ -1627,10 +1771,9 @@ fn main() {
         }
 
         Commands::Backup { file } => {
-            // A backup is the complete state in the same v2 format the server
-            // loads (secrets sealed with this node's secret key).
-            let world = load_state(&state_path);
-            match persist::encode(&world.to_state(), &[]).and_then(|b| persist::atomic_write(&file, &b)) {
+            // Offline only: refuses missing state, a live owner or Raft
+            // authority; publishes a private recovery point without clobbering.
+            match persist::backup_offline(&state_path, &file) {
                 Ok(()) => println!("  ✓ cluster state backed up to {file}"),
                 Err(e) => { eprintln!("  ✗ backup failed: {e}"); std::process::exit(3); }
             }
@@ -1648,6 +1791,13 @@ fn main() {
                 Err(e) => { eprintln!("  ✗ {file}: {e}"); std::process::exit(3); }
             };
             let mut world = load_state(&state_path);
+            if !state.storage_identities.lifecycle.is_empty() || !world.storage_identities.lifecycle.is_empty()
+                || state.backup_registry.has_authority() || world.backup_registry.has_authority()
+                || state.storage_node_directory.has_authority() || world.storage_node_directory.has_authority()
+                || host_access::has_authority(&state) || host_access::has_authority(&world.to_state()) {
+                eprintln!("  ✗ legacy restore cannot import or discard managed volume/attachment, backup or host-access authority; explicit recovery is required");
+                std::process::exit(3);
+            }
             let gen = world.generation;
             world.install_state(state);
             world.generation = gen;
@@ -1664,7 +1814,10 @@ fn main() {
             println!("  Pulling {image} via {} runtime...", r.name());
             match r.pull(&image) {
                 Ok(()) => println!("  ✓ {image} pulled successfully"),
-                Err(e) => eprintln!("  ✗ pull failed: {e}"),
+                Err(e) => {
+                    eprintln!("  ✗ pull failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -1852,6 +2005,8 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                             }).collect())
                             .unwrap_or_default();
                         reconcile::StoredContainer {
+                            host_access: None,
+                            security_context: None,
                             name: c["name"].as_str().unwrap_or("").to_string(),
                             image: c["image"].as_str().unwrap_or("").to_string(),
                             command: c["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
@@ -1862,8 +2017,10 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                             liveness_probe: c.get("livenessProbe").and_then(|p| {
                                 if p.is_null() { return None; }
                                 Some(reconcile::StoredProbe {
+                                    timeout_seconds: 3, success_threshold: 1,
                                     http_get: p["httpGet"].as_array().and_then(|a| Some((a[0].as_str()?.to_string(), a[1].as_u64()? as u16))),
                                     exec: p["exec"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                                    tcp_socket: p["tcpSocket"].as_u64().map(|v| v as u16),
                                     initial_delay_seconds: p["initialDelay"].as_u64().unwrap_or(5),
                                     period_seconds: p["period"].as_u64().unwrap_or(10),
                                     failure_threshold: p["failureThreshold"].as_u64().unwrap_or(3) as u32,
@@ -1872,8 +2029,10 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                             readiness_probe: c.get("readinessProbe").and_then(|p| {
                                 if p.is_null() { return None; }
                                 Some(reconcile::StoredProbe {
+                                    timeout_seconds: 3, success_threshold: 1,
                                     http_get: p["httpGet"].as_array().and_then(|a| Some((a[0].as_str()?.to_string(), a[1].as_u64()? as u16))),
                                     exec: p["exec"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                                    tcp_socket: p["tcpSocket"].as_u64().map(|v| v as u16),
                                     initial_delay_seconds: p["initialDelay"].as_u64().unwrap_or(5),
                                     period_seconds: p["period"].as_u64().unwrap_or(10),
                                     failure_threshold: p["failureThreshold"].as_u64().unwrap_or(3) as u32,
@@ -1882,8 +2041,10 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                             startup_probe: c.get("startupProbe").and_then(|p| {
                                 if p.is_null() { return None; }
                                 Some(reconcile::StoredProbe {
+                                    timeout_seconds: 3, success_threshold: 1,
                                     http_get: p["httpGet"].as_array().and_then(|a| Some((a[0].as_str()?.to_string(), a[1].as_u64()? as u16))),
                                     exec: p["exec"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                                    tcp_socket: p["tcpSocket"].as_u64().map(|v| v as u16),
                                     initial_delay_seconds: p["initialDelay"].as_u64().unwrap_or(5),
                                     period_seconds: p["period"].as_u64().unwrap_or(10),
                                     failure_threshold: p["failureThreshold"].as_u64().unwrap_or(3) as u32,
@@ -2007,6 +2168,8 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                         name: item["name"].as_str().unwrap_or("").to_string(),
                         namespace: item["namespace"].as_str().unwrap_or("default").to_string(),
                         container: reconcile::StoredContainer {
+                            host_access: None,
+                            security_context: None,
                             name: item["container"]["name"].as_str().unwrap_or("main").to_string(),
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
@@ -2027,6 +2190,8 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                         completions: item["completions"].as_u64().unwrap_or(1) as u32,
                         status: reconcile::JobStatus::Pending,
                         container: reconcile::StoredContainer {
+                            host_access: None,
+                            security_context: None,
                             name: item["container"]["name"].as_str().unwrap_or("main").to_string(),
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
@@ -2047,6 +2212,8 @@ pub fn load_v1_world(state: &serde_json::Value) -> Result<DesiredWorld, String> 
                         schedule: item["schedule"].as_str().unwrap_or("").to_string(),
                         last_run: item["lastRun"].as_u64(),
                         container: reconcile::StoredContainer {
+                            host_access: None,
+                            security_context: None,
                             name: item["container"]["name"].as_str().unwrap_or("main").to_string(),
                             image: item["container"]["image"].as_str().unwrap_or("").to_string(),
                             command: item["container"]["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
@@ -2427,7 +2594,7 @@ fn load_state(path: &str) -> DesiredWorld {
     match persist::load(path) {
         Ok(l) => {
             if let Some(v) = l.migrated_from {
-                eprintln!("  [migrate] {path}: state schema v{v} → v{} (in memory; written on first save, original kept as {path}.v1.bak)", persist::SCHEMA_VERSION);
+                eprintln!("  [migrate] {path}: state schema v{v} → v{} (in memory; written on first save, backup {path}.v{}.bak)", persist::SCHEMA_VERSION, v.max(1));
             }
             let mut w = DesiredWorld::new();
             w.install_state(l.state);
@@ -2449,6 +2616,10 @@ static CLI_OWNER: std::sync::Mutex<Option<persist::OwnerLock>> = std::sync::Mute
 /// server owns the state file — the server's API is the only writer then.
 /// Exits non-zero on any failure: a CLI change is reported only once durable.
 pub fn save_state(path: &str, world: &mut DesiredWorld) {
+    if let Err(e)=world.synchronize_storage_identities() {
+        eprintln!("  ✗ storage identity invariant: {e}");
+        std::process::exit(3);
+    }
     let mut held = CLI_OWNER.lock().unwrap_or_else(|e| e.into_inner());
     if held.is_none() {
         match persist::try_own(path) {
@@ -2464,12 +2635,15 @@ pub fn save_state(path: &str, world: &mut DesiredWorld) {
     let mut next = world.to_state();
     match on_disk {
         Ok((cur, migrated)) => {
+            if let Err(error)=cur.storage_node_directory.require_unchanged(&next.storage_node_directory) {
+                eprintln!("  ✗ offline save cannot change directory history: {error}");std::process::exit(3);
+            }
             if cur.generation > world.generation {
                 eprintln!("  ✗ {path} changed since it was read (generation {} > {}); not overwriting", cur.generation, world.generation);
                 std::process::exit(3);
             }
-            if migrated.is_some() {
-                if let Err(e) = persist::backup_before_migration(path) { eprintln!("  ✗ {e}"); std::process::exit(3); }
+            if let Some(v) = migrated {
+                if let Err(e) = persist::backup_before_migration(path, v) { eprintln!("  ✗ {e}"); std::process::exit(3); }
             }
             if next.same_content(&cur) && migrated.is_none() { world.generation = cur.generation; return; }
             next.generation = cur.generation + 1;
@@ -2704,4 +2878,26 @@ mod state_tests {
         assert!(persist::try_own(&path).unwrap().is_none());
         cleanup(&path);
     }
+    #[test]
+    fn api_diagnostic_recovery_source_wiring_is_owned_before_reconcile_and_serve() {
+        // SOURCE-WIRING evidence only: no recovery worker, Docker, ownership
+        // acquisition, API server, readiness or runtime liveness is exercised.
+        let source = include_str!("main.rs");
+        let api = source.split_once("\n        Commands::Api { port } => {\n").unwrap().1
+            .split_once("\n        Commands::PortForward { pod, ports } => {\n").unwrap().0;
+        let ownership = api.find("match reconcile::try_take_ownership(&world_arc, &state_path) {").unwrap();
+        let owned = api.find("Ok(true) => {}").unwrap();
+        let registered = api.find("reconcile::register_local_node(").unwrap();
+        let retained = api.find("let _diagnostic_recovery = {").unwrap();
+        let producer = api.find("docker::start_exec_recovery(cluster, store::node_name())").unwrap();
+        let reconcile = api.find("std::thread::spawn(move || {").unwrap();
+        let serve = api.find("rt.block_on(api::serve(port, world_arc));").unwrap();
+        assert!(ownership < owned && owned < registered && registered < retained);
+        assert!(retained < producer && producer < reconcile && reconcile < serve);
+        assert_eq!(api.matches("docker::start_exec_recovery(").count(), 1);
+        assert!(api[retained..reconcile].contains("Ok(agent) => Some(agent)"));
+        assert!(api[retained..reconcile].contains("diagnostics remain closed: {error}"));
+    }
+
 }
+

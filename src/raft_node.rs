@@ -23,7 +23,9 @@ use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use openraft::storage::{Adaptor, LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
+use openraft::storage::{
+    Adaptor, LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot,
+};
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership, Vote,
@@ -66,21 +68,142 @@ pub enum Sealing {
 }
 
 const SEAL_PURPOSE: &[u8] = b"royak-raft-state-v1";
+const SECURITY_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v2-security";
+// Old binaries must fail authentication instead of ignoring storage identities
+// or future attachment authority. Mixed-version live operation is not supported.
+const STORAGE_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v3-storage-identities";
+const HOST_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v4-host-access";
+const BACKUP_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v5-backup-jobs";
+// An older reader must fail authentication instead of interpreting the stricter
+// restore acknowledgement/reservation contract with its previous semantics.
+const RESTORE_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v6-restore-contract";
+const NODE_DIRECTORY_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v7-node-directory";
+// Pre-capture reservations must not be dropped/interpreted by older binaries.
+const PRECAPTURE_SEAL_PURPOSE: &[u8] = b"royak-raft-state-v8-precapture-reservations";
 
 impl Sealing {
     pub fn seal(self, s: &DesiredState) -> Result<String, String> {
+        s.storage_identities.validate(s)?;
+        s.storage_node_directory.validate_state(s)?;
+        s.backup_registry.validate_state(s)?;
+        crate::host_access::validate_state(s)?;
         let json = serde_json::to_vec(s).map_err(|e| e.to_string())?;
         match self {
-            Sealing::Cluster => crate::auth::seal_for_cluster(SEAL_PURPOSE, &json),
+            Sealing::Cluster => crate::auth::seal_for_cluster(PRECAPTURE_SEAL_PURPOSE, &json),
             Sealing::Plain => String::from_utf8(json).map_err(|e| e.to_string()),
         }
     }
     pub fn unseal(self, sealed: &str) -> Result<DesiredState, String> {
-        let bytes = match self {
-            Sealing::Cluster => crate::auth::unseal_for_cluster(SEAL_PURPOSE, sealed)?,
-            Sealing::Plain => sealed.as_bytes().to_vec(),
+        let (bytes, legacy, old_host, old_backup, old_restore, old_directory, old_precapture) = match self {
+            Sealing::Cluster => {
+                let mut found = None;
+                for (purpose, legacy, host, backup, restore, directory, precapture) in [
+                    (PRECAPTURE_SEAL_PURPOSE, false, false, false, false, false, false),
+                    (
+                        NODE_DIRECTORY_SEAL_PURPOSE,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                    ),
+                    (RESTORE_SEAL_PURPOSE, false, false, false, false, true, true),
+                    (BACKUP_SEAL_PURPOSE, false, false, false, true, true, true),
+                    (HOST_SEAL_PURPOSE, false, false, true, true, true, true),
+                    (STORAGE_SEAL_PURPOSE, false, true, true, true, true, true),
+                    (SECURITY_SEAL_PURPOSE, true, true, true, true, true, true),
+                    (SEAL_PURPOSE, true, true, true, true, true, true),
+                ] {
+                    if let Ok(bytes) = crate::auth::unseal_for_cluster(purpose, sealed) {
+                        found = Some((bytes, legacy, host, backup, restore, directory, precapture));
+                        break;
+                    }
+                }
+                found.ok_or("replicated state authentication failed in every supported domain")?
+            }
+            Sealing::Plain => {
+                let value: serde_json::Value =
+                    serde_json::from_str(sealed).map_err(|e| e.to_string())?;
+                (
+                    sealed.as_bytes().to_vec(),
+                    value.get("storage_identities").is_none(),
+                    false,
+                    value.get("backup_registry").is_none(),
+                    false,
+                    value.get("storage_node_directory").is_none(),
+                    value.get("backup_registry").and_then(|r| r.get("version"))
+                        .and_then(|v| v.as_u64()) == Some(1),
+                )
+            }
         };
-        serde_json::from_slice(&bytes).map_err(|e| format!("replicated state: {e}"))
+        if old_restore || !old_backup || old_directory {
+            let raw: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| "malformed replicated state")?;
+            if old_restore {
+                crate::storage_lifecycle::legacy_without_data_authority(&raw)?;
+            }
+            if old_directory {
+                crate::storage_node_directory::legacy_without_node_authority(&raw)?;
+            } else {
+                crate::storage_node_directory::Registry::require_explicit(
+                    raw.get("storage_node_directory")
+                        .ok_or("current replicated state lacks node-directory history")?,
+                )?;
+            }
+            if !old_backup {
+                let registry = raw.get("backup_registry").ok_or(
+                    "backup envelope lacks its required registry; refusing to infer history",
+                )?;
+                if old_precapture {
+                    crate::backup_engine::Registry::require_legacy_precapture_absence(registry)?;
+                } else {
+                    crate::backup_engine::Registry::require_explicit_state_fields(registry)?;
+                }
+                if old_restore {
+                    crate::backup_engine::Registry::reject_pre_contract_restore(registry)?;
+                }
+            }
+        }
+        if old_backup {
+            let raw: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| "malformed legacy replicated backup state")?;
+            if raw.get("backup_registry").is_some_and(|r| r.get("capture_reservations").is_some()) {
+                return Err("legacy backup schema/domain cannot import pre-capture reservation history".into());
+            }
+        }
+        // Existing domain-specific raw guards keep their error contract.
+        // This newer guard still precedes every typed DesiredState decode.
+        crate::storage_pod_writer::reject_unbound_writer_history(
+            &serde_json::from_slice(&bytes).map_err(|_| "malformed replicated PodWriter history")?,
+        )?;
+        let mut state: DesiredState =
+            serde_json::from_slice(&bytes).map_err(|e| format!("replicated state: {e}"))?;
+        if old_directory {
+            state.storage_node_directory = crate::storage_node_directory::Registry::fresh();
+        }
+        state.storage_node_directory.validate_state(&state)?;
+        if old_host && crate::host_access::has_authority(&state) {
+            return Err("legacy Raft envelope cannot import host-access authority".into());
+        }
+        if legacy {
+            crate::storage_identity::Identities::migrate(&mut state)?;
+        } else {
+            state.storage_identities.validate(&state)?;
+        }
+        if old_backup {
+            state.backup_registry.migrate_legacy_empty()?;
+        } else {
+            if old_precapture {
+                state.backup_registry.migrate_v1_precapture_empty()?;
+            }
+            if old_restore {
+                state.backup_registry.validate_pre_contract_no_restore()?;
+            }
+        }
+        state.backup_registry.validate_state(&state)?;
+        crate::host_access::validate_state(&state)?;
+        Ok(state)
     }
 }
 
@@ -107,6 +230,9 @@ pub struct NeuroStore {
     world: Arc<std::sync::RwLock<DesiredWorld>>,
     sm: std::sync::Mutex<SmState>,
     current_snapshot: TokioRwLock<Option<SnapshotFile>>,
+    storage_directory_history: std::sync::Mutex<Option<crate::storage_node_directory::Registry>>,
+    #[cfg(test)]
+    disk_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -136,9 +262,13 @@ fn decode_log(bytes: &[u8]) -> Result<(Vec<Entry<NeuroTypeConfig>>, usize), Stri
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {
-        if bytes.len() - off < 12 { break; }
+        if bytes.len() - off < 12 {
+            break;
+        }
         let len = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        if bytes.len() - off - 12 < len { break; } // torn tail
+        if bytes.len() - off - 12 < len {
+            break;
+        } // torn tail
         let sum = &bytes[off + 4..off + 12];
         let json = &bytes[off + 12..off + 12 + len];
         if checksum(json) != sum {
@@ -157,7 +287,11 @@ impl NeuroStore {
         Arc::new(Self::empty(None, Sealing::Plain, world))
     }
 
-    fn empty(dir: Option<PathBuf>, sealing: Sealing, world: Arc<std::sync::RwLock<DesiredWorld>>) -> Self {
+    fn empty(
+        dir: Option<PathBuf>,
+        sealing: Sealing,
+        world: Arc<std::sync::RwLock<DesiredWorld>>,
+    ) -> Self {
         Self {
             dir,
             sealing,
@@ -166,35 +300,68 @@ impl NeuroStore {
             log: TokioRwLock::new(BTreeMap::new()),
             last_purged: TokioRwLock::new(None),
             world,
-            sm: std::sync::Mutex::new(SmState { last_applied: None, membership: StoredMembership::default() }),
+            sm: std::sync::Mutex::new(SmState {
+                last_applied: None,
+                membership: StoredMembership::default(),
+            }),
             current_snapshot: TokioRwLock::new(None),
+            storage_directory_history: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            disk_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Open (or create) durable storage in `dir` and restore the state machine
     /// from the last snapshot into `world`.
-    pub fn open(dir: PathBuf, sealing: Sealing, world: Arc<std::sync::RwLock<DesiredWorld>>) -> Result<Arc<Self>, String> {
+    pub fn open(
+        dir: PathBuf,
+        sealing: Sealing,
+        world: Arc<std::sync::RwLock<DesiredWorld>>,
+    ) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        crate::storage_driver::node_identity::require_external_history(&dir)?;
         let read_json = |name: &str| -> Result<Option<serde_json::Value>, String> {
             let p = dir.join(name);
             match std::fs::read(&p) {
-                Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!("{}: {e}", p.display())),
+                Ok(b) => serde_json::from_slice(&b)
+                    .map(Some)
+                    .map_err(|e| format!("{}: {e}", p.display())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(format!("{}: {e}", p.display())),
             }
         };
         let store = Self::empty(Some(dir.clone()), sealing, world.clone());
-        let vote: Option<Vote<NeuroNodeId>> = read_json("vote.json")?.map(serde_json::from_value).transpose().map_err(|e| e.to_string())?;
-        let committed: Option<LogId<NeuroNodeId>> = read_json("committed.json")?.and_then(|v| serde_json::from_value(v).ok());
-        let purged: Option<LogId<NeuroNodeId>> = read_json("purged.json")?.and_then(|v| serde_json::from_value(v).ok());
-        let snap: Option<SnapshotFile> = read_json("snapshot.json")?.map(serde_json::from_value).transpose().map_err(|e| format!("snapshot.json: {e}"))?;
+        *store
+            .storage_directory_history
+            .lock()
+            .map_err(|_| "directory history lock poisoned")? =
+            crate::storage_driver::node_identity::load_guard(&dir)?;
+        let vote: Option<Vote<NeuroNodeId>> = read_json("vote.json")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let committed: Option<LogId<NeuroNodeId>> =
+            read_json("committed.json")?.and_then(|v| serde_json::from_value(v).ok());
+        let purged: Option<LogId<NeuroNodeId>> =
+            read_json("purged.json")?.and_then(|v| serde_json::from_value(v).ok());
+        let snap: Option<SnapshotFile> = read_json("snapshot.json")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| format!("snapshot.json: {e}"))?;
         let log_path = dir.join("log.bin");
         let (entries, valid) = match std::fs::read(&log_path) {
             Ok(b) => {
                 let (entries, valid) = decode_log(&b)?;
                 if valid < b.len() {
-                    eprintln!("  [raft] truncating torn tail of {} ({} bytes)", log_path.display(), b.len() - valid);
-                    let f = std::fs::OpenOptions::new().write(true).open(&log_path).map_err(|e| e.to_string())?;
+                    eprintln!(
+                        "  [raft] truncating torn tail of {} ({} bytes)",
+                        log_path.display(),
+                        b.len() - valid
+                    );
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&log_path)
+                        .map_err(|e| e.to_string())?;
                     f.set_len(valid as u64).map_err(|e| e.to_string())?;
                     f.sync_all().map_err(|e| e.to_string())?;
                 }
@@ -206,15 +373,23 @@ impl NeuroStore {
         let _ = valid;
         {
             let mut log = store.log.try_write().expect("fresh lock");
-            for e in entries { log.insert(e.log_id.index, e); }
+            for e in entries {
+                log.insert(e.log_id.index, e);
+            }
         }
         *store.vote.try_write().expect("fresh lock") = vote;
         *store.committed.try_write().expect("fresh lock") = committed;
         *store.last_purged.try_write().expect("fresh lock") = purged;
+        storage_directory_authority::validate_startup(&store, snap.as_ref())?;
         if let Some(s) = snap {
-            let state = sealing.unseal(&s.state).map_err(|e| format!("snapshot.json: {e}"))?;
-            eprintln!("  [raft] restored snapshot from disk (up to log {:?}, generation {})",
-                s.meta.last_log_id.map(|l| l.index), state.generation);
+            let state = sealing
+                .unseal(&s.state)
+                .map_err(|e| format!("snapshot.json: {e}"))?;
+            eprintln!(
+                "  [raft] restored snapshot from disk (up to log {:?}, generation {})",
+                s.meta.last_log_id.map(|l| l.index),
+                state.generation
+            );
             {
                 let mut w = world.write().unwrap_or_else(|e| e.into_inner());
                 w.install_state(state);
@@ -230,6 +405,11 @@ impl NeuroStore {
     }
 
     fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.disk_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         if let Some(dir) = &self.dir {
             let p = dir.join(name);
             crate::persist::atomic_write(&p.to_string_lossy(), bytes).map_err(io_err)?;
@@ -237,32 +417,90 @@ impl NeuroStore {
         Ok(())
     }
 
-    fn rewrite_log(&self, log: &BTreeMap<u64, Entry<NeuroTypeConfig>>) -> Result<(), std::io::Error> {
-        if self.dir.is_none() { return Ok(()); }
+    fn rewrite_log(
+        &self,
+        log: &BTreeMap<u64, Entry<NeuroTypeConfig>>,
+    ) -> Result<(), std::io::Error> {
+        if self.dir.is_none() {
+            return Ok(());
+        }
         let mut buf = Vec::new();
-        for e in log.values() { buf.extend(encode_record(e).map_err(io_err)?); }
+        for e in log.values() {
+            buf.extend(encode_record(e).map_err(io_err)?);
+        }
         self.write_file("log.bin", &buf)
     }
 
     fn append_records(&self, entries: &[Entry<NeuroTypeConfig>]) -> Result<(), std::io::Error> {
         use std::io::Write;
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.disk_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         let Some(dir) = &self.dir else { return Ok(()) };
         let mut buf = Vec::new();
-        for e in entries { buf.extend(encode_record(e).map_err(io_err)?); }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.bin"))?;
+        for e in entries {
+            buf.extend(encode_record(e).map_err(io_err)?);
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("log.bin"))?;
         f.write_all(&buf)?;
         f.sync_all()
     }
 
     /// The state machine: compare-and-swap install of a replicated state.
-    fn apply_command(&self, cmd: &Command) -> NeuroResponse {
+    fn apply_command(
+        &self,
+        cmd: &Command,
+        log_id: LogId<NeuroNodeId>,
+        membership: &StoredMembership<NeuroNodeId, BasicNode>,
+    ) -> Result<NeuroResponse, String> {
         match cmd {
-            Command::Commit { base_generation, state } => {
+            Command::EnrollStorageDirectory {
+                base_generation,
+                proposal,
+            } => storage_directory_authority::apply_enrollment(
+                self,
+                *base_generation,
+                proposal,
+                log_id,
+                membership,
+            ),
+            Command::Commit {
+                base_generation,
+                state,
+            } => Ok((|| {
                 let next = match self.sealing.unseal(state) {
                     Ok(s) => s,
-                    Err(e) => return NeuroResponse { applied: false, generation: 0, message: format!("cannot open replicated state: {e}") },
+                    Err(e) => {
+                        return NeuroResponse {
+                            applied: false,
+                            generation: 0,
+                            message: format!("cannot open replicated state: {e}"),
+                        }
+                    }
                 };
                 let mut w = self.world.write().unwrap_or_else(|e| e.into_inner());
+                if let Err(error) = w
+                    .storage_node_directory
+                    .require_unchanged(&next.storage_node_directory)
+                    .and_then(|_| {
+                        storage_directory_authority::validate_ordinary(
+                            self,
+                            &w.storage_node_directory,
+                            log_id.index,
+                        )
+                    })
+                {
+                    return NeuroResponse {
+                        applied: false,
+                        generation: w.generation,
+                        message: error,
+                    };
+                }
                 if w.generation != *base_generation {
                     return NeuroResponse {
                         applied: false,
@@ -270,39 +508,111 @@ impl NeuroStore {
                         message: format!("conflict: state is at generation {}, write was based on {base_generation}", w.generation),
                     };
                 }
+                if let Err(e) = w
+                    .storage_identities
+                    .lifecycle
+                    .validate_transition(&next.storage_identities.lifecycle)
+                {
+                    return NeuroResponse {
+                        applied: false,
+                        generation: w.generation,
+                        message: format!("unsafe volume lifecycle transition: {e}"),
+                    };
+                }
+                if let Err(e) = w.backup_registry.validate_transition(&next.backup_registry) {
+                    return NeuroResponse {
+                        applied: false,
+                        generation: w.generation,
+                        message: format!("unsafe backup lifecycle transition: {e}"),
+                    };
+                }
                 let g = next.generation;
                 w.install_state(next);
-                NeuroResponse { applied: true, generation: g, message: format!("generation {g}") }
-            }
+                NeuroResponse {
+                    applied: true,
+                    generation: g,
+                    message: format!("generation {g}"),
+                }
+            })()),
         }
     }
 }
 
 impl RaftLogReader<NeuroTypeConfig> for Arc<NeuroStore> {
-    async fn try_get_log_entries<RB>(&mut self, range: RB) -> Result<Vec<Entry<NeuroTypeConfig>>, StorageError<NeuroNodeId>>
-    where RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend {
+    async fn try_get_log_entries<RB>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<Entry<NeuroTypeConfig>>, StorageError<NeuroNodeId>>
+    where
+        RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend,
+    {
         let log = self.log.read().await;
         Ok(log.range(range).map(|(_, e)| e.clone()).collect())
     }
 }
 
 impl RaftSnapshotBuilder<NeuroTypeConfig> for Arc<NeuroStore> {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<NeuroTypeConfig>, StorageError<NeuroNodeId>> {
-        // Capture state and last_applied atomically w.r.t. apply.
-        let (meta, sealed) = {
-            let sm = self.sm.lock().unwrap();
-            let state = self.world.read().unwrap_or_else(|e| e.into_inner()).to_state();
-            let sealed = self.sealing.seal(&state).map_err(|e| StorageIOError::read_state_machine(&io_err(e)))?;
-            let snapshot_id = sm.last_applied
-                .map(|l| format!("{}-{}-{}", l.leader_id, l.index, state.generation))
-                .unwrap_or_else(|| format!("--{}", state.generation));
-            (SnapshotMeta { last_log_id: sm.last_applied, last_membership: sm.membership.clone(), snapshot_id }, sealed)
-        };
-        let file = SnapshotFile { meta: meta.clone(), state: sealed };
-        let bytes = serde_json::to_vec(&file).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e)))?;
-        self.write_file("snapshot.json", &bytes).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<NeuroTypeConfig>, StorageError<NeuroNodeId>> {
+        let store = self.clone();
+        let (meta, file, bytes) =
+            tokio::task::spawn_blocking(move || -> Result<_, StorageError<NeuroNodeId>> {
+                // Capture state and last_applied atomically w.r.t. apply.
+                let (meta, sealed) = {
+                    let sm = store.sm.lock().unwrap();
+                    let state = store
+                        .world
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .to_state();
+                    if state.storage_node_directory.has_authority() {
+                        storage_directory_authority::validate_ordinary(
+                            &store,
+                            &state.storage_node_directory,
+                            sm.last_applied.map_or(0, |id| id.index),
+                        )
+                        .map_err(|e| StorageIOError::read_state_machine(&io_err(e)))?;
+                        // General Raft snapshots retain the original guarded
+                        // history across membership changes. Current-membership
+                        // equality is an issuer gate, not a fatal SM invariant.
+                    }
+                    let sealed = store
+                        .sealing
+                        .seal(&state)
+                        .map_err(|e| StorageIOError::read_state_machine(&io_err(e)))?;
+                    let snapshot_id = sm
+                        .last_applied
+                        .map(|l| format!("{}-{}-{}", l.leader_id, l.index, state.generation))
+                        .unwrap_or_else(|| format!("--{}", state.generation));
+                    (
+                        SnapshotMeta {
+                            last_log_id: sm.last_applied,
+                            last_membership: sm.membership.clone(),
+                            snapshot_id,
+                        },
+                        sealed,
+                    )
+                };
+                let file = SnapshotFile {
+                    meta: meta.clone(),
+                    state: sealed,
+                };
+                let bytes = serde_json::to_vec(&file).map_err(|e| {
+                    StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e))
+                })?;
+                store
+                    .write_file("snapshot.json", &bytes)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+                Ok((meta, file, bytes))
+            })
+            .await
+            .map_err(|e| StorageIOError::write_state_machine(&io_err(e)))??;
         *self.current_snapshot.write().await = Some(file);
-        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(bytes)),
+        })
     }
 }
 
@@ -310,16 +620,28 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
     type LogReader = Self;
     type SnapshotBuilder = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<NeuroTypeConfig>, StorageError<NeuroNodeId>> {
+    async fn get_log_state(
+        &mut self,
+    ) -> Result<LogState<NeuroTypeConfig>, StorageError<NeuroNodeId>> {
         let log = self.log.read().await;
         let last_purged = *self.last_purged.read().await;
         let last = log.iter().next_back().map(|(_, e)| e.log_id);
-        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last.or(last_purged) })
+        Ok(LogState {
+            last_purged_log_id: last_purged,
+            last_log_id: last.or(last_purged),
+        })
     }
 
-    async fn save_vote(&mut self, vote: &Vote<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
+    async fn save_vote(
+        &mut self,
+        vote: &Vote<NeuroNodeId>,
+    ) -> Result<(), StorageError<NeuroNodeId>> {
         let bytes = serde_json::to_vec(vote).map_err(|e| StorageIOError::write_vote(&io_err(e)))?;
-        self.write_file("vote.json", &bytes).map_err(|e| StorageIOError::write_vote(&e))?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.write_file("vote.json", &bytes))
+            .await
+            .map_err(|e| StorageIOError::write_vote(&io_err(e)))?
+            .map_err(|e| StorageIOError::write_vote(&e))?;
         *self.vote.write().await = Some(*vote);
         Ok(())
     }
@@ -328,119 +650,254 @@ impl RaftStorage<NeuroTypeConfig> for Arc<NeuroStore> {
         Ok(*self.vote.read().await)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<NeuroNodeId>>) -> Result<(), StorageError<NeuroNodeId>> {
-        let bytes = serde_json::to_vec(&committed).map_err(|e| StorageIOError::write(&io_err(e)))?;
-        self.write_file("committed.json", &bytes).map_err(|e| StorageIOError::write(&e))?;
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<NeuroNodeId>>,
+    ) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes =
+            serde_json::to_vec(&committed).map_err(|e| StorageIOError::write(&io_err(e)))?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.write_file("committed.json", &bytes))
+            .await
+            .map_err(|e| StorageIOError::write(&io_err(e)))?
+            .map_err(|e| StorageIOError::write(&e))?;
         *self.committed.write().await = committed;
         Ok(())
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId<NeuroNodeId>>, StorageError<NeuroNodeId>> {
+    async fn read_committed(
+        &mut self,
+    ) -> Result<Option<LogId<NeuroNodeId>>, StorageError<NeuroNodeId>> {
         Ok(*self.committed.read().await)
     }
 
     async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NeuroNodeId>>
-    where I: IntoIterator<Item = Entry<NeuroTypeConfig>> + openraft::OptionalSend {
+    where
+        I: IntoIterator<Item = Entry<NeuroTypeConfig>> + openraft::OptionalSend,
+    {
         let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty() { return Ok(()); }
-        self.append_records(&entries).map_err(|e| StorageIOError::write_logs(&e))?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let store = self.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            store.append_records(&entries)?;
+            Ok::<_, std::io::Error>(entries)
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(&io_err(e)))?
+        .map_err(|e| StorageIOError::write_logs(&e))?;
         let mut log = self.log.write().await;
-        for e in entries { log.insert(e.log_id.index, e); }
+        for e in entries {
+            log.insert(e.log_id.index, e);
+        }
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
+    async fn delete_conflict_logs_since(
+        &mut self,
+        log_id: LogId<NeuroNodeId>,
+    ) -> Result<(), StorageError<NeuroNodeId>> {
         let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for k in keys { log.remove(&k); }
-        self.rewrite_log(&log).map_err(|e| StorageIOError::write_logs(&e))?;
+        let mut next = log.clone();
+        next.retain(|index, _| *index < log_id.index);
+        let store = self.clone();
+        let next = tokio::task::spawn_blocking(move || {
+            store.rewrite_log(&next)?;
+            Ok::<_, std::io::Error>(next)
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(&io_err(e)))?
+        .map_err(|e| StorageIOError::write_logs(&e))?;
+        *log = next;
         Ok(())
     }
 
-    async fn purge_logs_upto(&mut self, log_id: LogId<NeuroNodeId>) -> Result<(), StorageError<NeuroNodeId>> {
-        let bytes = serde_json::to_vec(&Some(log_id)).map_err(|e| StorageIOError::write(&io_err(e)))?;
-        self.write_file("purged.json", &bytes).map_err(|e| StorageIOError::write(&e))?;
+    async fn purge_logs_upto(
+        &mut self,
+        log_id: LogId<NeuroNodeId>,
+    ) -> Result<(), StorageError<NeuroNodeId>> {
+        let bytes =
+            serde_json::to_vec(&Some(log_id)).map_err(|e| StorageIOError::write(&io_err(e)))?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.write_file("purged.json", &bytes))
+            .await
+            .map_err(|e| StorageIOError::write(&io_err(e)))?
+            .map_err(|e| StorageIOError::write(&e))?;
         *self.last_purged.write().await = Some(log_id);
         let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for k in keys { log.remove(&k); }
-        self.rewrite_log(&log).map_err(|e| StorageIOError::write_logs(&e))?;
+        let mut next = log.clone();
+        next.retain(|index, _| *index > log_id.index);
+        let store = self.clone();
+        let next = tokio::task::spawn_blocking(move || {
+            store.rewrite_log(&next)?;
+            Ok::<_, std::io::Error>(next)
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(&io_err(e)))?
+        .map_err(|e| StorageIOError::write_logs(&e))?;
+        *log = next;
         Ok(())
     }
 
-    async fn last_applied_state(&mut self) -> Result<(Option<LogId<NeuroNodeId>>, StoredMembership<NeuroNodeId, BasicNode>), StorageError<NeuroNodeId>> {
-        let sm = self.sm.lock().unwrap();
-        Ok((sm.last_applied, sm.membership.clone()))
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<
+        (
+            Option<LogId<NeuroNodeId>>,
+            StoredMembership<NeuroNodeId, BasicNode>,
+        ),
+        StorageError<NeuroNodeId>,
+    > {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let sm = store.sm.lock().unwrap();
+            (sm.last_applied, sm.membership.clone())
+        })
+        .await
+        .map_err(|e| StorageIOError::read_state_machine(&io_err(e)).into())
     }
 
-    async fn apply_to_state_machine(&mut self, entries: &[Entry<NeuroTypeConfig>]) -> Result<Vec<NeuroResponse>, StorageError<NeuroNodeId>> {
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let mut sm = self.sm.lock().unwrap();
-            sm.last_applied = Some(entry.log_id);
-            match &entry.payload {
-                EntryPayload::Blank => out.push(NeuroResponse::default()),
-                EntryPayload::Normal(cmd) => out.push(self.apply_command(cmd)),
-                EntryPayload::Membership(m) => {
-                    sm.membership = StoredMembership::new(Some(entry.log_id), m.clone());
-                    out.push(NeuroResponse::default());
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<NeuroTypeConfig>],
+    ) -> Result<Vec<NeuroResponse>, StorageError<NeuroNodeId>> {
+        let store = self.clone();
+        let entries = entries.to_vec();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<NeuroResponse>, StorageError<NeuroNodeId>> {
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    let mut sm = store.sm.lock().unwrap();
+                    match &entry.payload {
+                        EntryPayload::Blank => out.push(NeuroResponse::default()),
+                        EntryPayload::Normal(cmd) => out.push(
+                            store
+                                .apply_command(cmd, entry.log_id, &sm.membership)
+                                .map_err(|error| {
+                                    StorageIOError::write_state_machine(&io_err(error))
+                                })?,
+                        ),
+                        EntryPayload::Membership(m) => {
+                            sm.membership = StoredMembership::new(Some(entry.log_id), m.clone());
+                            out.push(NeuroResponse::default());
+                        }
+                    }
+                    sm.last_applied = Some(entry.log_id);
                 }
-            }
-        }
-        Ok(out)
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| StorageIOError::write_state_machine(&io_err(e)))?
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NeuroNodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NeuroNodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
-    async fn install_snapshot(&mut self, meta: &SnapshotMeta<NeuroNodeId, BasicNode>, snapshot: Box<Cursor<Vec<u8>>>) -> Result<(), StorageError<NeuroNodeId>> {
-        let bytes = snapshot.into_inner();
-        let file: SnapshotFile = serde_json::from_slice(&bytes)
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NeuroNodeId, BasicNode>,
+        snapshot: Box<Cursor<Vec<u8>>>,
+    ) -> Result<(), StorageError<NeuroNodeId>> {
+        let store = self.clone();
+        let meta = meta.clone();
+        let file = tokio::task::spawn_blocking(move || -> Result<_, StorageError<NeuroNodeId>> {
+            let bytes = snapshot.into_inner();
+            let file: SnapshotFile = serde_json::from_slice(&bytes)
+                .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
+            let state = store
+                .sealing
+                .unseal(&file.state)
+                .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
+            let mut sm = store.sm.lock().unwrap();
+            let mut world = store.world.write().unwrap_or_else(|e| e.into_inner());
+            storage_directory_authority::validate_live_snapshot(
+                &store,
+                &world.storage_node_directory,
+                &state,
+                &meta,
+            )
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
-        let state = self.sealing.unseal(&file.state)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
-        eprintln!("  [raft] installing snapshot from leader (up to log {:?}, generation {})",
-            meta.last_log_id.map(|l| l.index), state.generation);
-        let file = SnapshotFile { meta: meta.clone(), state: file.state };
-        let disk = serde_json::to_vec(&file).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e)))?;
-        self.write_file("snapshot.json", &disk).map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        {
-            let mut sm = self.sm.lock().unwrap();
-            self.world.write().unwrap_or_else(|e| e.into_inner()).install_state(state);
-            sm.last_applied = meta.last_log_id;
-            sm.membership = meta.last_membership.clone();
-        }
+            world
+                .backup_registry
+                .validate_snapshot_successor(&state.backup_registry)
+                .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &io_err(e)))?;
+            eprintln!(
+                "  [raft] installing snapshot from leader (up to log {:?}, generation {})",
+                meta.last_log_id.map(|l| l.index),
+                state.generation
+            );
+            let file = SnapshotFile {
+                meta: meta.clone(),
+                state: file.state,
+            };
+            let disk = serde_json::to_vec(&file)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &io_err(e)))?;
+            store
+                .write_file("snapshot.json", &disk)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            {
+                world.install_state(state);
+                sm.last_applied = meta.last_log_id;
+                sm.membership = meta.last_membership.clone();
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|e| StorageIOError::write_state_machine(&io_err(e)))??;
         *self.current_snapshot.write().await = Some(file);
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<NeuroTypeConfig>>, StorageError<NeuroNodeId>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<NeuroTypeConfig>>, StorageError<NeuroNodeId>> {
         let cur = self.current_snapshot.read().await;
         match cur.as_ref() {
             Some(s) => {
-                let bytes = serde_json::to_vec(s).map_err(|e| StorageIOError::read_snapshot(Some(s.meta.signature()), &io_err(e)))?;
-                Ok(Some(Snapshot { meta: s.meta.clone(), snapshot: Box::new(Cursor::new(bytes)) }))
+                let bytes = serde_json::to_vec(s).map_err(|e| {
+                    StorageIOError::read_snapshot(Some(s.meta.signature()), &io_err(e))
+                })?;
+                Ok(Some(Snapshot {
+                    meta: s.meta.clone(),
+                    snapshot: Box::new(Cursor::new(bytes)),
+                }))
             }
             None => Ok(None),
         }
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader { self.clone() }
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder { self.clone() }
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
+    }
 }
 
 // ─── In-process network (unit tests: partitions, failover) ─────────────
 
 #[cfg(test)]
-pub type NodeRegistry = Arc<tokio::sync::RwLock<std::collections::HashMap<NeuroNodeId, Arc<openraft::Raft<NeuroTypeConfig>>>>>;
+pub type NodeRegistry = Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<NeuroNodeId, Arc<openraft::Raft<NeuroTypeConfig>>>,
+    >,
+>;
 #[cfg(test)]
 pub type Partition = Arc<tokio::sync::RwLock<std::collections::HashSet<NeuroNodeId>>>;
 
 #[cfg(test)]
-pub fn new_registry() -> NodeRegistry { Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())) }
+pub fn new_registry() -> NodeRegistry {
+    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
+}
 #[cfg(test)]
-pub fn new_partition() -> Partition { Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())) }
+pub fn new_partition() -> Partition {
+    Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()))
+}
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -454,7 +911,12 @@ pub struct InProcNetworkFactory {
 impl openraft::RaftNetworkFactory<NeuroTypeConfig> for InProcNetworkFactory {
     type Network = InProcNetwork;
     async fn new_client(&mut self, target: NeuroNodeId, _node: &BasicNode) -> Self::Network {
-        InProcNetwork { target, source: self.source, registry: self.registry.clone(), isolated: self.isolated.clone() }
+        InProcNetwork {
+            target,
+            source: self.source,
+            registry: self.registry.clone(),
+            isolated: self.isolated.clone(),
+        }
     }
 }
 
@@ -466,17 +928,23 @@ pub struct InProcNetwork {
     isolated: Partition,
 }
 
-type RpcErr<E = openraft::error::RaftError<NeuroNodeId>> = openraft::error::RPCError<NeuroNodeId, BasicNode, E>;
+type RpcErr<E = openraft::error::RaftError<NeuroNodeId>> =
+    openraft::error::RPCError<NeuroNodeId, BasicNode, E>;
 
 fn unreachable<E: std::error::Error>(msg: String) -> RpcErr<E> {
-    openraft::error::RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::new(std::io::ErrorKind::NotConnected, msg)))
+    openraft::error::RPCError::Unreachable(openraft::error::Unreachable::new(&std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        msg,
+    )))
 }
 
 #[cfg(test)]
 impl InProcNetwork {
     async fn peer(&self) -> Option<Arc<openraft::Raft<NeuroTypeConfig>>> {
         let iso = self.isolated.read().await;
-        if iso.contains(&self.source) || iso.contains(&self.target) { return None; }
+        if iso.contains(&self.source) || iso.contains(&self.target) {
+            return None;
+        }
         drop(iso);
         self.registry.read().await.get(&self.target).cloned()
     }
@@ -484,20 +952,56 @@ impl InProcNetwork {
 
 #[cfg(test)]
 impl openraft::RaftNetwork<NeuroTypeConfig> for InProcNetwork {
-    async fn append_entries(&mut self, rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
-        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
-        p.append_entries(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
+    async fn append_entries(
+        &mut self,
+        rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
+        let p = self
+            .peer()
+            .await
+            .ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.append_entries(rpc).await.map_err(|e| {
+            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(
+                self.target,
+                e,
+            ))
+        })
     }
-    async fn install_snapshot(&mut self, rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
-        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
-        p.install_snapshot(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
+    async fn install_snapshot(
+        &mut self,
+        rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::InstallSnapshotResponse<NeuroNodeId>,
+        RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>,
+    > {
+        let p = self
+            .peer()
+            .await
+            .ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.install_snapshot(rpc).await.map_err(|e| {
+            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(
+                self.target,
+                e,
+            ))
+        })
     }
-    async fn vote(&mut self, rpc: openraft::raft::VoteRequest<NeuroNodeId>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
-        let p = self.peer().await.ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
-        p.vote(rpc).await.map_err(|e| openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(self.target, e)))
+    async fn vote(
+        &mut self,
+        rpc: openraft::raft::VoteRequest<NeuroNodeId>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
+        let p = self
+            .peer()
+            .await
+            .ok_or_else(|| unreachable(format!("peer {} unreachable", self.target)))?;
+        p.vote(rpc).await.map_err(|e| {
+            openraft::error::RPCError::RemoteError(openraft::error::RemoteError::new(
+                self.target,
+                e,
+            ))
+        })
     }
 }
 
@@ -520,7 +1024,10 @@ impl HttpNetworkFactory {
 impl openraft::RaftNetworkFactory<NeuroTypeConfig> for HttpNetworkFactory {
     type Network = HttpNetwork;
     async fn new_client(&mut self, target: NeuroNodeId, _node: &BasicNode) -> Self::Network {
-        HttpNetwork { target, peers: self.peers.clone() }
+        HttpNetwork {
+            target,
+            peers: self.peers.clone(),
+        }
     }
 }
 
@@ -530,12 +1037,25 @@ pub struct HttpNetwork {
 }
 
 impl HttpNetwork {
-    async fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(&self, path: &str, req: &Req, timeout: std::time::Duration) -> Result<Resp, String> {
-        let addr = self.peers.read().unwrap().get(&self.target).cloned().ok_or_else(|| format!("peer {} not registered", self.target))?;
+    async fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        req: &Req,
+        timeout: std::time::Duration,
+    ) -> Result<Resp, String> {
+        let addr = self
+            .peers
+            .read()
+            .unwrap()
+            .get(&self.target)
+            .cloned()
+            .ok_or_else(|| format!("peer {} not registered", self.target))?;
         let body = serde_json::to_vec(req).map_err(|e| format!("serialize: {e}"))?;
-        let resp_body = crate::node_rpc::call_async("POST", &addr, path, &body, timeout).await
+        let resp_body = crate::node_rpc::call_async("POST", &addr, path, &body, timeout)
+            .await
             .map_err(|e| format!("raft rpc: {e}"))?;
-        serde_json::from_slice::<Resp>(&resp_body).map_err(|e| format!("decode ({} bytes): {e}", resp_body.len()))
+        serde_json::from_slice::<Resp>(&resp_body)
+            .map_err(|e| format!("decode ({} bytes): {e}", resp_body.len()))
     }
 }
 
@@ -543,17 +1063,35 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl openraft::RaftNetwork<NeuroTypeConfig> for HttpNetwork {
-    async fn append_entries(&mut self, rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
-        self.post_json("/royak/v1/raft/append-entries", &rpc, RPC_TIMEOUT).await.map_err(unreachable)
+    async fn append_entries(
+        &mut self,
+        rpc: openraft::raft::AppendEntriesRequest<NeuroTypeConfig>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<openraft::raft::AppendEntriesResponse<NeuroNodeId>, RpcErr> {
+        self.post_json("/royak/v1/raft/append-entries", &rpc, RPC_TIMEOUT)
+            .await
+            .map_err(unreachable)
     }
-    async fn install_snapshot(&mut self, rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::InstallSnapshotResponse<NeuroNodeId>, RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>> {
-        self.post_json("/royak/v1/raft/install-snapshot", &rpc, SNAPSHOT_TIMEOUT).await.map_err(unreachable)
+    async fn install_snapshot(
+        &mut self,
+        rpc: openraft::raft::InstallSnapshotRequest<NeuroTypeConfig>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::InstallSnapshotResponse<NeuroNodeId>,
+        RpcErr<openraft::error::RaftError<NeuroNodeId, openraft::error::InstallSnapshotError>>,
+    > {
+        self.post_json("/royak/v1/raft/install-snapshot", &rpc, SNAPSHOT_TIMEOUT)
+            .await
+            .map_err(unreachable)
     }
-    async fn vote(&mut self, rpc: openraft::raft::VoteRequest<NeuroNodeId>, _o: openraft::network::RPCOption)
-        -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
-        self.post_json("/royak/v1/raft/vote", &rpc, RPC_TIMEOUT).await.map_err(unreachable)
+    async fn vote(
+        &mut self,
+        rpc: openraft::raft::VoteRequest<NeuroNodeId>,
+        _o: openraft::network::RPCOption,
+    ) -> Result<openraft::raft::VoteResponse<NeuroNodeId>, RpcErr> {
+        self.post_json("/royak/v1/raft/vote", &rpc, RPC_TIMEOUT)
+            .await
+            .map_err(unreachable)
     }
 }
 
@@ -565,21 +1103,18 @@ pub struct RaftHandle {
     pub node_id: NeuroNodeId,
     pub sealing: Sealing,
     pub rt: tokio::runtime::Handle,
+    storage_store: Arc<NeuroStore>,
 }
+#[path = "storage_directory_authority.rs"]
+pub(crate) mod storage_directory_authority;
+#[path = "storage_remote_core.rs"]
+pub(crate) mod storage_remote_core;
 
 pub static RAFT: std::sync::OnceLock<RaftHandle> = std::sync::OnceLock::new();
 
-pub fn raft_config() -> Result<Arc<openraft::Config>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Arc::new(openraft::Config {
-        cluster_name: "royak".to_string(),
-        heartbeat_interval: 250,
-        election_timeout_min: 1000,
-        election_timeout_max: 2000,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(64),
-        max_in_snapshot_log_to_keep: 16,
-        ..Default::default()
-    }.validate()?))
-}
+#[path = "raft_config.rs"]
+mod fixed_config;
+pub use fixed_config::raft_config;
 
 /// Start this process's Raft node with durable storage in `dir`.
 ///
@@ -597,18 +1132,49 @@ pub async fn build_http_node(
     seed: Option<DesiredState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let net = HttpNetworkFactory::default();
-    for (id, addr) in peers { net.set_peer(*id, addr.clone()); }
+    for (id, addr) in peers {
+        net.set_peer(*id, addr.clone());
+    }
     let store = NeuroStore::open(dir, Sealing::Cluster, world.clone())?;
     let fresh = store.log.read().await.is_empty() && store.current_snapshot.read().await.is_none();
-    let (log_store, state_machine) = Adaptor::new(store);
-    let raft = Arc::new(openraft::Raft::new(node_id, raft_config()?, net.clone(), log_store, state_machine).await?);
-    RAFT.set(RaftHandle { raft: raft.clone(), net, node_id, sealing: Sealing::Cluster, rt: tokio::runtime::Handle::current() })
-        .map_err(|_| "RAFT already set")?;
+    if bootstrap
+        && fresh
+        && seed.as_ref().is_some_and(|s| {
+            !s.storage_identities.lifecycle.is_empty()
+                || s.backup_registry.has_authority()
+                || s.storage_node_directory.has_authority()
+                || crate::host_access::has_authority(s)
+        })
+    {
+        return Err("managed volume or host-access state requires explicit recovery, not a fresh Raft seed import".into());
+    }
+    let (log_store, state_machine) = Adaptor::new(store.clone());
+    let raft = Arc::new(
+        openraft::Raft::new(
+            node_id,
+            raft_config()?,
+            net.clone(),
+            log_store,
+            state_machine,
+        )
+        .await?,
+    );
+    RAFT.set(RaftHandle {
+        raft: raft.clone(),
+        net,
+        node_id,
+        sealing: Sealing::Cluster,
+        rt: tokio::runtime::Handle::current(),
+        storage_store: store,
+    })
+    .map_err(|_| "RAFT already set")?;
 
     if bootstrap && fresh {
         let mut members = BTreeMap::new();
         members.insert(node_id, BasicNode::default());
-        for (id, _) in peers { members.insert(*id, BasicNode::default()); }
+        for (id, _) in peers {
+            members.insert(*id, BasicNode::default());
+        }
         match raft.initialize(members).await {
             Ok(()) => eprintln!("  [raft] cluster initialised by node {node_id}"),
             Err(e) => eprintln!("  [raft] initialise skipped: {e}"),
@@ -617,16 +1183,31 @@ pub async fn build_http_node(
             if !seed.same_content(&DesiredWorld::new().to_state()) || seed.generation > 0 {
                 // Wait for our own leadership, then commit the seed as generation 1.
                 for _ in 0..120 {
-                    if raft.current_leader().await == Some(node_id) { break; }
+                    if raft.current_leader().await == Some(node_id) {
+                        break;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
                 let base = world.read().unwrap_or_else(|e| e.into_inner()).generation;
                 if base == 0 {
                     seed.generation = 1;
-                    seed.cluster_id = world.read().unwrap_or_else(|e| e.into_inner()).cluster_id.clone();
+                    seed.cluster_id = world
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .cluster_id
+                        .clone();
                     let state = Sealing::Cluster.seal(&seed)?;
-                    match raft.client_write(Command::Commit { base_generation: 0, state }).await {
-                        Ok(r) if r.data.applied => eprintln!("  [raft] seeded cluster state from local file ({} deployments)", seed.deployments.len()),
+                    match raft
+                        .client_write(Command::Commit {
+                            base_generation: 0,
+                            state,
+                        })
+                        .await
+                    {
+                        Ok(r) if r.data.applied => eprintln!(
+                            "  [raft] seeded cluster state from local file ({} deployments)",
+                            seed.deployments.len()
+                        ),
                         Ok(r) => eprintln!("  [raft] seed not applied: {}", r.data.message),
                         Err(e) => eprintln!("  [raft] seed commit failed: {e}"),
                     }
@@ -643,7 +1224,11 @@ pub async fn handle_rpc(which: &str, body: &[u8]) -> Result<String, String> {
     match which {
         "append-entries" => {
             let rpc = serde_json::from_slice(body).map_err(|e| format!("decode: {e}"))?;
-            let resp = handle.raft.append_entries(rpc).await.map_err(|e| format!("{e}"))?;
+            let resp = handle
+                .raft
+                .append_entries(rpc)
+                .await
+                .map_err(|e| format!("{e}"))?;
             serde_json::to_string(&resp).map_err(|e| format!("encode: {e}"))
         }
         "vote" => {
@@ -653,7 +1238,11 @@ pub async fn handle_rpc(which: &str, body: &[u8]) -> Result<String, String> {
         }
         "install-snapshot" => {
             let rpc = serde_json::from_slice(body).map_err(|e| format!("decode: {e}"))?;
-            let resp = handle.raft.install_snapshot(rpc).await.map_err(|e| format!("{e}"))?;
+            let resp = handle
+                .raft
+                .install_snapshot(rpc)
+                .await
+                .map_err(|e| format!("{e}"))?;
             serde_json::to_string(&resp).map_err(|e| format!("encode: {e}"))
         }
         other => Err(format!("unknown raft rpc: {other}")),
@@ -667,11 +1256,20 @@ pub const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 
 /// Replicate `next` through Raft. Blocking — call from a non-async thread.
 pub fn commit_blocking(base_generation: u64, next: DesiredState) -> Result<(), CommitError> {
-    let h = RAFT.get().ok_or_else(|| CommitError::Unavailable("raft is not running yet on this node".into()))?;
+    let h = RAFT
+        .get()
+        .ok_or_else(|| CommitError::Unavailable("raft is not running yet on this node".into()))?;
     let state = h.sealing.seal(&next).map_err(CommitError::Unavailable)?;
     let raft = h.raft.clone();
     let res = h.rt.block_on(async move {
-        tokio::time::timeout(COMMIT_TIMEOUT, raft.client_write(Command::Commit { base_generation, state })).await
+        tokio::time::timeout(
+            COMMIT_TIMEOUT,
+            raft.client_write(Command::Commit {
+                base_generation,
+                state,
+            }),
+        )
+        .await
     });
     match res {
         Err(_) => Err(CommitError::Unknown(format!(
@@ -728,16 +1326,49 @@ fn confirmed_leader(m: &openraft::RaftMetrics<NeuroNodeId, BasicNode>, me: Neuro
 }
 
 const LEADER_LEASE_MS: u64 = 1000;
+static LEADERSHIP_POLL_LAG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LEADERSHIP_MAX_POLL_LAG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bounded metadata only, so a lost confirmation can be distinguished from a
+/// new term, slow heartbeats or a parked async runtime without logging state.
+pub fn leadership_diagnostics() -> serde_json::Value {
+    let metrics = RAFT.get().map(|h| h.raft.metrics().borrow().clone());
+    serde_json::json!({
+        "quorumAckAgeMs": metrics.as_ref().and_then(|m| m.millis_since_quorum_ack),
+        "term": metrics.as_ref().map(|m| m.current_term),
+        "lastLogIndex": metrics.as_ref().and_then(|m| m.last_log_index),
+        "leaseMs": LEADER_LEASE_MS,
+        "pollLagMs": LEADERSHIP_POLL_LAG_MS.load(std::sync::atomic::Ordering::Relaxed),
+        "maxPollLagMs": LEADERSHIP_MAX_POLL_LAG_MS.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
 
 pub async fn leadership_poller() {
     use std::sync::atomic::Ordering;
+    let period = std::time::Duration::from_millis(250);
+    let mut expected = std::time::Instant::now();
+    let mut previous = None;
     loop {
+        let lag = std::time::Instant::now()
+            .saturating_duration_since(expected)
+            .as_millis() as u64;
+        LEADERSHIP_POLL_LAG_MS.store(lag, Ordering::Relaxed);
+        LEADERSHIP_MAX_POLL_LAG_MS.fetch_max(lag, Ordering::Relaxed);
         let is_leader = match RAFT.get() {
             Some(h) => confirmed_leader(&h.raft.metrics().borrow(), h.node_id),
             None => false,
         };
         IS_RAFT_LEADER.store(is_leader, Ordering::Release);
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if previous != Some(is_leader) {
+            previous = Some(is_leader);
+            let metadata = leadership_diagnostics();
+            tokio::task::spawn_blocking(move || {
+                eprintln!("  [raft-lease] confirmed={is_leader} {metadata}")
+            });
+        }
+        expected = std::time::Instant::now() + period;
+        tokio::time::sleep(period).await;
     }
 }
 
@@ -750,22 +1381,37 @@ pub async fn build_node_in_proc(
     isolated: Partition,
     dir: Option<PathBuf>,
 ) -> Result<Arc<openraft::Raft<NeuroTypeConfig>>, Box<dyn std::error::Error + Send + Sync>> {
-    let config = Arc::new(openraft::Config {
-        cluster_name: "royak-test".to_string(),
-        heartbeat_interval: 100,
-        election_timeout_min: 300,
-        election_timeout_max: 600,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(8),
-        max_in_snapshot_log_to_keep: 2,
-        ..Default::default()
-    }.validate()?);
+    let config = Arc::new(
+        openraft::Config {
+            cluster_name: "royak-test".to_string(),
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(8),
+            max_in_snapshot_log_to_keep: 2,
+            ..Default::default()
+        }
+        .validate()?,
+    );
     let store = match dir {
         Some(d) => NeuroStore::open(d, Sealing::Plain, world)?,
         None => NeuroStore::in_memory(world),
     };
     let (log_store, state_machine) = Adaptor::new(store);
-    let raft = Arc::new(openraft::Raft::new(node_id, config,
-        InProcNetworkFactory { registry: registry.clone(), source: node_id, isolated }, log_store, state_machine).await?);
+    let raft = Arc::new(
+        openraft::Raft::new(
+            node_id,
+            config,
+            InProcNetworkFactory {
+                registry: registry.clone(),
+                source: node_id,
+                isolated,
+            },
+            log_store,
+            state_machine,
+        )
+        .await?,
+    );
     registry.write().await.insert(node_id, raft.clone());
     Ok(raft)
 }
@@ -778,14 +1424,214 @@ mod tests {
     type Rafts = HashMap<u64, Arc<openraft::Raft<NeuroTypeConfig>>>;
     type Worlds = HashMap<u64, Arc<std::sync::RwLock<DesiredWorld>>>;
 
+    #[test]
+    fn storage_identity_crypto_domain_is_a_real_upgrade_barrier() {
+        const CHILD: &str = "ROYAK_TEST_STORAGE_SEAL_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "raft_node::tests::storage_identity_crypto_domain_is_a_real_upgrade_barrier",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "ROYAK_CLUSTER_SECRET",
+                    "storage-seal-isolated-test-secret-0123456789",
+                )
+                .env_remove("ROYAK_CLUSTER_SECRET_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "isolated crypto regression failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let state = DesiredWorld::new().to_state();
+        let sealed = Sealing::Cluster.seal(&state).unwrap();
+        assert_eq!(
+            serde_json::to_value(Sealing::Cluster.unseal(&sealed).unwrap()).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        for old in [
+            SEAL_PURPOSE,
+            SECURITY_SEAL_PURPOSE,
+            STORAGE_SEAL_PURPOSE,
+            HOST_SEAL_PURPOSE,
+            BACKUP_SEAL_PURPOSE,
+            RESTORE_SEAL_PURPOSE,
+        ] {
+            assert!(
+                crate::auth::unseal_for_cluster(old, &sealed).is_err(),
+                "old domain must not authenticate new authority"
+            );
+        }
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("backup_registry");
+        legacy.as_object_mut().unwrap().remove("storage_identities");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("storage_node_directory");
+        let old = crate::auth::seal_for_cluster(
+            SECURITY_SEAL_PURPOSE,
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let a = Sealing::Cluster.unseal(&old).unwrap();
+        let b = Sealing::Cluster.unseal(&old).unwrap();
+        assert_eq!(a.storage_identities, b.storage_identities);
+        let malformed = crate::auth::seal_for_cluster(
+            STORAGE_SEAL_PURPOSE,
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            Sealing::Cluster.unseal(&malformed).is_err(),
+            "new envelope cannot request legacy migration"
+        );
+        let mut bytes = sealed.into_bytes();
+        let last = bytes.len() - 2;
+        bytes[last] = if bytes[last] == b'a' { b'b' } else { b'a' };
+        assert!(Sealing::Cluster
+            .unseal(std::str::from_utf8(&bytes).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn storage_identity_payloads_reject_missing_authority_and_migrate_only_legacy() {
+        let state = DesiredWorld::new().to_state();
+        let plain = Sealing::Plain.seal(&state).unwrap();
+        assert_eq!(
+            Sealing::Plain.unseal(&plain).unwrap().storage_identities,
+            state.storage_identities
+        );
+        let mut v: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        v["storage_identities"]["version"] = 0.into();
+        assert!(Sealing::Plain.unseal(&v.to_string()).is_err());
+        v.as_object_mut().unwrap().remove("storage_identities");
+        let a = Sealing::Plain.unseal(&v.to_string()).unwrap();
+        let b = Sealing::Plain.unseal(&v.to_string()).unwrap();
+        assert_eq!(a.storage_identities, b.storage_identities);
+        assert_ne!(STORAGE_SEAL_PURPOSE, SEAL_PURPOSE);
+        assert_ne!(STORAGE_SEAL_PURPOSE, SECURITY_SEAL_PURPOSE);
+    }
+
+    #[test]
+    fn quorum_confirmation_still_fails_closed_at_the_original_lease_boundary() {
+        let mut metrics = openraft::RaftMetrics::<u64, BasicNode>::new_initial(1);
+        metrics.current_leader = Some(1);
+        metrics.membership_config = Arc::new(StoredMembership::new(
+            None,
+            openraft::Membership::new(
+                vec![[1, 2, 3].into_iter().collect()],
+                None::<std::collections::BTreeSet<u64>>,
+            ),
+        ));
+        for age in [None, Some(1000), Some(1001), Some(10_000)] {
+            metrics.millis_since_quorum_ack = age;
+            assert!(!confirmed_leader(&metrics, 1));
+        }
+        metrics.millis_since_quorum_ack = Some(999);
+        assert!(confirmed_leader(&metrics, 1));
+        assert!(!confirmed_leader(&metrics, 2));
+    }
+
+    #[tokio::test]
+    async fn durable_raft_writes_keep_async_timers_live() {
+        let dir = tmpdir("slow-disk-timers");
+        let world = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
+        let store = NeuroStore::open(dir.clone(), Sealing::Plain, world).unwrap();
+        store
+            .disk_delay_ms
+            .store(500, std::sync::atomic::Ordering::Relaxed);
+        for operation in 0..5 {
+            let mut writer = store.clone();
+            let started = std::time::Instant::now();
+            let write = tokio::spawn(async move {
+                let id = LogId::new(openraft::CommittedLeaderId::new(1, 1), 1);
+                match operation {
+                    0 => writer.save_vote(&Vote::new(1, 1)).await.unwrap(),
+                    1 => writer.save_committed(Some(id)).await.unwrap(),
+                    2 => writer
+                        .append_to_log([Entry {
+                            log_id: id,
+                            payload: EntryPayload::Blank,
+                        }])
+                        .await
+                        .unwrap(),
+                    3 => writer.delete_conflict_logs_since(id).await.unwrap(),
+                    _ => writer.purge_logs_upto(id).await.unwrap(),
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let elapsed = started.elapsed();
+            write.await.unwrap();
+            assert!(
+                elapsed < std::time::Duration::from_millis(250),
+                "Raft durable IO operation {operation} parked the runtime for {elapsed:?}"
+            );
+        }
+        let vote: Vote<u64> =
+            serde_json::from_slice(&std::fs::read(dir.join("vote.json")).unwrap()).unwrap();
+        assert_eq!(vote, Vote::new(1, 1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn applying_state_under_reconcile_contention_keeps_async_timers_live() {
+        let world = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
+        let base = world.read().unwrap().to_state();
+        let mut next = base.clone();
+        next.generation += 1;
+        let entry: Entry<NeuroTypeConfig> = Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(Command::Commit {
+                base_generation: base.generation,
+                state: Sealing::Plain.seal(&next).unwrap(),
+            }),
+        };
+        let mut store = NeuroStore::in_memory(world.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _guard = world.write().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        let apply =
+            tokio::spawn(async move { store.apply_to_state_machine(&[entry]).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let elapsed = start.elapsed();
+        let result = apply.await.unwrap();
+        writer.join().unwrap();
+        assert!(result[0].applied);
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "Raft apply parked the async runtime for {elapsed:?}"
+        );
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("royak-raft-{tag}-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let d = std::env::temp_dir().join(format!(
+            "royak-raft-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
-    async fn cluster(n: u64, durable: Option<&PathBuf>) -> (Rafts, Worlds, NodeRegistry, Partition) {
+    async fn cluster(
+        n: u64,
+        durable: Option<&PathBuf>,
+    ) -> (Rafts, Worlds, NodeRegistry, Partition) {
         let registry = new_registry();
         let isolated = new_partition();
         let mut rafts = HashMap::new();
@@ -793,12 +1639,16 @@ mod tests {
         for id in 1..=n {
             let w = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
             let dir = durable.map(|d| d.join(format!("n{id}")));
-            let r = build_node_in_proc(id, w.clone(), registry.clone(), isolated.clone(), dir).await.unwrap();
+            let r = build_node_in_proc(id, w.clone(), registry.clone(), isolated.clone(), dir)
+                .await
+                .unwrap();
             rafts.insert(id, r);
             worlds.insert(id, w);
         }
         let mut members = BTreeMap::new();
-        for id in 1..=n { members.insert(id, BasicNode::default()); }
+        for id in 1..=n {
+            members.insert(id, BasicNode::default());
+        }
         rafts[&1].initialize(members).await.unwrap();
         (rafts, worlds, registry, isolated)
     }
@@ -807,8 +1657,12 @@ mod tests {
         for _ in 0..100 {
             let iso = isolated.read().await.clone();
             for (id, r) in rafts {
-                if iso.contains(id) { continue; }
-                if r.current_leader().await == Some(*id) { return *id; }
+                if iso.contains(id) {
+                    continue;
+                }
+                if r.current_leader().await == Some(*id) {
+                    return *id;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -816,10 +1670,14 @@ mod tests {
     }
 
     /// A write as the API would make it: next state = current + one change.
-    fn next_state(w: &Arc<std::sync::RwLock<DesiredWorld>>, f: impl FnOnce(&mut DesiredWorld)) -> (u64, DesiredState) {
+    fn next_state(
+        w: &Arc<std::sync::RwLock<DesiredWorld>>,
+        f: impl FnOnce(&mut DesiredWorld),
+    ) -> (u64, DesiredState) {
         let base = w.read().unwrap().to_state();
         let mut scratch = DesiredWorld::from_state(base.clone());
         f(&mut scratch);
+        scratch.synchronize_storage_identities().unwrap();
         let mut next = scratch.to_state();
         next.generation = base.generation + 1;
         (base.generation, next)
@@ -829,9 +1687,21 @@ mod tests {
         move |w: &mut DesiredWorld| w.namespaces.push(name.to_string())
     }
 
-    async fn write(r: &openraft::Raft<NeuroTypeConfig>, base: u64, next: DesiredState) -> Result<NeuroResponse, String> {
+    async fn write(
+        r: &openraft::Raft<NeuroTypeConfig>,
+        base: u64,
+        next: DesiredState,
+    ) -> Result<NeuroResponse, String> {
         let state = Sealing::Plain.seal(&next).unwrap();
-        match tokio::time::timeout(std::time::Duration::from_secs(3), r.client_write(Command::Commit { base_generation: base, state })).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            r.client_write(Command::Commit {
+                base_generation: base,
+                state,
+            }),
+        )
+        .await
+        {
             Ok(Ok(resp)) => Ok(resp.data),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err("timeout".into()),
@@ -840,7 +1710,12 @@ mod tests {
 
     async fn converge(worlds: &Worlds, ids: &[u64], ns: &str) -> bool {
         for _ in 0..50 {
-            if ids.iter().all(|i| worlds[i].read().unwrap().namespaces.iter().any(|n| n == ns)) { return true; }
+            if ids
+                .iter()
+                .all(|i| worlds[i].read().unwrap().namespaces.iter().any(|n| n == ns))
+            {
+                return true;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         false
@@ -853,12 +1728,17 @@ mod tests {
         let (base, next) = next_state(&worlds[&l], add_ns("a"));
         let r = write(&rafts[&l], base, next.clone()).await.unwrap();
         assert!(r.applied);
-        assert!(converge(&worlds, &[1, 2, 3], "a").await, "followers must apply the committed state");
+        assert!(
+            converge(&worlds, &[1, 2, 3], "a").await,
+            "followers must apply the committed state"
+        );
         // A retried / duplicated write based on the old generation is a no-op.
         let r2 = write(&rafts[&l], base, next).await.unwrap();
         assert!(!r2.applied, "stale-base commit must be rejected by CAS");
         assert_eq!(worlds[&l].read().unwrap().generation, 1);
-        for r in rafts.values() { let _ = r.shutdown().await; }
+        for r in rafts.values() {
+            let _ = r.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -872,22 +1752,47 @@ mod tests {
         // Isolate the leader: it is a minority of one and cannot commit.
         iso.write().await.insert(l);
         let (b, n) = next_state(&worlds[&l], add_ns("minority"));
-        assert!(write(&rafts[&l], b, n).await.is_err(), "an isolated leader must not confirm a write");
-        assert!(!worlds[&l].read().unwrap().namespaces.iter().any(|x| x == "minority"),
-            "an unconfirmed write must not reach the state machine");
+        assert!(
+            write(&rafts[&l], b, n).await.is_err(),
+            "an isolated leader must not confirm a write"
+        );
+        assert!(
+            !worlds[&l]
+                .read()
+                .unwrap()
+                .namespaces
+                .iter()
+                .any(|x| x == "minority"),
+            "an unconfirmed write must not reach the state machine"
+        );
 
         // The majority elects a new leader and keeps the committed write.
         let l2 = leader(&rafts, &iso).await;
         assert_ne!(l2, l);
-        assert!(worlds[&l2].read().unwrap().namespaces.iter().any(|x| x == "before"));
+        assert!(worlds[&l2]
+            .read()
+            .unwrap()
+            .namespaces
+            .iter()
+            .any(|x| x == "before"));
         let (b, n) = next_state(&worlds[&l2], add_ns("after"));
         assert!(write(&rafts[&l2], b, n).await.unwrap().applied);
 
         // Heal: the old leader catches up, its unconfirmed write is discarded.
         iso.write().await.clear();
-        assert!(converge(&worlds, &[1, 2, 3], "after").await, "old leader must catch up after heal");
-        assert!(!worlds[&l].read().unwrap().namespaces.iter().any(|x| x == "minority"));
-        for r in rafts.values() { let _ = r.shutdown().await; }
+        assert!(
+            converge(&worlds, &[1, 2, 3], "after").await,
+            "old leader must catch up after heal"
+        );
+        assert!(!worlds[&l]
+            .read()
+            .unwrap()
+            .namespaces
+            .iter()
+            .any(|x| x == "minority"));
+        for r in rafts.values() {
+            let _ = r.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -900,13 +1805,32 @@ mod tests {
         let (b, n) = next_state(&worlds[&l], |w| w.namespaces.retain(|x| x != "gone"));
         assert!(write(&rafts[&l], b, n).await.unwrap().applied);
         for _ in 0..50 {
-            if [1, 2, 3].iter().all(|i| !worlds[i].read().unwrap().namespaces.iter().any(|x| x == "gone")) { break; }
+            if [1, 2, 3].iter().all(|i| {
+                !worlds[i]
+                    .read()
+                    .unwrap()
+                    .namespaces
+                    .iter()
+                    .any(|x| x == "gone")
+            }) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         for i in [1u64, 2, 3] {
-            assert!(!worlds[&i].read().unwrap().namespaces.iter().any(|x| x == "gone"), "node {i} still has deleted object");
+            assert!(
+                !worlds[&i]
+                    .read()
+                    .unwrap()
+                    .namespaces
+                    .iter()
+                    .any(|x| x == "gone"),
+                "node {i} still has deleted object"
+            );
         }
-        for r in rafts.values() { let _ = r.shutdown().await; }
+        for r in rafts.values() {
+            let _ = r.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -921,7 +1845,9 @@ mod tests {
         }
         assert!(converge(&worlds, &[1, 2, 3], "ns19").await);
         let gen_before = worlds[&l].read().unwrap().generation;
-        for r in rafts.values() { let _ = r.shutdown().await; }
+        for r in rafts.values() {
+            let _ = r.shutdown().await;
+        }
         drop(rafts);
 
         // Restart all three from the same directories with EMPTY worlds.
@@ -931,23 +1857,43 @@ mod tests {
         let mut worlds2 = HashMap::new();
         for id in 1..=3u64 {
             let w = Arc::new(std::sync::RwLock::new(DesiredWorld::new()));
-            let r = build_node_in_proc(id, w.clone(), registry.clone(), isolated.clone(), Some(dir.join(format!("n{id}")))).await.unwrap();
+            let r = build_node_in_proc(
+                id,
+                w.clone(),
+                registry.clone(),
+                isolated.clone(),
+                Some(dir.join(format!("n{id}"))),
+            )
+            .await
+            .unwrap();
             rafts2.insert(id, r);
             worlds2.insert(id, w);
         }
-        assert!(dir.join("n1/snapshot.json").exists(), "a snapshot must have been persisted");
+        assert!(
+            dir.join("n1/snapshot.json").exists(),
+            "a snapshot must have been persisted"
+        );
         let l2 = leader(&rafts2, &isolated).await;
         // Restored state (snapshot + replayed log) and a new write still works.
         for _ in 0..50 {
-            if worlds2[&l2].read().unwrap().generation >= gen_before { break; }
+            if worlds2[&l2].read().unwrap().generation >= gen_before {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(worlds2[&l2].read().unwrap().generation, gen_before);
-        assert!(worlds2[&l2].read().unwrap().namespaces.iter().any(|x| x == "ns19"));
+        assert!(worlds2[&l2]
+            .read()
+            .unwrap()
+            .namespaces
+            .iter()
+            .any(|x| x == "ns19"));
         let (b, n) = next_state(&worlds2[&l2], add_ns("post-restart"));
         assert!(write(&rafts2[&l2], b, n).await.unwrap().applied);
         assert!(converge(&worlds2, &[1, 2, 3], "post-restart").await);
-        for r in rafts2.values() { let _ = r.shutdown().await; }
+        for r in rafts2.values() {
+            let _ = r.shutdown().await;
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
