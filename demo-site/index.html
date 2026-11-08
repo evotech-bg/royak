@@ -505,6 +505,8 @@ tick(); setInterval(tick, 1500);
   }
   function apply(a) {
     gtag('consent', 'update', { analytics_storage: a ? 'granted' : 'denied', ad_storage: 'denied', ad_user_data: 'denied', ad_personalization: 'denied' });
+    // After a withdrawal gtag.js stays on the page; this official flag stops it sending anything.
+    window['ga-disable-' + window.GA_ID] = !a;
     if (a) loadGA();
   }
   function choose(a) {
