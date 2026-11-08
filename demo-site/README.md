@@ -25,18 +25,17 @@ Interactivity is served by a tiny, opt-in endpoint in Royak, enabled only with
 
 Rate-limited, no token, and it touches **nothing else** in the cluster. Without
 `ROYAK_DEMO=1` every `/demo/*` route returns 404 (fail-safe closed). Read-only stats
-endpoints send `Access-Control-Allow-Origin: *`; mutations still require the
-`X-Royak-Token` (which CORS never bypasses).
+endpoints send `Access-Control-Allow-Origin: *`; every other API call still requires
+an `Authorization: Bearer` token (which CORS never bypasses).
 
 ## Deploy (when the VPS is ready)
 
 On a small Linux VPS with Docker + the `royak` binary:
 
 ```bash
-# 1. run Royak with the demo sandbox on, and an ingress on :80
-ROYAK_DEMO=1 ROYAK_DEMO_APP=demo royak watch --ingress-port 80 &
-
-# 2. the demo app whose pods visitors will kill/scale
+# 1. the demo app whose pods visitors will kill/scale. Apply before the server
+#    starts: while a server owns the state, offline `royak apply` is refused —
+#    send later changes through the API (kubectl / curl with the admin token).
 cat <<'YAML' | royak apply -
 apiVersion: apps/v1
 kind: Deployment
@@ -44,7 +43,7 @@ metadata: {name: demo}
 spec: {replicas: 3, template: {spec: {containers: [{name: c, image: nginx:alpine}]}}}
 YAML
 
-# 3. build + deploy THIS page via Royak's own build pipeline (dogfood)
+# 2. build + deploy THIS page via Royak's own build pipeline (dogfood)
 cat <<'YAML' | royak apply -
 apiVersion: royak/v1
 kind: Repository
@@ -59,6 +58,10 @@ spec:
     - {name: build,  action: build, context: demosite, dockerfile: demo-site/Dockerfile, tag: royak-demosite:v1}
     - {name: deploy, action: apply, file: demo-site/deploy.yaml, dependsOn: build}
 YAML
+
+# 3. run Royak with the demo sandbox on, and an ingress on :80
+#    (admin token: ~/.royak/admin.token unless ROYAK_TOKEN / ROYAK_TOKEN_FILE is set)
+ROYAK_DEMO=1 ROYAK_DEMO_APP=demo royak watch --ingress-port 80 &
 ```
 
 `demo-site/Dockerfile` serves `index.html`; set `ROYAK_API` on the container if the

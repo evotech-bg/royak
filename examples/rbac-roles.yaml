@@ -1,11 +1,16 @@
-# RBAC roles — control who can do what.
-# When no roles are defined, all operations are allowed (open by default).
-# Once at least one role exists, the API enforces permissions.
+# Royak's own RbacRole — a role named X applies to the authenticated user X.
+#
+# Identity comes only from a verified bearer token (ROYAK_TOKEN, or the token
+# table in ROYAK_TOKEN_FILE: "token,user,uid,\"group1,group2\"" per line).
+# Authorization is deny-by-default: a user with no matching role or binding
+# can do nothing. Members of group system:masters are cluster-admin. Native
+# Role/ClusterRole/RoleBinding/ClusterRoleBinding work the same way.
 #
 # Deploy: royak apply examples/rbac-roles.yaml
-# Test:   curl -X POST http://localhost:6443/apis/apps/v1/deployments \
-#              -H "X-Royak-Role: viewer" \
-#              -d '...'   # → 403 Forbidden
+# Test (as user "viewer", token from your token file):
+#   curl -X POST http://localhost:6443/apis/apps/v1/namespaces/default/deployments \
+#        -H "Authorization: Bearer $VIEWER_TOKEN" -H 'Content-Type: application/yaml' \
+#        --data-binary @deploy.yaml   # → 403 Forbidden
 
 apiVersion: v1
 kind: RbacRole

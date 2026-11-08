@@ -1,0 +1,62 @@
+name: Royak self-hosted smoke (not release qualification)
+
+# Never run pull_request or pull_request_target code on the shared Mac.
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/cluster-census-federation, main]
+    paths:
+      - .github/workflows/self-hosted-smoke.yml
+      - tests/qualification/self_hosted_smoke.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: royak-self-hosted-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: >-
+      github.repository == 'evotech-bg/royak' &&
+      (github.ref == 'refs/heads/fix/cluster-census-federation' ||
+       github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, macOS, ARM64, evotech-bg]
+    timeout-minutes: 10
+    steps:
+      - name: Select existing Python (no installs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+            if command -v "$candidate" >/dev/null && "$candidate" -c 'import sys; assert sys.version_info >= (3, 11)' 2>/dev/null; then
+              printf 'ROYAK_SMOKE_PYTHON=%s\n' "$(command -v "$candidate")" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo 'Python >=3.11 must already be installed; nothing was installed.' >&2
+          exit 1
+      - name: Checkout into this run's unique disposable directory
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          clean: false
+          path: royak-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Smoke checks only (no compile, Docker, VM or deploy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/royak-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          "$ROYAK_SMOKE_PYTHON" -B "$ROOT/tests/qualification/self_hosted_smoke.py" --root "$ROOT"
+      - name: Remove only this run's marked disposable checkout
+        if: always() && env.ROYAK_SMOKE_PYTHON != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/royak-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if [ -f "$ROOT/tests/qualification/self_hosted_smoke.py" ]; then
+            "$ROYAK_SMOKE_PYTHON" -B "$ROOT/tests/qualification/self_hosted_smoke.py" --root "$ROOT" --cleanup
+          fi

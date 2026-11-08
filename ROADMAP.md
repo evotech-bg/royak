@@ -8,34 +8,42 @@ Versioning tracks the git tag cadence, not calendar time. Items move forward whe
 
 ## Current state — v0.4-beta
 
-What's working end-to-end, covered by the test suite:
+What's working end-to-end, covered by the test suites. Items marked *(source)* landed after the
+latest published release (`v0.4.0-beta.1`) and exist only in the source so far:
 
 - Container orchestration on Docker (single node): deploy, scale, rolling update, rollback, health probes, CrashLoopBackOff detection.
 - 22+ K8s resource kinds with YAML/JSON parsing (Deployment, Service, ConfigMap, Secret, HPA, NetworkPolicy, ResourceQuota, Ingress, Operator, CustomResource, Pipeline, Function, Job, CronJob, DaemonSet, RbacRole, Guard, PV, PVC, StorageClass, Namespace).
 - Service DNS: pod-to-service name resolution via Docker network aliases (single node).
-- Leader lease HA: file-based election with 15s TTL and automatic failover when the leader crashes. Single-writer guarantee on shared state.
+- Single writer per state file: an exclusive lock held for the process life; a second server is a read-only standby and takes over the moment the owner dies. Every change is written atomically (fsync) before it is acknowledged; corrupt state stops the server instead of starting empty.
 - mTLS cluster CA with per-pod certificate issuance.
 - AES-256-GCM encrypted Secrets at rest.
-- RBAC enforcement at the API layer (403 on unauthorized verb+resource+namespace).
+- Authentication by bearer token only (no anonymous access, no role headers) and deny-by-default RBAC on every read, write, scale, PATCH, exec, logs and watch. Inter-node requests and responses are HMAC-signed with the cluster secret.
+- Namespaces as real identity: objects are keyed by namespace + name; same names coexist, operations stay inside their namespace.
 - kubectl compatibility: discovery, get, describe, delete, watch, **and native apply for creation** (full OpenAPI v3 operation IDs — no `--validate=false`). ✅ landed in v0.3. Client-side apply updates (strategic merge + last-applied annotations + full field schemas) ✅ landed in v0.4-beta.
 - Cross-node mesh proxy (MVP): pods on node B reach services on node A through per-node proxies. ✅ landed in v0.3
-- Ingress as a live reverse proxy: async, streaming, binary-safe, TLS, Host+path routing. ✅ landed in v0.3
-- openraft integration, phases 1–2: single-node command flow + leader election and log replication across 3 nodes, proven over in-process and HTTP transports. ✅ landed in v0.4
-- Multi-node state sync via HTTP POST + pull on join (UDP discovery optional).
+- Ingress as a live reverse proxy: async, binary-safe, TLS, Host+path routing. ✅ landed in v0.3. Current HTTP response decoding is bounded/buffered; streaming/SSE/upgrades are not qualified.
+- *(source)* openraft on the live write path (phase 3): every desired-state change in cluster mode commits on a quorum before it is acknowledged; durable log and vote; snapshots. Only a quorum-confirmed leader schedules; a minority answers 504 "outcome unknown". ✅ verified with 3 nodes on one host (`test-raft-cluster.sh`)
+- ServiceLB (NodePort + LoadBalancer) forwards only to Ready pods and follows Service changes (selector, targetPort, delete/recreate) without a restart; `tcpSocket` probes alongside `httpGet`/`exec`, with invalid probes rejected at apply (`test-servicelb-probes.sh`). *(source)*
+- Multi-node placement: the leader places pods on any Ready node via signed RPC with the full workload contract; self-healing after pod kills and node loss without over-provisioning (`test-multinode.sh`).
 - Prometheus `/metrics`, Kubernetes-compat `/openapi/v3`, built-in dashboard.
-- Test coverage: 88 unit + 100 integration + multi-node + HA lease + mesh + ingress + NeuroPod + load suites.
+- *(source)* Read-only live topology graph with scoped RBAC, actual placement/ownership and labelled declared references; search/filter/map/list/fit and keyboard-preserved details. Native, real Docker/API, three-daemon fault and browser checks passed for the [bounded local beta](tests/qualification/BETA-RESULTS-2026-10-27.md), not production certification.
+- *(source)* Probe lifecycle scheduling/thresholds/startup/incarnation reset, immutable new-pod health contracts, sidecar readiness and exec process-group cleanup; 53 real lifecycle/topology/RBAC regressions pass. Unsupported targets/fields are refused within the [documented subset](tests/qualification/PROBE-TOPOLOGY-CONTRACT.md).
+- Test coverage: unit suite + single-node integration + multi-node + Raft cluster + single-writer + ServiceLB/probes + auth-over-HTTP + mesh + ingress + NeuroPod + load suites.
 
 ## Known limits
 
 | What's not in v0.4-beta | Why it matters | Planned in |
 |---|---|---|
-| Raft on the live write path | Election + replication are proven in tests, but the reconcile loop still mutates state directly. A partition across independent disks can still split-brain. | v0.4 final (phase 3) |
-| Raft snapshots + log compaction | Long-running clusters need bounded log growth. | v0.4.x |
-| kubectl `exec -it` (interactive TTY) + `port-forward` | Non-interactive exec works over WebSocket; interactive stdin/TTY streaming and port-forward stream pairs are the remaining kubectl gaps. | v0.4.x |
+| Multi-machine verification | Legacy cluster suites use 3 processes/one daemon; the fault lab now uses 3 distinct daemons, still on one physical host. Separate-machine failure domains remain untested. | v0.4.x |
+| Replicated / movable volumes | Local PVC paths have no durable node binding or fenced handoff; a new scheduler can resolve another machine's directory. Stateful production is blocked on the [separate storage gate](tests/qualification/STATEFUL-PRODUCTION-GATE.md), with backend architecture not yet selected. | v0.5 |
+| Node cordon/drain/join | Nodes are declared with `--peers`; no live membership change or drain. | v0.4.x |
+| Mesh frame replay protection + per-host mesh port | Sealed mesh frames are encrypted and authenticated, but a captured frame can be replayed; the fixed `:6550` port allows one node per host. | v0.4.x |
+| kubectl `port-forward` | kubectl 1.36 tunnels SPDY-over-WebSocket, which is not decoded (`royak port-forward` works). | v0.4.x |
 | WireGuard L3 mesh | Cross-node **service** traffic is now AES-256-GCM encrypted on the proxy hop (v0.4-beta). A routed encrypted L3 (raw pod-IP peering across hosts via WireGuard) is still v0.5. | v0.5 |
 | Native Helm engine | Today: `helm template \| royak apply -`. | v0.5 |
 | Canary traffic splitting at service layer | Parsed and scheduled; needs proxy integration. | v0.5 |
-| Multi-node ServiceLB | NodePort + LoadBalancer ✅ shipped (single-node, klipper-lb-style); multi-node external IP pools pending. | v0.5 |
+| Multi-node ServiceLB | NodePort + LoadBalancer work per node (readiness-gated, live Service updates); each node forwards only to its own pods, and multi-node external IP pools are pending. | v0.5 |
+| Full probe/runtime parity and upgrades | Source lifecycle semantics passed the bounded Docker tests, but synchronous deadlines, hostile exec escape, full multi-container controller API and legacy in-place/version-skew upgrades remain unqualified. | separate qualification |
 
 ---
 
@@ -107,7 +115,7 @@ Estimated effort: 1-2 sessions.
 
 ---
 
-## v0.4 plan — real HA with consensus (phases 1–2 ✅ done, phase 3 in progress)
+## v0.4 plan — real HA with consensus (phases 1–3 ✅ done; multi-machine verification open)
 
 Goal: the word "HA" means the same thing in Royak as in etcd.
 
@@ -154,8 +162,8 @@ The reconcile loop moves from "read state, mutate state, save state" to "propose
 2. **v0.4.0** — integrate openraft:
    - **Phase 1 ✅** — openraft wired to our `Command` state machine, single-node command flow proven (`client_write` → log → apply → `DesiredWorld` mutation).
    - **Phase 2 ✅** — network transports: in-process registry for distributed invariant tests + HTTP transport on `/royak/v1/raft/*`. 3-node election and log replication pass in the unit suite.
-   - **Phase 3 (in progress)** — route the live reconcile write path through `backend.propose(cmd)`; lease file becomes single-node fallback. Add CLI: `royak cluster bootstrap <peers...>` to initialise a quorum.
-3. **v0.4.1** — snapshots + log compaction.
+   - **Phase 3 ✅** — every desired-state write (API and reconcile) goes through one commit path that proposes on Raft in cluster mode; durable log + vote; quorum-lease leadership gates scheduling. Single-node mode keeps the owner-locked file. Bootstrap is `watch --bootstrap` on the first node.
+3. **Snapshots ✅** — built from the state machine, installed on lagging followers and restored from disk on restart; a snapshot every 64 log entries, after which older entries are purged (16 kept).
 
 ### Test plan
 

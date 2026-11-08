@@ -1,110 +1,105 @@
 #!/bin/bash
-# Royak HA Leader Lease Test — verifies only one of two concurrent
-# watch processes acquires the lease and performs reconcile mutations.
+# Royak single-writer (state owner lock) test — two `watch` processes share
+# one state file. Exactly one owns it (an exclusive flock held for the whole
+# process life); the other is a read-only standby whose writes return 421.
+# The kernel drops the lock the moment the owner dies, so a SIGKILLed owner
+# hands over at the standby's next tick (no lease TTL to wait out).
 #
-# NOT a full quorum / consensus test. This validates the single-writer
-# guarantee when multiple instances share a state path.
+# NOT a consensus test (see test-raft-cluster.sh). Cleanup touches only the
+# processes this run started and its temporary directory.
 
-set -e
-BIN="./target/release/royak"
-STATE="/tmp/rk-ha-state.json"
-PORT_A=6553
-PORT_B=6554
-PASS=0
-FAIL=0
-TOTAL=0
-
-pass() { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo "  ✓ $1"; }
-fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  ✗ $1"; }
+set -u
+cd "$(dirname "$0")"
+BIN="$PWD/target/release/royak"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/royak-ha.XXXXXX")
+STATE="$WORK/state.json"
+PORT_A=${PORT_A:-6553}
+PORT_B=${PORT_B:-6554}
+PASS=0; FAIL=0
+pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
+fail() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 check() { if eval "$2" >/dev/null 2>&1; then pass "$1"; else fail "$1"; fi }
 
+export ROYAK_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+export ROYAK_STATE="$STATE" HOME="$WORK/home" ROYAK_DATA_DIR="$WORK/data"
+mkdir -p "$HOME" "$ROYAK_DATA_DIR"
+A_PID=""; B_PID=""
 cleanup() {
-    lsof -ti:$PORT_A 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    lsof -ti:$PORT_B 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    rm -f "$STATE" "$STATE.nrns" "$STATE.lock" "$STATE.leader" "$STATE.leader.tmp" 2>/dev/null || true
-    docker ps -a --filter "name=rk-" -q | xargs -r docker rm -f 2>/dev/null || true
+    for p in $A_PID $B_PID; do kill -9 "$p" 2>/dev/null || true; done
+    CID=$(python3 -c "import json;print(json.load(open('$STATE'))['clusterId'])" 2>/dev/null)
+    [ -n "$CID" ] && docker ps -aq --filter "label=royak.cluster=$CID" | xargs -r docker rm -f >/dev/null 2>&1
+    if [ $FAIL -gt 0 ]; then
+        echo "  --- A log tail ---"; tail -20 "$WORK/a.log" 2>/dev/null | sed 's/^/    /'
+        echo "  --- B log tail ---"; tail -20 "$WORK/b.log" 2>/dev/null | sed 's/^/    /'
+    fi
+    rm -rf "$WORK"
 }
 trap cleanup EXIT
+[ -x "$BIN" ] || cargo build --release
 
-echo "╔════════════════════════════════════════════╗"
-echo "║  Royak HA Leader Lease Test           ║"
-echo "╚════════════════════════════════════════════╝"
+post_cm() { # post_cm PORT NAME → HTTP code
+    curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -H "Authorization: Bearer $ROYAK_TOKEN" \
+        -H 'Content-Type: application/yaml' \
+        --data-binary "$(printf 'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: %s}\ndata: {k: v}\n' "$2")" \
+        "http://127.0.0.1:$1/api/v1/namespaces/default/configmaps"
+}
+on_disk() { python3 -c "import json,sys; d=json.load(open('$STATE')); sys.exit(0 if 'default/$1' in d['state']['configmaps'] else 1)"; }
+wait_up() { for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$1/healthz" && return 0; sleep 0.2; done; return 1; }
+
+echo "Royak state-owner lock test (work dir $WORK)"
 echo ""
-
-cleanup
-sleep 1
-
-if [ ! -f "$BIN" ]; then
-    echo "Building..."
-    cargo build --release 2>/dev/null
-fi
-
-# ═══════════════════════════════════════════
-echo "1. Start instance A (becomes leader)"
-echo "────────────────────────────────────"
-HOSTNAME=host-a ROYAK_STATE="$STATE" $BIN watch --interval 2 --port $PORT_A > /tmp/rk-ha-a.log 2>&1 &
-A_PID=$!
-sleep 5
-check "instance A is running" "kill -0 $A_PID"
-check "lease file created" "test -f '$STATE.leader'"
-check "A logs 'became leader'" "grep -q 'became leader' /tmp/rk-ha-a.log"
-check "lease file names A as leader" "python3 -c \"import json; d=json.load(open('$STATE.leader')); assert d['leader'].startswith('host-a-')\""
-
-# ═══════════════════════════════════════════
-echo ""
-echo "2. Start instance B while A holds lease"
-echo "───────────────────────────────────────"
-HOSTNAME=host-b ROYAK_STATE="$STATE" $BIN watch --interval 2 --port $PORT_B > /tmp/rk-ha-b.log 2>&1 &
-B_PID=$!
-sleep 6
-check "instance B is running" "kill -0 $B_PID"
-check "B enters standby" "grep -q '\\[standby\\]' /tmp/rk-ha-b.log"
-check "B did NOT reconcile" "! grep -q 'tick 1' /tmp/rk-ha-b.log || true; ! grep -q 'Reconciling...' /tmp/rk-ha-b.log"
-# Verify lease still belongs to A
-OWNER=$(python3 -c "import json; d=json.load(open('$STATE.leader')); print(d['leader'])" 2>/dev/null || echo "")
-check "lease still held by A" "echo '$OWNER' | grep -q 'host-a-'"
-
-# ═══════════════════════════════════════════
-echo ""
-echo "3. Kill A — B must take over after TTL"
-echo "──────────────────────────────────────"
-# Kill without clean shutdown (SIGKILL — no lease release)
-kill -9 $A_PID 2>/dev/null || true
-# Port_A may still be bound for a moment; that's fine.
-# Wait > LEASE_TTL_SECS (15s) so lease goes stale, then B's next tick takes over.
-# We poll B's log to avoid over-waiting.
-for i in $(seq 1 20); do
-    sleep 2
-    if grep -q 'became leader' /tmp/rk-ha-b.log; then
-        break
-    fi
-done
-check "B takes over after A dies" "grep -q 'became leader' /tmp/rk-ha-b.log"
-OWNER=$(python3 -c "import json; d=json.load(open('$STATE.leader')); print(d['leader'])" 2>/dev/null || echo "")
-check "lease now held by B" "echo '$OWNER' | grep -q 'host-b-'"
-
-# ═══════════════════════════════════════════
-echo ""
-echo "4. Graceful shutdown of B releases lease"
-echo "────────────────────────────────────────"
-kill -TERM $B_PID 2>/dev/null || true
-wait $B_PID 2>/dev/null || true
-sleep 2
-check "lease file removed on graceful shutdown" "! test -f '$STATE.leader'"
+echo "1. Instance A owns the state"
+"$BIN" watch --interval 2 --port $PORT_A --ingress-port 0 > "$WORK/a.log" 2>&1 & A_PID=$!
+wait_up $PORT_A
+check "A is running" "kill -0 $A_PID"
+check "A reports ownership" "grep -q 'state owner: $STATE' '$WORK/a.log'"
+check "A accepts a write (201) and it is durable" "[ \$(post_cm $PORT_A from-a) = 201 ] && on_disk from-a"
 
 echo ""
-echo "════════════════════════════════════════"
-echo "  Results: $PASS passed, $FAIL failed (of $TOTAL)"
-echo "════════════════════════════════════════"
+echo "2. Instance B on the same state is a read-only standby"
+"$BIN" watch --interval 2 --port $PORT_B --ingress-port 0 > "$WORK/b.log" 2>&1 & B_PID=$!
+wait_up $PORT_B
+sleep 3
+check "B is running" "kill -0 $B_PID"
+check "B starts in standby" "grep -q 'owned by another Royak process' '$WORK/b.log'"
+check "B does not reconcile" "! grep -q '── tick' '$WORK/b.log'"
+C=$(post_cm $PORT_B from-b)
+check "a write to the standby is refused (421, not applied)" "[ '$C' = 421 ]"
+check "the refused write is not on disk" "! on_disk from-b"
+OUT=$("$BIN" apply - 2>&1 <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: from-cli}
+data: {k: v}
+YAML
+); RC=$?
+check "an offline CLI write is refused while a server owns the state (exit 3)" "[ $RC = 3 ] && echo \"\$OUT\" | grep -q 'owns'"
 
-if [ $FAIL -gt 0 ]; then
-    echo "  SOME TESTS FAILED"
-    echo "  --- A log tail ---"
-    tail -20 /tmp/rk-ha-a.log 2>/dev/null | sed 's/^/    /'
-    echo "  --- B log tail ---"
-    tail -30 /tmp/rk-ha-b.log 2>/dev/null | sed 's/^/    /'
-    exit 1
-else
-    echo "  ALL TESTS PASSED"
-    exit 0
-fi
+echo ""
+echo "3. SIGKILL A — B takes over without a lease timeout"
+kill -9 $A_PID; T0=$(date +%s)
+for _ in $(seq 1 30); do grep -q 'acquired state ownership' "$WORK/b.log" && break; sleep 0.5; done
+T1=$(date +%s)
+check "B acquires ownership after A dies ($((T1-T0))s, interval 2s)" "grep -q 'acquired state ownership' '$WORK/b.log'"
+for _ in $(seq 1 20); do grep -q '── tick' "$WORK/b.log" && break; sleep 0.5; done
+check "B reconciles as owner" "grep -q '── tick' '$WORK/b.log'"
+check "B kept A's acknowledged write" "curl -sf -H 'Authorization: Bearer $ROYAK_TOKEN' http://127.0.0.1:$PORT_B/api/v1/namespaces/default/configmaps/from-a"
+check "B now accepts writes (201), durably" "[ \$(post_cm $PORT_B from-b2) = 201 ] && on_disk from-b2"
+
+echo ""
+echo "4. SIGTERM B — clean exit releases the lock"
+kill -TERM $B_PID
+for _ in $(seq 1 20); do kill -0 $B_PID 2>/dev/null || break; sleep 0.5; done
+check "B exits on SIGTERM" "! kill -0 $B_PID"
+OUT=$("$BIN" apply - 2>&1 <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: from-cli}
+data: {k: v}
+YAML
+); RC=$?
+check "with no server running, the CLI can own and write the state" "[ $RC = 0 ] && on_disk from-cli"
+
+echo ""
+echo "  Results: $PASS passed, $FAIL failed"
+[ $FAIL -eq 0 ]
