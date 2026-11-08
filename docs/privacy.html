@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Privacy and cookies · Royak</title>
+<link rel="canonical" href="https://royak.io/privacy.html" />
+<link rel="icon" type="image/png" href="./assets/royak-mark.png" />
+<style>
+:root{--bg:#fafbff;--ink:#111327;--ink2:#4b5069;--ink3:#9aa0b5;--line:#e5e7f0;--accent:#4338ca}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:40px max(16px,env(safe-area-inset-right,0px)) 80px max(16px,env(safe-area-inset-left,0px))}
+a{color:var(--accent)}
+.back{display:inline-flex;align-items:center;gap:10px;font-weight:700;color:var(--ink);text-decoration:none}
+.back img{width:26px;height:26px}
+h1{font-size:34px;line-height:1.15;margin:28px 0 6px;text-wrap:balance}
+h2{font-size:20px;margin:34px 0 8px;padding-top:20px;border-top:1px solid var(--line)}
+p,li{color:var(--ink2)}
+strong{color:var(--ink)}
+.muted{color:var(--ink3);font-size:14px}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink3);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="./"><img src="./assets/royak-mark.png" alt="" /> ← royak.io</a>
+  <h1>Privacy and cookies</h1>
+  <p class="muted">Effective 8 November 2026 · covers royak.io and demo.royak.io · <a href="#bg">Резюме на български</a></p>
+
+  <h2>Who is responsible</h2>
+  <p>Royak is open source (MIT). The controller of personal data collected through royak.io and demo.royak.io is <strong>Evo Tech Development EOOD, UIC 204234209, 1A Petko Karavelov Blvd, Sofia, Bulgaria</strong>. Questions about your data: <strong>office@evotech.bg</strong>.</p>
+
+  <h2>What we collect</h2>
+  <ul>
+    <li><strong>Visit statistics</strong>, only if you accept analytics cookies. We use Google Analytics 4 (Google Ireland Limited). No advertising, remarketing or advertising cookies.</li>
+    <li>The hosting processes technical data such as IP addresses to deliver the sites: GitHub Pages for royak.io, and our own server running Royak for demo.royak.io.</li>
+  </ul>
+  <p>The sites have no forms and do not ask for your name or email. The demo's buttons (scale, kill a pod) act on the demo cluster only and store nothing about you.</p>
+
+  <h2>Cookies and browser storage</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Name</th><th>Type</th><th>Purpose</th><th>Duration</th></tr>
+    <tr><td>royak-consent-v1</td><td>Necessary (localStorage)</td><td>Remembers your cookie choice</td><td>Until you delete it</td></tr>
+    <tr><td>_ga, _ga_*</td><td>Analytics, only with consent</td><td>Google Analytics 4: tells visits apart with a random identifier</td><td>Up to 2 years; analytics data is kept for 14 months</td></tr>
+  </table>
+  </div>
+  <p>Without consent Google Analytics is not loaded at all. You can change or withdraw your consent at any time with "Cookie settings" at the bottom of either page; declining also removes Google Analytics cookies. Google may process data outside the EU under the European Commission's standard contractual clauses.</p>
+
+  <h2>Legal basis and your rights</h2>
+  <p>We process analytics data on the basis of your consent (Article 6(1)(a) GDPR). You have the right of access, rectification, erasure, restriction, objection and portability, and the right to complain to the Bulgarian Commission for Personal Data Protection (<a href="https://www.cpdp.bg">www.cpdp.bg</a>).</p>
+
+  <h2 id="bg" lang="bg">Резюме на български</h2>
+  <p lang="bg">Администратор на личните данни, събирани чрез royak.io и demo.royak.io, е <strong>Ево Тех Девелъпмънт ЕООД, ЕИК 204234209, гр. София, бул. „Петко Каравелов“ 1А</strong>, имейл office@evotech.bg. Сайтовете нямат формуляри. Статистика за посещенията събираме с Google Analytics 4 <em>само след съгласието ви</em>; без съгласие скриптът изобщо не се зарежда, а при отказ изтриваме и бисквитките му. Не използваме рекламни бисквитки. Изборът ви се пази в localStorage (royak-consent-v1) и може да се промени от „Cookie settings“ долу на страницата. Имате правата по GDPR, включително жалба до КЗЛД (cpdp.bg).</p>
+</div>
+</body>
+</html>

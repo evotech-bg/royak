@@ -141,7 +141,28 @@
     font-family:ui-monospace,monospace;flex:none}
   .pill{display:inline-block;background:var(--panel2);color:var(--panel-ink);border-radius:6px;padding:1px 8px;
     font-size:11.5px;font-weight:700;font-variant-numeric:tabular-nums}
+/* cookie consent */
+.cc{position:fixed;left:0;right:0;bottom:0;z-index:100;padding:0 max(16px,env(safe-area-inset-right,0px)) calc(16px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px))}
+.cc-box{max-width:760px;margin:0 auto;background:#fff;color:#111327;border:1px solid #e5e7f0;border-radius:14px;padding:20px;display:grid;gap:14px;box-shadow:0 16px 48px rgba(17,19,39,.18);font-size:15px;line-height:1.55}
+.cc-box h2{font-size:18px;margin:0}
+.cc-box p{margin:0;color:#4b5069}
+.cc-box a{color:#4338ca}
+.cc-actions{display:flex;flex-wrap:wrap;gap:10px}
+.cc-actions button{font:inherit;font-size:14px;font-weight:600;border-radius:10px;padding:9px 16px;cursor:pointer;border:1px solid #e5e7f0;background:#fff;color:#111327}
+.cc-actions button.primary{background:#4f46e5;border-color:#4f46e5;color:#fff}
+.cc-actions button:focus-visible,.cc-opt input:focus-visible,.cc-link:focus-visible{outline:2px solid #4f46e5;outline-offset:2px}
+.cc-prefs{display:grid;gap:10px;border-top:1px solid #e5e7f0;padding-top:14px}
+.cc-opt{display:flex;gap:12px;align-items:flex-start;color:#4b5069}
+.cc-opt input{margin-top:5px;accent-color:#4f46e5;width:16px;height:16px}
+.cc-opt b{color:#111327}
+.cc-link{background:none;border:0;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer}
 </style>
+<script>
+// Consent Mode v2: everything denied until the visitor chooses; gtag.js loads only after "analytics" consent.
+window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}
+gtag('consent','default',{ad_storage:'denied',ad_user_data:'denied',ad_personalization:'denied',analytics_storage:'denied',functionality_storage:'granted',security_storage:'granted',wait_for_update:500});
+window.GA_ID='G-4THESHNBSL'; /* GA4 property demo.royak.io (Evo Tech account) */
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -239,7 +260,8 @@
   </div>
 
   <div class="foot">Powered by <b>Royak</b> — a swarm of containers in one ~7.3&nbsp;MB binary ·
-    <a href="https://github.com/evotech-bg/royak" target="_blank" rel="noopener">github.com/evotech-bg/royak</a></div>
+    <a href="https://github.com/evotech-bg/royak" target="_blank" rel="noopener">github.com/evotech-bg/royak</a> ·
+    <a href="https://royak.io/privacy.html">Privacy</a> · <button type="button" class="cc-link" data-cc-open>Cookie settings</button></div>
 </div>
 
 <script>
@@ -453,6 +475,53 @@ async function tick(){
 // response is fresh from a live pod, not a cached static file.
 try{ $('served-at').textContent = 'rendered ' + new Date().toLocaleTimeString(); }catch(e){}
 tick(); setInterval(tick, 1500);
+</script>
+<div class="cc" id="cc" role="dialog" aria-modal="false" aria-labelledby="cc-title" hidden>
+  <div class="cc-box">
+    <h2 id="cc-title">Cookies</h2>
+    <p>We use necessary storage to make the site work. With your consent we also use Google Analytics to understand how the site is used. No advertising cookies. You can change your choice at any time from "Cookie settings" at the bottom of the page. <a href="https://royak.io/privacy.html">Details</a></p>
+    <div class="cc-prefs" id="cc-prefs" hidden>
+      <label class="cc-opt"><input type="checkbox" checked disabled><span><b>Necessary:</b> remembering this choice. Always on.</span></label>
+      <label class="cc-opt"><input type="checkbox" id="cc-analytics"><span><b>Analytics:</b> Google Analytics 4, aggregate visit statistics.</span></label>
+    </div>
+    <div class="cc-actions">
+      <button type="button" class="primary" id="cc-accept">Accept</button>
+      <button type="button" id="cc-reject">Necessary only</button>
+      <button type="button" id="cc-custom">Settings</button>
+      <button type="button" id="cc-save" hidden>Save choice</button>
+    </div>
+  </div>
+</div>
+<script>
+// Cookie consent: Consent Mode v2; gtag.js loads only after analytics consent. Choice kept in localStorage "royak-consent-v1".
+(function () {
+  var KEY = 'royak-consent-v1', cc = document.getElementById('cc'), prefs = document.getElementById('cc-prefs'),
+      box = document.getElementById('cc-analytics'), save = document.getElementById('cc-save'), loaded = false;
+  function store(v) { try { if (v !== undefined) localStorage.setItem(KEY, v); return localStorage.getItem(KEY); } catch (e) { return null; } }
+  function loadGA() {
+    var id = window.GA_ID; if (loaded || !id) return; loaded = true;
+    var s = document.createElement('script'); s.async = true; s.src = 'https://www.googletagmanager.com/gtag/js?id=' + encodeURIComponent(id);
+    document.head.appendChild(s); gtag('js', new Date()); gtag('config', id);
+  }
+  function apply(a) {
+    gtag('consent', 'update', { analytics_storage: a ? 'granted' : 'denied', ad_storage: 'denied', ad_user_data: 'denied', ad_personalization: 'denied' });
+    if (a) loadGA();
+  }
+  function choose(a) {
+    store(JSON.stringify({ analytics: !!a, ts: new Date().toISOString() }));
+    apply(a); cc.hidden = true;
+    if (!a) document.cookie.split(';').forEach(function (c) { var n = c.split('=')[0].trim(); if (/^_ga/.test(n))
+      ['', '; domain=.' + location.hostname, '; domain=.royak.io'].forEach(function (d) { document.cookie = n + '=; Max-Age=0; path=/' + d; }); });
+  }
+  function open(p) { cc.hidden = false; prefs.hidden = !p; save.hidden = !p; }
+  var saved = null; try { saved = JSON.parse(store() || 'null'); } catch (e) {}
+  if (saved) { box.checked = !!saved.analytics; apply(!!saved.analytics); } else open(false);
+  document.getElementById('cc-accept').onclick = function () { box.checked = true; choose(true); };
+  document.getElementById('cc-reject').onclick = function () { box.checked = false; choose(false); };
+  document.getElementById('cc-custom').onclick = function () { open(true); };
+  save.onclick = function () { choose(box.checked); };
+  document.querySelectorAll('[data-cc-open]').forEach(function (b) { b.onclick = function () { open(true); }; });
+})();
 </script>
 </body>
 </html>
